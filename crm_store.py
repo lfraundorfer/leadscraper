@@ -13,67 +13,12 @@ import re
 import tempfile
 from typing import Optional
 
+import crm_backend as backend
 from campaign_service import get_active_campaign, resolve_active_csv_path, resolve_csv_path
+from crm_fields import ALL_COLUMNS, ORIGINAL_COLUMNS, TERMINAL_STATUSES, VALID_STATUSES
 
 
 DELIMITER = ";"
-
-# Original columns (must stay in this order)
-ORIGINAL_COLUMNS = [
-    "Unternehmen", "Website", "TelNr", "Email", "Kontaktname",
-    "Kontaktdatum", "Source", "Notes", "Adresse",
-    "Google_Maps_Link", "FirmenABC_Link",
-]
-
-# New CRM columns added by `migrate`
-NEW_COLUMNS = [
-    "ID",
-    "Status",
-    "Channel_Used",
-    "Preferred_Channel",
-    "Priority",
-    # Research results
-    "Website_Category",
-    "Website_Score",
-    "Pain_Points",
-    "Pain_Categories",
-    "Google_Rating",
-    "Google_Review_Count",
-    "Google_Review_Snippets",
-    "Google_Rank_Keyword",
-    "Google_Rank_Position",
-    "Google_Map_Pack",
-    "Google_Competitors",
-    "Research_Config_Version",
-    "Research_Stale",
-    # Generated drafts
-    "Email_Draft",
-    "WhatsApp_Draft",
-    "Phone_Script",
-    "Drafts_Approved",
-    "Template_Used",
-    "Draft_Config_Version",
-    "Draft_Stale",
-    # Pricing
-    "Price",
-    # CRM tracking
-    "Last_Contact_Date",
-    "Next_Action_Date",
-    "Next_Action_Type",
-    "Contact_Count",
-    "Contact_Log",
-    "Enriched_At",
-    "Analyzed_At",
-]
-
-ALL_COLUMNS = ORIGINAL_COLUMNS + NEW_COLUMNS
-
-VALID_STATUSES = {
-    "new", "draft_ready", "approved", "contacted", "replied",
-    "meeting_scheduled", "won", "lost", "done", "no_contact", "blacklist",
-}
-
-TERMINAL_STATUSES = {"won", "lost", "done", "blacklist"}
 
 WIEN_BEZIRK: dict[str, tuple[str, str]] = {
     "1010": ("1.", "Innere Stadt"),
@@ -261,8 +206,58 @@ def _apply_staleness_defaults(row: dict, draft_version: str, research_version: s
     return row
 
 
+def ensure_lead_ids(leads: list[dict], campaign: Optional[dict] = None) -> int:
+    """
+    Assign IDs only to leads that are still missing one.
+    Keeps existing IDs stable so repeated scrapes do not renumber the whole campaign.
+    Returns the number of IDs assigned.
+    """
+    active_campaign = campaign or get_active_campaign()
+    prefix = (active_campaign.get("id_prefix") or "LEAD").upper()
+    draft_version = _draft_version(active_campaign)
+    research_version = _research_version(active_campaign)
+
+    next_number = 0
+    for lead in leads:
+        lead_id = str(lead.get("ID") or "").strip()
+        if not lead_id.startswith(f"{prefix}-"):
+            continue
+        suffix = lead_id.rsplit("-", 1)[-1]
+        try:
+            next_number = max(next_number, int(suffix))
+        except ValueError:
+            continue
+
+    assigned = 0
+    for lead in leads:
+        if not str(lead.get("ID") or "").strip():
+            next_number += 1
+            lead["ID"] = f"{prefix}-{next_number:04d}"
+            assigned += 1
+        if not lead.get("Status"):
+            lead["Status"] = "new"
+        if not lead.get("Contact_Count"):
+            lead["Contact_Count"] = "0"
+        if not lead.get("Drafts_Approved"):
+            lead["Drafts_Approved"] = "0"
+        lead["Preferred_Channel"] = preferred_channel(lead)
+        if not lead.get("Draft_Config_Version") and _data_exists(lead, ["Email_Draft", "WhatsApp_Draft", "Phone_Script"]):
+            lead["Draft_Config_Version"] = draft_version
+        if not lead.get("Research_Config_Version") and _data_exists(lead, ["Website_Category", "Google_Rank_Keyword", "Google_Rating"]):
+            lead["Research_Config_Version"] = research_version
+
+    return assigned
+
+
 def load_leads(csv_path: str = "", campaign: Optional[dict] = None) -> list[dict]:
     """Load all rows from the active CRM CSV. Missing columns default to ''."""
+    if backend.is_postgres_backend() and not csv_path:
+        active_campaign = campaign or get_active_campaign()
+        leads = backend.postgres_load_leads(active_campaign["id"])
+        draft_version = _draft_version(active_campaign)
+        research_version = _research_version(active_campaign)
+        return [_apply_staleness_defaults(dict(lead), draft_version, research_version) for lead in leads]
+
     path = _resolve_csv_path(csv_path=csv_path, campaign=campaign)
     if not os.path.exists(path):
         return []
@@ -282,6 +277,17 @@ def load_leads(csv_path: str = "", campaign: Optional[dict] = None) -> list[dict
 
 def save_leads(leads: list[dict], csv_path: str = "", campaign: Optional[dict] = None) -> None:
     """Atomically write all leads back to the active CSV (tmp + rename)."""
+    if backend.is_postgres_backend() and not csv_path:
+        active_campaign = campaign or get_active_campaign()
+        draft_version = _draft_version(active_campaign)
+        research_version = _research_version(active_campaign)
+        normalized = []
+        for lead in leads:
+            row = {col: lead.get(col, "") for col in ALL_COLUMNS}
+            normalized.append(_apply_staleness_defaults(row, draft_version, research_version))
+        backend.postgres_save_leads(active_campaign["id"], normalized)
+        return
+
     path = _resolve_csv_path(csv_path=csv_path, campaign=campaign)
     dir_ = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(dir_, exist_ok=True)
@@ -306,17 +312,23 @@ def save_leads(leads: list[dict], csv_path: str = "", campaign: Optional[dict] =
     os.replace(tmp_path, path)
 
 
-def get_lead_by_id(lead_id: str) -> Optional[dict]:
+def get_lead_by_id(lead_id: str, campaign: Optional[dict] = None) -> Optional[dict]:
     """Find a single lead by its ID field in the active campaign."""
+    if backend.is_postgres_backend():
+        active_campaign = campaign or get_active_campaign()
+        lead = backend.postgres_get_lead_by_id(lead_id.strip(), campaign_id=active_campaign.get("id", ""))
+        if lead is not None:
+            return _apply_staleness_defaults(lead, _draft_version(active_campaign), _research_version(active_campaign))
+        return None
     for lead in load_leads():
         if lead.get("ID", "").strip() == lead_id.strip():
             return lead
     return None
 
 
-def update_lead(lead_id: str, updates: dict) -> bool:
+def update_lead(lead_id: str, updates: dict, campaign: Optional[dict] = None) -> bool:
     """Load all leads, update one row by ID, save atomically. Returns True if found."""
-    leads = load_leads()
+    leads = load_leads(campaign=campaign)
     found = False
     for lead in leads:
         if lead.get("ID", "").strip() == lead_id.strip():
@@ -324,7 +336,7 @@ def update_lead(lead_id: str, updates: dict) -> bool:
             found = True
             break
     if found:
-        save_leads(leads)
+        save_leads(leads, campaign=campaign)
     return found
 
 
@@ -340,29 +352,11 @@ def migrate() -> int:
         print(f"No leads found in '{path}'. Nothing to migrate.")
         return 0
 
-    prefix = (campaign.get("id_prefix") or "LEAD").upper()
-    already_done = sum(1 for lead in leads if lead.get("ID", "").startswith(f"{prefix}-"))
-    if already_done == len(leads):
-        print(f"Already migrated: all {len(leads)} leads have {prefix}- IDs.")
+    assigned = ensure_lead_ids(leads, campaign=campaign)
+    if assigned == 0:
+        print(f"Already migrated: all {len(leads)} leads already have IDs.")
         return 0
 
-    draft_version = _draft_version(campaign)
-    research_version = _research_version(campaign)
-    for i, lead in enumerate(leads, start=1):
-        lead["ID"] = f"{prefix}-{i:04d}"
-        if not lead.get("Status"):
-            lead["Status"] = "new"
-        if not lead.get("Contact_Count"):
-            lead["Contact_Count"] = "0"
-        if not lead.get("Drafts_Approved"):
-            lead["Drafts_Approved"] = "0"
-        lead["Preferred_Channel"] = preferred_channel(lead)
-        if not lead.get("Draft_Config_Version") and _data_exists(lead, ["Email_Draft", "WhatsApp_Draft", "Phone_Script"]):
-            lead["Draft_Config_Version"] = draft_version
-        if not lead.get("Research_Config_Version") and _data_exists(lead, ["Website_Category", "Google_Rank_Keyword", "Google_Rating"]):
-            lead["Research_Config_Version"] = research_version
-
     save_leads(leads, campaign=campaign)
-    print(f"Migrated {len(leads)} leads -> '{path}'")
-    print(f"IDs: {prefix}-0001 ... {prefix}-{len(leads):04d}")
-    return len(leads)
+    print(f"Migrated {assigned} lead(s) -> '{path}'")
+    return assigned

@@ -18,14 +18,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import crm_backend as backend
 from campaign_service import (
     bump_campaign_version,
     create_campaign,
     get_active_campaign,
     get_campaign,
-    get_flyer_path,
     get_hooks_library_path,
-    get_portfolio_dir,
     get_template_overrides_path,
     list_campaigns,
     mark_campaign_stage_run,
@@ -34,6 +33,7 @@ from campaign_service import (
     update_campaign,
 )
 from crm_mailer import format_phone_e164, send_email
+from crm_scrape import scrape_campaign
 from crm_store import (
     ALL_COLUMNS,
     TERMINAL_STATUSES,
@@ -55,6 +55,7 @@ from crm_templates import (
     invalidate_campaign_copy_cache,
     parse_email_draft,
 )
+from crm_schedule import clear_scheduled_send, queue_scheduled_email, scheduled_send_label
 from crm_tracker import check_and_archive_stale, log_contact, parse_contact_log
 
 
@@ -98,11 +99,6 @@ def _score_bar(score_str: str) -> str:
     filled = "█" * score
     empty = "░" * (10 - score)
     return f"{filled}{empty} {score}/10"
-
-
-def _save_upload(uploaded_file, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(uploaded_file.getbuffer())
 
 
 def _campaign_state_key(campaign: dict, name: str) -> str:
@@ -162,14 +158,6 @@ def _render_subject_editor(campaign: dict, lead: dict, *, key_prefix: str, curre
     return subject.strip()
 
 
-def _write_json_payload(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if payload:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    elif path.exists():
-        path.unlink()
-
-
 def _extract_urls(*texts: str) -> list[str]:
     seen: set[str] = set()
     urls: list[str] = []
@@ -189,6 +177,15 @@ def _render_draft_links(*texts: str) -> None:
     st.caption("Links")
     for url in urls:
         st.markdown(f"- [{url}]({url})")
+
+
+def _write_json_payload(path_value: str, payload: dict) -> None:
+    path = Path(path_value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if payload:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif path.exists():
+        path.unlink()
 
 
 def _build_whatsapp_link(phone: str, draft: str) -> str | None:
@@ -285,6 +282,7 @@ def _set_manual_status(
         if row.get("ID") != lead_id:
             continue
         row["Status"] = status
+        clear_scheduled_send(row)
         if status in TERMINAL_STATUSES or status in {"replied", "meeting_scheduled", "no_contact"}:
             row["Next_Action_Type"] = "none"
             row["Next_Action_Date"] = ""
@@ -310,6 +308,7 @@ def _save_draft_edits(
     whatsapp: str,
     phone_script: str,
     selected_channel: str,
+    schedule_choice: str = "",
 ) -> dict | None:
     all_leads = load_leads(campaign=campaign)
     updated: dict | None = None
@@ -329,6 +328,10 @@ def _save_draft_edits(
         row["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
         if row.get("Status") in {"new", "draft_ready"}:
             row["Status"] = "approved"
+        if schedule_choice in {"today", "tomorrow"} and "email" in available_channels(row):
+            queue_scheduled_email(row, schedule_choice)
+        elif schedule_choice == "clear":
+            clear_scheduled_send(row)
         updated = dict(row)
         break
     if updated is not None:
@@ -359,9 +362,10 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
     phone_script = st.text_area("Phone script", value=lead.get("Phone_Script", ""), height=220, key=f"{key_prefix}_phone")
     _render_draft_links(email_body, wa_draft, phone_script)
     action_note = st.text_input("Action note", value="", key=f"{key_prefix}_action_note", placeholder="Optional note for the contact log")
+    st.caption(f"Queue status: {scheduled_send_label(lead)}")
 
     save_col, log_col = st.columns([1, 2])
-    if save_col.button("Save Drafts", key=f"{key_prefix}_save_drafts", type="primary"):
+    if save_col.button("Save + Approve", key=f"{key_prefix}_save_drafts", type="primary"):
         _save_draft_edits(
             campaign,
             lid,
@@ -370,9 +374,37 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             whatsapp=wa_draft,
             phone_script=phone_script,
             selected_channel=selected_channel,
+            schedule_choice="clear",
         )
         reload()
-    log_col.caption("Saving here also marks the draft as approved/fresh so you can send it immediately.")
+    log_col.caption("Saving here marks the draft approved/fresh without queueing an automatic send.")
+
+    if "email" in channel_options:
+        queue_col1, queue_col2 = st.columns(2)
+        if queue_col1.button("Queue Send Today", key=f"{key_prefix}_queue_today"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+                schedule_choice="today",
+            )
+            reload()
+        if queue_col2.button("Queue Send Tomorrow", key=f"{key_prefix}_queue_tomorrow"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+                schedule_choice="tomorrow",
+            )
+            reload()
 
     if "email" in channel_options:
         st.markdown("**Email**")
@@ -386,9 +418,10 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 whatsapp=wa_draft,
                 phone_script=phone_script,
                 selected_channel=selected_channel,
+                schedule_choice="clear",
             )
             with st.spinner("Sending email..."):
-                ok = send_email(lid, notes=action_note)
+                ok = send_email(lid, notes=action_note, campaign=campaign)
             if ok:
                 reload()
         if c2.button("Mark Email Sent", key=f"{key_prefix}_mark_email"):
@@ -400,8 +433,9 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 whatsapp=wa_draft,
                 phone_script=phone_script,
                 selected_channel=selected_channel,
+                schedule_choice="clear",
             )
-            log_contact(lid, "sent", notes=action_note, channel="email")
+            log_contact(lid, "sent", notes=action_note, channel="email", campaign=campaign)
             reload()
 
     if "whatsapp" in channel_options:
@@ -421,8 +455,9 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 whatsapp=wa_draft,
                 phone_script=phone_script,
                 selected_channel=selected_channel,
+                schedule_choice="clear",
             )
-            log_contact(lid, "sent", notes=action_note, channel="whatsapp")
+            log_contact(lid, "sent", notes=action_note, channel="whatsapp", campaign=campaign)
             reload()
 
     if "phone" in channel_options:
@@ -438,7 +473,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 phone_script=phone_script,
                 selected_channel=selected_channel,
             )
-            log_contact(lid, "called", notes=action_note, channel="phone")
+            log_contact(lid, "called", notes=action_note, channel="phone", campaign=campaign)
             reload()
         if c2.button("Voicemail", key=f"{key_prefix}_voicemail"):
             _save_draft_edits(
@@ -450,7 +485,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 phone_script=phone_script,
                 selected_channel=selected_channel,
             )
-            log_contact(lid, "voicemail", notes=action_note, channel="phone")
+            log_contact(lid, "voicemail", notes=action_note, channel="phone", campaign=campaign)
             reload()
         if c3.button("No Answer", key=f"{key_prefix}_no_answer"):
             _save_draft_edits(
@@ -462,7 +497,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 phone_script=phone_script,
                 selected_channel=selected_channel,
             )
-            log_contact(lid, "no_answer", notes=action_note, channel="phone")
+            log_contact(lid, "no_answer", notes=action_note, channel="phone", campaign=campaign)
             reload()
 
     st.markdown("**Status**")
@@ -499,6 +534,7 @@ def _is_bulk_email_ready(lead: dict) -> bool:
         and (lead.get("Email") or "").strip() != ""
         and (lead.get("Email_Draft") or "").strip() != ""
         and lead.get("Draft_Stale") != "1"
+        and (lead.get("Scheduled_Send_Status") or "").strip() != "queued"
     )
 
 
@@ -681,25 +717,36 @@ def _persist_campaign_copy_changes(
     hooks_payload: dict | None = None,
     template_payload: dict | None = None,
 ) -> None:
-    if hooks_payload is not None:
-        _write_json_payload(Path(get_hooks_library_path(campaign)), hooks_payload)
-    if template_payload is not None:
-        _write_json_payload(Path(get_template_overrides_path(campaign)), template_payload)
+    if backend.is_postgres_backend():
+        updates: dict[str, object] = {}
+        if hooks_payload is not None:
+            updates["hooks_library_json"] = hooks_payload
+        if template_payload is not None:
+            updates["template_overrides_json"] = template_payload
+        if updates:
+            update_campaign(campaign["id"], updates)
+    else:
+        changed = False
+        if hooks_payload is not None:
+            _write_json_payload(get_hooks_library_path(campaign), hooks_payload)
+            changed = True
+        if template_payload is not None:
+            _write_json_payload(get_template_overrides_path(campaign), template_payload)
+            changed = True
+        if changed:
+            bump_campaign_version(campaign["id"])
     invalidate_campaign_copy_cache(campaign)
-    bump_campaign_version(campaign["id"])
 
 
 def _render_campaign_template_editor(campaign: dict) -> None:
     st.divider()
     st.subheader("Template Editor")
     st.caption("Edit campaign-specific draft copy here. Saving changes marks existing drafts as stale so you can regenerate them with the new wording.")
-    st.caption(f"Hooks file: {get_hooks_library_path(campaign)}")
-    st.caption(f"Template overrides: {get_template_overrides_path(campaign)}")
 
     placeholder_help = (
         "Available placeholders: {{hook}}, {{salutation}}, {{contact}}, {{price}}, {{sender_name}}, "
         "{{sender_company}}, {{sender_website}}, {{sender_phone}}, {{sender_email}}, {{rank_keyword}}, "
-        "{{rank_keyword_district}}, {{portfolio_block}}, {{portfolio_first}}, {{competitors_line}}, "
+        "{{rank_keyword_district}}, {{competitors_line}}, "
         "{{competitors_short}}, {{subject_intro}}, {{subject_name}}."
     )
 
@@ -866,6 +913,7 @@ def _render_dashboard(campaign: dict, leads: list[dict]) -> None:
         lead for lead in leads
         if lead.get("Status") not in TERMINAL_STATUSES
         and lead.get("Status") != "no_contact"
+        and (lead.get("Scheduled_Send_Status") or "").strip() != "queued"
         and lead.get("Next_Action_Type", "none") not in ("none", "")
         and (not lead.get("Next_Action_Date") or lead.get("Next_Action_Date") <= today)
     ]
@@ -984,14 +1032,6 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
                 if item.strip():
                     st.markdown(f"- {item.strip()}")
 
-        portfolio_dir = Path(get_portfolio_dir(campaign))
-        portfolio_imgs = sorted(path for path in portfolio_dir.glob("*.png"))
-        if portfolio_imgs:
-            with st.expander("Portfolio reference", expanded=False):
-                cols = st.columns(min(3, len(portfolio_imgs)))
-                for idx, img in enumerate(portfolio_imgs[:3]):
-                    cols[idx].image(str(img), caption=img.name, width="stretch")
-
     with right:
         st.subheader("Drafts")
         channel_options = available_channels(selected)
@@ -1014,12 +1054,15 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
         wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120, key=f"{review_key_prefix}_wa")
         phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240, key=f"{review_key_prefix}_phone")
         _render_draft_links(email_body, wa_draft, phone_script)
-        c1, c2, c3 = st.columns(3)
+        st.caption(f"Queue status: {scheduled_send_label(selected)}")
+        c1, c2, c3, c4, c5 = st.columns(5)
         approve = c1.button("Approve", type="primary", width="stretch", key=f"{review_key_prefix}_approve")
-        skip = c2.button("Skip", width="stretch", key=f"{review_key_prefix}_skip")
-        blacklist = c3.button("Blacklist", width="stretch", key=f"{review_key_prefix}_blacklist")
+        queue_today = c2.button("Send Today", width="stretch", key=f"{review_key_prefix}_queue_today")
+        queue_tomorrow = c3.button("Send Tomorrow", width="stretch", key=f"{review_key_prefix}_queue_tomorrow")
+        skip = c4.button("Skip", width="stretch", key=f"{review_key_prefix}_skip")
+        blacklist = c5.button("Blacklist", width="stretch", key=f"{review_key_prefix}_blacklist")
 
-        if approve:
+        if approve or queue_today or queue_tomorrow:
             all_leads = load_leads(campaign=campaign)
             for lead in all_leads:
                 if lead.get("ID") == lid:
@@ -1031,6 +1074,12 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
                     lead["Status"] = "approved"
                     lead["Drafts_Approved"] = "1"
                     lead["Draft_Stale"] = "0"
+                    if queue_today and "email" in available_channels(lead):
+                        queue_scheduled_email(lead, "today")
+                    elif queue_tomorrow and "email" in available_channels(lead):
+                        queue_scheduled_email(lead, "tomorrow")
+                    else:
+                        clear_scheduled_send(lead)
                     break
             save_leads(all_leads, campaign=campaign)
             skipped_ids.discard(lid)
@@ -1050,6 +1099,7 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
                 if lead.get("ID") == lid:
                     lead["Status"] = "blacklist"
                     lead["Next_Action_Type"] = "none"
+                    clear_scheduled_send(lead)
                     break
             save_leads(all_leads, campaign=campaign)
             skipped_ids.discard(lid)
@@ -1076,6 +1126,24 @@ def _render_outreach(campaign: dict, leads: list[dict]) -> None:
     if stale_count:
         st.warning(f"{stale_count} approved lead(s) have stale drafts. You can still edit or send them here.")
     st.caption("Outreach is for approved leads only. Use Re-contact for leads you already touched before.")
+
+    today = date.today().isoformat()
+    queued = [lead for lead in approved if (lead.get("Scheduled_Send_Status") or "").strip() == "queued"]
+    queued_today = [
+        lead for lead in queued
+        if (lead.get("Scheduled_Send_At") or "")[:10] == today
+    ]
+    queued_later = [lead for lead in queued if lead not in queued_today]
+    failed_queue = [lead for lead in approved if (lead.get("Scheduled_Send_Error") or "").strip()]
+    sent_today = [
+        lead for lead in leads
+        if (lead.get("Sent_At") or "")[:10] == today
+    ]
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Queued Today", len(queued_today))
+    q2.metric("Queued Later", len(queued_later))
+    q3.metric("Send Errors", len(failed_queue))
+    q4.metric("Sent Today", len(sent_today))
 
     state_keys = _init_outreach_state(campaign)
     notice = st.session_state.get(state_keys["notice"])
@@ -1365,10 +1433,16 @@ def _render_all_leads(campaign: dict, leads: list[dict]) -> None:
                     all_leads = load_leads(campaign=campaign)
                     for row in all_leads:
                         if row.get("ID") == lid:
+                            previous_channel = row.get("Preferred_Channel", "")
                             row["Price"] = price_value
                             row["Preferred_Channel"] = selected_channel
                             if selected_channel != "none" and row.get("Status") not in TERMINAL_STATUSES:
                                 row["Next_Action_Type"] = selected_channel
+                            if (
+                                selected_channel != previous_channel
+                                and (row.get("Scheduled_Send_Status") or "").strip() == "queued"
+                            ):
+                                clear_scheduled_send(row)
                             row["Notes"] = notes_value
                             break
                     save_leads(all_leads, campaign=campaign)
@@ -1379,6 +1453,7 @@ def _render_all_leads(campaign: dict, leads: list[dict]) -> None:
                         if row.get("ID") == lid:
                             row["Status"] = "blacklist"
                             row["Next_Action_Type"] = "none"
+                            clear_scheduled_send(row)
                             break
                     save_leads(all_leads, campaign=campaign)
                     reload()
@@ -1430,7 +1505,11 @@ def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
     with create_right:
         st.subheader("Active Campaign")
         st.markdown(f"**{campaign.get('label', campaign['id'])}**")
-        st.text(f"CSV: {resolve_csv_path(campaign)}")
+        if backend.is_postgres_backend():
+            st.text("Backend: postgres")
+            st.text(f"Database campaign: {campaign.get('id', '')}")
+        else:
+            st.text(f"CSV: {resolve_csv_path(campaign)}")
         st.text(f"ID prefix: {campaign.get('id_prefix', '')}")
         st.text(f"Config version: {campaign.get('config_version', 1)}")
 
@@ -1445,20 +1524,14 @@ def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
 
     stage_cols = st.columns(5)
     if stage_cols[0].button("Scrape", type="primary", width="stretch"):
-        from herold_scraper import scrape_to_csv
-
         with st.spinner("Scraping Herold..."):
-            scrape_to_csv(
-                category=campaign["keyword"],
-                location=campaign["location"],
-                output=resolve_csv_path(campaign),
-            )
+            scrape_campaign(campaign)
             mark_campaign_stage_run(campaign["id"], "scraped")
         reload()
     if stage_cols[1].button("Migrate", width="stretch"):
         from crm_store import migrate
 
-        with st.spinner("Migrating CSV..."):
+        with st.spinner("Assigning lead IDs and CRM fields..."):
             if migrate():
                 mark_campaign_stage_run(campaign["id"], "migrated")
         reload()
@@ -1508,13 +1581,6 @@ def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
         sender_website = col2.text_input("Sender website", value=campaign.get("sender_website", ""))
         sender_phone = col1.text_input("Sender phone", value=campaign.get("sender_phone", ""))
         sender_email = col2.text_input("Sender email", value=campaign.get("sender_email", ""))
-        offer_summary = st.text_area("Offer summary", value=campaign.get("offer_summary", ""), height=100)
-        example_intro = st.text_area("Example intro", value=campaign.get("example_intro", ""), height=80)
-        portfolio_urls_text = st.text_area(
-            "Portfolio URLs",
-            value="\n".join(campaign.get("portfolio_urls", [])),
-            height=120,
-        )
         save_config = st.form_submit_button("Save Campaign Config", type="primary")
 
     if save_config:
@@ -1535,55 +1601,11 @@ def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
                 "sender_website": sender_website.strip(),
                 "sender_phone": sender_phone.strip(),
                 "sender_email": sender_email.strip(),
-                "offer_summary": offer_summary.strip(),
-                "example_intro": example_intro.strip(),
-                "portfolio_urls": [line.strip() for line in portfolio_urls_text.splitlines() if line.strip()],
             },
         )
         reload()
 
     _render_campaign_template_editor(campaign)
-
-    st.divider()
-    asset_left, asset_right = st.columns(2)
-    with asset_left:
-        st.subheader("Flyer")
-        flyer_path = Path(get_flyer_path(campaign))
-        if flyer_path.exists():
-            st.caption(str(flyer_path))
-            st.image(str(flyer_path), caption=flyer_path.name, width="stretch")
-        flyer_upload = st.file_uploader("Upload flyer", type=["png", "jpg", "jpeg"], key="flyer_upload")
-        if st.button("Save Flyer", key="save_flyer"):
-            if flyer_upload is not None:
-                _save_upload(flyer_upload, flyer_path)
-                bump_campaign_version(campaign["id"])
-                reload()
-            else:
-                st.warning("Choose a flyer file first.")
-
-    with asset_right:
-        st.subheader("Portfolio Images")
-        portfolio_dir = Path(get_portfolio_dir(campaign))
-        portfolio_dir.mkdir(parents=True, exist_ok=True)
-        existing = sorted(portfolio_dir.glob("*"))
-        if existing:
-            cols = st.columns(min(3, len(existing)))
-            for idx, img in enumerate(existing[:3]):
-                cols[idx].image(str(img), caption=img.name, width="stretch")
-        uploads = st.file_uploader(
-            "Upload portfolio images",
-            type=["png", "jpg", "jpeg"],
-            accept_multiple_files=True,
-            key="portfolio_uploads",
-        )
-        if st.button("Save Portfolio Images", key="save_portfolio"):
-            if uploads:
-                for upload in uploads:
-                    _save_upload(upload, portfolio_dir / upload.name)
-                bump_campaign_version(campaign["id"])
-                reload()
-            else:
-                st.warning("Choose one or more images first.")
 
 
 def _prepare_active_leads(campaign: dict) -> list[dict]:

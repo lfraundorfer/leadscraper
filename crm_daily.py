@@ -18,7 +18,7 @@ CHANNEL_EMOJI = {"email": "📧", "phone": "📞", "whatsapp": "💬", "none": "
 def show_daily(limit: int = 10) -> None:
     """Show today's action list — leads that need attention today."""
     campaign = get_active_campaign()
-    leads = load_leads()
+    leads = load_leads(campaign=campaign)
     if not leads:
         print("No leads. Run `python crm.py migrate` first.")
         return
@@ -26,7 +26,7 @@ def show_daily(limit: int = 10) -> None:
     # Auto-archive stale leads
     leads, archived = check_and_archive_stale(leads)
     if archived:
-        save_leads(leads)
+        save_leads(leads, campaign=campaign)
         print(f"[Auto-archived {archived} lead(s) with no reply after 14 days → 'no_contact']\n")
 
     today = date.today().isoformat()
@@ -35,6 +35,8 @@ def show_daily(limit: int = 10) -> None:
     for lead in leads:
         status = lead.get("Status", "new")
         if status in TERMINAL_STATUSES or status == "no_contact":
+            continue
+        if (lead.get("Scheduled_Send_Status") or "").strip() == "queued":
             continue
         next_date = lead.get("Next_Action_Date", "")
         next_type = lead.get("Next_Action_Type", "")
@@ -91,7 +93,7 @@ def show_daily(limit: int = 10) -> None:
 def show_stats() -> None:
     """Show pipeline overview stats."""
     campaign = get_active_campaign()
-    leads = load_leads()
+    leads = load_leads(campaign=campaign)
     if not leads:
         print("No leads.")
         return

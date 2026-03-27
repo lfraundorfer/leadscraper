@@ -1,161 +1,84 @@
 # Multi-Niche Campaign CRM
 
-AI-powered outreach automation for local service businesses.
-Create saved campaigns like `Installateur Wien` or `Schluesseldienst Wien`, scrape leads from Herold, research them, generate niche-specific drafts, and run outreach from one dashboard.
+Hybrid outreach workflow for local service businesses:
 
----
+- run `scrape`, `enrich`, `research`, and `analyze` locally
+- store campaigns and leads either in local CSVs or in hosted Postgres
+- review, approve, queue, and monitor outreach in Streamlit
+- send emails through your existing SMTP account
+
+The current v1 target is:
+
+- `Streamlit Community Cloud` for the private dashboard
+- `Supabase Postgres` for hosted data
+- `GitHub Actions` for scheduled sends
+- `Hostinger SMTP` for real email delivery
 
 ## Quick Start
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 
 cp .env.example .env
-# -> fill in your API keys / SMTP settings
+# fill in OpenAI, Google Places, SMTP, and optionally DATABASE_URL
 
-streamlit run app.py           # open dashboard
+streamlit run app.py
 ```
 
-Then in the app:
+## Backends
 
-1. Open **Campaigns**
-2. Create a campaign from `keyword + location`
-3. Run `Scrape -> Migrate -> Enrich -> Research -> Analyze`
-4. Review drafts, approve them, and send outreach
+### Local-only mode
 
----
+Keep `.env` like this:
 
-## Setup: What You Need to Fill In
-
-### 1. OpenAI API Key (required)
-
-Used for website scoring and (optionally) custom hooks.
-
-1. Go to [platform.openai.com](https://platform.openai.com) → API keys → Create new key
-2. Add to `.env`:
-   ```
-   OPENAI_API_KEY=sk-proj-...
-   ```
-
-**Cost:** Website analysis ≈ $0.01–0.02 per lead (gpt-4o). Hooks use 0 tokens by default (pre-written library).
-
----
-
-### 2. Google Places API Key (required for Google reviews + ratings)
-
-Used to fetch star ratings, review count, and review snippets for each lead.
-
-1. Go to [console.cloud.google.com](https://console.cloud.google.com)
-2. Create a project (or use existing)
-3. Enable **"Places API (New)"** — not the old Places API
-4. Create an API key: APIs & Services → Credentials → Create credentials → API key
-5. Add to `.env`:
-   ```
-   GOOGLE_PLACES_API_KEY=AIza...
-   ```
-
-**Cost:** Google gives $200/month free credit. 940 leads ≈ $30 one-time.
-
----
-
-### 3. Email Sending via SMTP (required for Send Email button)
-
-#### Option A: Gmail (recommended)
-
-Gmail requires an **App Password** — your regular password won't work with SMTP.
-
-1. Go to [myaccount.google.com](https://myaccount.google.com) → Security
-2. Make sure **2-Step Verification** is enabled
-3. Search for "App passwords" → Create one → name it "CRM"
-4. Copy the 16-character password shown
-5. Add to `.env`:
-   ```
-   SMTP_HOST=smtp.gmail.com
-   SMTP_PORT=465
-   SMTP_USER=your@gmail.com
-   SMTP_PASS=xxxx xxxx xxxx xxxx
-   SENDER_EMAIL=your@gmail.com
-   ```
-
-#### Option B: Strato / GMX / other provider
-
-```
-SMTP_HOST=smtp.strato.de        # or smtp.gmx.net, mail.your-domain.com, etc.
-SMTP_PORT=465
-SMTP_USER=your@domain.com
-SMTP_PASS=your-password
-SENDER_EMAIL=your@domain.com
+```env
+CRM_BACKEND=csv
 ```
 
-> Port 465 uses SSL (default). If your provider uses STARTTLS, change to port 587.
+Everything stays in local campaign folders and CSV files.
 
----
+### Hybrid hosted mode
 
-### 4. Sender Identity
+Use a hosted Postgres database and switch to:
 
-These values are used as defaults when creating a new campaign. You can override them per campaign in the dashboard.
-
-```
-SENDER_NAME=Linus
-SENDER_EMAIL=linus@megaphonia.com
-SENDER_PHONE=+43 XXX XXXXXXX
-SENDER_COMPANY=Digitalagentur Megaphonia
-SENDER_WEBSITE=https://www.megaphonia.com
+```env
+CRM_BACKEND=postgres
+DATABASE_URL=postgresql://...
+TZ=Europe/Vienna
 ```
 
----
+Then import your current local data once:
 
-### 5. WhatsApp Sending
+```bash
+python crm.py bootstrap-postgres
+```
 
-**No API setup needed.** The "Open WhatsApp" button in the Outreach page generates a `wa.me/` deep link that opens WhatsApp Web (or the app) with the message pre-filled. You just hit Send.
+After that:
 
-Requirements:
+- local CLI commands write directly to Postgres
+- Streamlit reads the same hosted data
+- no CSV upload step is needed
 
-- The lead must have a mobile phone number in `TelNr`
-- Austrian mobile numbers are auto-detected (06xx or +436xx)
+## Daily Workflow
 
-After opening WhatsApp and sending manually, click **"Mark as Sent"** in the dashboard to log it.
+1. Run local pipeline commands:
 
-#### Optional: Automated WhatsApp via Twilio (no manual step)
+```bash
+python crm.py scrape
+python crm.py enrich
+python crm.py research
+python crm.py analyze
+```
 
-If you want fully automated sending without opening WhatsApp manually:
-
-1. Sign up at [twilio.com](https://www.twilio.com)
-2. Enable the **WhatsApp sandbox** (free for testing) or buy a WhatsApp Business number
-3. Add to `.env`:
-   ```
-   TWILIO_ACCOUNT_SID=AC...
-   TWILIO_AUTH_TOKEN=...
-   TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
-   ```
-4. `pip install twilio`
-
----
-
-### 5. Campaign Config vs .env
-
-`.env` is now only for infrastructure and secrets:
-
-- OpenAI API key
-- Google Places API key
-- SMTP settings
-- default sender identity used to seed new campaigns
-
-Each saved campaign owns its own:
-
-- keyword + location
-- leads CSV
-- flyer
-- example / portfolio links
-- portfolio images
-- prices
-- sender-facing copy
-- outreach wording and rank keywords
-
----
+2. Open the Streamlit app and review drafts.
+3. Use one of:
+   - `Approve`
+   - `Send Today`
+   - `Send Tomorrow`
+4. Scheduled emails are sent later by `python crm.py send-scheduled`.
 
 ## CLI Commands
 
@@ -163,77 +86,97 @@ Each saved campaign owns its own:
 python crm.py campaigns
 python crm.py campaign-create Schluesseldienst Wien
 python crm.py campaign-activate schluesseldienst_wien
-python crm.py scrape                              # scrape active campaign from Herold
-python crm.py migrate                             # add CRM columns + assign campaign IDs
-python crm.py enrich [--id SCHLWIEN-0001]
-python crm.py research [--id X] [--from X]
-python crm.py analyze [--id X] [--limit 50]
-python crm.py analyze --gpt-hooks
-python crm.py generate-hooks                      # writes the active campaign hook library
-python crm.py daily
-python crm.py log SCHLWIEN-0001 sent
+
+python crm.py scrape
+python crm.py migrate
+python crm.py enrich --id SCHLWIEN-0001
+python crm.py research --id SCHLWIEN-0001
+python crm.py analyze --limit 50
+python crm.py refresh-drafts
+
+python crm.py bootstrap-postgres
+python crm.py bootstrap-postgres --force
+
 python crm.py send-email SCHLWIEN-0001 --dry-run
+python crm.py send-scheduled --dry-run
+python crm.py send-scheduled
+
+python crm.py daily
 python crm.py stats
 ```
 
----
+## Streamlit Pages
 
-## Dashboard (Streamlit)
+- `Campaigns`: create/activate campaigns, edit config, edit hooks/templates, run pipeline stages
+- `Dashboard`: KPIs and batch draft generation
+- `Review Queue`: review drafts, approve, queue for today/tomorrow
+- `Outreach`: manual email/WhatsApp/phone actions, queued send overview
+- `All Leads`: filter/search the whole active campaign
+
+## Scheduled Sending
+
+Queued send rules:
+
+- `Approve only` keeps the draft approved without scheduling a send
+- `Send Today` queues for today at `17:00 Europe/Vienna` if still before that time, otherwise next business day `09:00`
+- `Send Tomorrow` queues for the next business day at `09:00 Europe/Vienna`
+
+The sender only processes leads where:
+
+- `Scheduled_Send_Status = queued`
+- `Scheduled_Send_Channel = email`
+- `Scheduled_Send_At <= now`
+
+Run it manually:
 
 ```bash
-streamlit run app.py
+python crm.py send-scheduled
 ```
 
-| Page             | What it does                                                           |
-| ---------------- | ---------------------------------------------------------------------- |
-| **Campaigns**    | Create / activate campaigns, edit niche config, upload flyer/assets, run pipeline stages |
-| **Dashboard**    | KPIs, pipeline funnel, today's actions, bulk draft generation          |
-| **Review Queue** | Review AI drafts with research data → approve or edit before sending   |
-| **Outreach**     | One-click Send Email / Open WhatsApp / phone script for approved leads |
-| **All Leads**    | Search and filter active-campaign leads; inspect stale research/drafts |
+Or schedule it with GitHub Actions using `.github/workflows/send-scheduled.yml`.
 
----
+## Environment Variables
 
-## Pipeline Flow
+Required for the hybrid hosted setup:
 
+```env
+CRM_BACKEND=postgres
+DATABASE_URL=postgresql://...
+OPENAI_API_KEY=...
+GOOGLE_PLACES_API_KEY=...
+SMTP_HOST=smtp.hostinger.com
+SMTP_PORT=465
+SMTP_USER=you@your-domain.com
+SMTP_PASS=...
+SENDER_NAME=Linus
+SENDER_EMAIL=you@your-domain.com
+SENDER_PHONE=+43...
+SENDER_COMPANY=...
+SENDER_WEBSITE=https://...
+TZ=Europe/Vienna
 ```
-new → draft_ready → approved → contacted → replied → meeting_scheduled → won
-                                                                        → lost
-                                         → (3x no reply, 14 days)     → no_contact
-```
 
-Campaign config changes mark old drafts / research as stale. Re-run the relevant step to refresh them.
+## What Changed In This Version
 
----
+- added a shared `csv | postgres` backend switch
+- moved hooks/template overrides into campaign JSON for Postgres mode
+- removed flyer, screenshots, portfolio images, and portfolio URL copy from the v1 flow
+- added scheduled email queue fields and processing
+- kept WhatsApp and phone as manual actions
+- kept heavy scraping/research/analyze work local
 
-## Token Usage (OpenAI)
+## Files To Know
 
-| Operation                                      | Cost (gpt-4o)    |
-| ---------------------------------------------- | ---------------- |
-| Website analysis per lead                      | ~$0.015          |
-| Custom hook per lead (`--gpt-hooks`)           | ~$0.005 extra    |
-| Hook library generation (once, all categories) | ~$0.03 total     |
-| **Default run (no `--gpt-hooks`)**             | **~$0.015/lead** |
-
-940 leads × $0.015 ≈ **$14 total** for a full analysis run.
-
----
-
-## File Structure
-
-```
-├── crm.py                 CLI entry point
-├── campaign_service.py    Saved campaign registry + active campaign resolution
-├── crm_store.py           CSV persistence for the active campaign
-├── crm_research.py        Website fetch + Google Places API + rank checking
-├── crm_enrich.py          Contact name enrichment from FirmenABC
-├── crm_analyze.py         OpenAI website scoring + draft generation
-├── crm_templates.py       Campaign-aware templates + hook library handling
-├── crm_mailer.py          SMTP email sender + WhatsApp link generator
-├── crm_tracker.py         Contact logging + follow-up scheduling
-├── crm_daily.py           Daily action list + pipeline stats
-├── app.py                 Streamlit dashboard
-├── campaigns/             Saved campaign configs, assets, portfolio, and CSVs
-├── .env                   Your secrets / infrastructure config
-└── .env.example           Template for .env
+```text
+crm.py              CLI entry point
+crm_scrape.py       Backend-aware scraping
+crm_backend.py      Postgres schema and persistence helpers
+campaign_service.py Campaign config + active campaign handling
+crm_store.py        Lead load/save logic
+crm_schedule.py     Vienna scheduling rules
+crm_scheduled.py    Queued email sender
+crm_mailer.py       SMTP sending
+crm_tracker.py      Contact logging and follow-up logic
+crm_templates.py    Hooks, templates, and draft rendering
+app.py              Streamlit dashboard
 ```

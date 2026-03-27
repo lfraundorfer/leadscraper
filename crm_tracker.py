@@ -4,9 +4,11 @@ crm_tracker.py – State machine for logging contact attempts and scheduling fol
 
 from __future__ import annotations
 
+import crm_backend as backend
 import json
 from datetime import date, datetime, timedelta
 
+from crm_schedule import clear_scheduled_send
 from crm_store import default_preferred_channel, load_leads, save_leads, update_lead, TERMINAL_STATUSES
 
 # Follow-up delays in days after each contact attempt
@@ -77,7 +79,7 @@ def append_contact_log(lead: dict, *, at: str, channel: str, outcome: str, notes
     lead["Contact_Log"] = format_contact_log(entries)
 
 
-def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") -> None:
+def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "", campaign: dict | None = None) -> None:
     """
     Log a contact attempt and update the lead state accordingly.
 
@@ -87,7 +89,7 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
       meeting       → Status = "meeting_scheduled"
       done / won / lost / blacklist → terminal states
     """
-    leads = load_leads()
+    leads = load_leads(campaign=campaign)
     lead = next((l for l in leads if l.get("ID", "").strip() == lead_id.strip()), None)
     if lead is None:
         print(f"Lead {lead_id} not found.")
@@ -122,6 +124,7 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
     lead["Status"] = new_status
     lead["Last_Contact_Date"] = today_str
     lead["Channel_Used"] = used_channel
+    clear_scheduled_send(lead)
     append_contact_log(lead, at=timestamp, channel=used_channel, outcome=outcome, notes=notes)
 
     # Append notes
@@ -130,7 +133,23 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
         sep = " | " if existing else ""
         lead["Notes"] = f"{existing}{sep}[{today_str}] {notes}"
 
-    save_leads(leads)
+    save_leads(leads, campaign=campaign)
+    active_campaign = campaign
+    if active_campaign is None:
+        try:
+            from campaign_service import get_active_campaign
+            active_campaign = get_active_campaign()
+        except Exception:
+            active_campaign = None
+    if backend.is_postgres_backend() and active_campaign is not None:
+        backend.postgres_record_contact_event(
+            active_campaign.get("id", ""),
+            lead_id,
+            occurred_at=timestamp,
+            channel=used_channel,
+            outcome=outcome,
+            notes=notes,
+        )
     print(f"Logged: {lead_id} → {new_status} | next: {lead.get('Next_Action_Type', '-')} on {lead.get('Next_Action_Date', '-')}")
 
 

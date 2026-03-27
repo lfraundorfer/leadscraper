@@ -1,0 +1,59 @@
+name: Send Scheduled Emails
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without sending emails"
+        required: false
+        default: "false"
+      limit:
+        description: "Max queued emails to process"
+        required: false
+        default: "100"
+
+concurrency:
+  group: scheduled-email-sender
+  cancel-in-progress: false
+
+jobs:
+  send-scheduled:
+    runs-on: ubuntu-latest
+    env:
+      CRM_BACKEND: postgres
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      TZ: ${{ secrets.TZ }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scheduled sender
+        run: |
+          if [ -z "$TZ" ]; then
+            export TZ="Europe/Vienna"
+          fi
+          LIMIT="${{ inputs.limit }}"
+          if [ -z "$LIMIT" ]; then
+            LIMIT="100"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            python crm.py send-scheduled --dry-run --limit "$LIMIT"
+          else
+            python crm.py send-scheduled --limit "$LIMIT"
+          fi

@@ -2,8 +2,8 @@
 campaign_service.py - Saved campaign registry and active campaign resolution.
 
 Campaigns are stored under campaigns/<campaign_id>/ with a config.json and
-campaign-local assets. The legacy installateur setup is bootstrapped into the
-registry so existing data keeps working.
+campaign-local hooks/templates. The legacy installateur setup is bootstrapped
+into the registry so existing data keeps working.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import crm_backend as backend
 
 ROOT_DIR = Path(__file__).resolve().parent
 CAMPAIGNS_DIR = ROOT_DIR / "campaigns"
@@ -65,11 +66,6 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _portfolio_urls_from_env() -> list[str]:
-    raw = os.getenv("PORTFOLIO_URLS", "").strip()
-    return [line.strip() for line in raw.splitlines() if line.strip()]
-
-
 def _default_offer_summary(keyword: str, location: str) -> str:
     return (
         f"Wir entwickeln moderne, mobiloptimierte Websites fuer {keyword}-Betriebe "
@@ -78,7 +74,7 @@ def _default_offer_summary(keyword: str, location: str) -> str:
 
 
 def _default_example_intro(keyword: str) -> str:
-    return f"Hier ein paar Beispiele, wie das fuer einen {keyword}-Betrieb aussehen koennte:"
+    return f"Wenn das relevant ist, schicke ich Ihnen gern 2-3 konkrete Ideen fuer einen {keyword}-Betrieb:"
 
 
 def _campaign_layout(campaign_id: str) -> dict[str, Path]:
@@ -86,9 +82,6 @@ def _campaign_layout(campaign_id: str) -> dict[str, Path]:
     return {
         "campaign_dir": campaign_dir,
         "csv_path": campaign_dir / "leads.csv",
-        "assets_dir": campaign_dir / "assets",
-        "flyer_path": campaign_dir / "assets" / "flyer.png",
-        "portfolio_dir": campaign_dir / "portfolio",
         "hooks_library_path": campaign_dir / "hooks_library.json",
         "template_overrides_path": campaign_dir / "template_overrides.json",
         "archive_dir": campaign_dir / "archive",
@@ -109,10 +102,8 @@ def _default_campaign_config(keyword: str, location: str, campaign_id: str | Non
         "price_default": os.getenv("PRICE_DEFAULT", "500"),
         "price_monthly": os.getenv("PRICE_MONTHLY", "25"),
         "turnaround_days": 14,
-        "portfolio_urls": _portfolio_urls_from_env(),
-        "portfolio_dir": str(layout["portfolio_dir"].relative_to(ROOT_DIR)),
-        "flyer_path": str(layout["flyer_path"].relative_to(ROOT_DIR)),
         "hooks_library_path": str(layout["hooks_library_path"].relative_to(ROOT_DIR)),
+        "template_overrides_path": str(layout["template_overrides_path"].relative_to(ROOT_DIR)),
         "sender_name": os.getenv("SENDER_NAME", "Linus"),
         "sender_company": os.getenv("SENDER_COMPANY", "Digitalagentur"),
         "sender_website": os.getenv("SENDER_WEBSITE", ""),
@@ -146,17 +137,15 @@ def _legacy_campaign_config() -> dict[str, Any]:
         "price_default": os.getenv("PRICE_DEFAULT", "500"),
         "price_monthly": os.getenv("PRICE_MONTHLY", "25"),
         "turnaround_days": 14,
-        "portfolio_urls": _portfolio_urls_from_env(),
-        "portfolio_dir": str(layout["portfolio_dir"].relative_to(ROOT_DIR)),
-        "flyer_path": str(layout["flyer_path"].relative_to(ROOT_DIR)),
         "hooks_library_path": str(layout["hooks_library_path"].relative_to(ROOT_DIR)),
+        "template_overrides_path": str(layout["template_overrides_path"].relative_to(ROOT_DIR)),
         "sender_name": os.getenv("SENDER_NAME", "Linus"),
         "sender_company": os.getenv("SENDER_COMPANY", "Digitalagentur Megaphonia"),
         "sender_website": os.getenv("SENDER_WEBSITE", "https://www.megaphonia.com"),
         "sender_phone": os.getenv("SENDER_PHONE", ""),
         "sender_email": os.getenv("SENDER_EMAIL", ""),
         "offer_summary": _default_offer_summary("Installateur", "Wien"),
-        "example_intro": "Hier ein paar Beispiele, wie das bei Ihnen aussehen koennte:",
+        "example_intro": "Wenn das relevant ist, schicke ich Ihnen gern 2-3 konkrete Ideen dazu:",
         "service_singular": "Installateur",
         "service_plural": "Installateurbetriebe",
         "config_version": 1,
@@ -206,14 +195,11 @@ def _normalize_legacy_installateur_campaign() -> None:
         return
 
     layout = _campaign_layout(LEGACY_CAMPAIGN_ID)
-    layout["assets_dir"].mkdir(parents=True, exist_ok=True)
-    layout["portfolio_dir"].mkdir(parents=True, exist_ok=True)
     layout["archive_dir"].mkdir(parents=True, exist_ok=True)
 
     _move_file_if_needed(ROOT_DIR / "new_leads.csv", layout["csv_path"])
-    _move_file_if_needed(ROOT_DIR / "flyer.png", layout["flyer_path"])
     _move_file_if_needed(ROOT_DIR / "hooks_library.json", layout["hooks_library_path"])
-    _merge_directory_if_needed(ROOT_DIR / "portfolio", layout["portfolio_dir"])
+    _move_file_if_needed(ROOT_DIR / "template_overrides.json", layout["template_overrides_path"])
     _move_file_if_needed(ROOT_DIR / "installateur_wien.csv", layout["archive_dir"] / "installateur_wien.csv")
 
     for backup in sorted(ROOT_DIR.glob("new_leads.csv.bak_*")):
@@ -221,20 +207,31 @@ def _normalize_legacy_installateur_campaign() -> None:
 
     desired_paths = {
         "csv_path": str(layout["csv_path"].relative_to(ROOT_DIR)),
-        "portfolio_dir": str(layout["portfolio_dir"].relative_to(ROOT_DIR)),
-        "flyer_path": str(layout["flyer_path"].relative_to(ROOT_DIR)),
         "hooks_library_path": str(layout["hooks_library_path"].relative_to(ROOT_DIR)),
+        "template_overrides_path": str(layout["template_overrides_path"].relative_to(ROOT_DIR)),
     }
     changed = False
     for key, value in desired_paths.items():
         if config.get(key) != value:
             config[key] = value
             changed = True
+    if "portfolio_urls" in config:
+        config.pop("portfolio_urls", None)
+        changed = True
+    if "portfolio_dir" in config:
+        config.pop("portfolio_dir", None)
+        changed = True
+    if "flyer_path" in config:
+        config.pop("flyer_path", None)
+        changed = True
     if changed:
         _write_json(config_path, config)
 
 
 def ensure_campaign_system() -> None:
+    if backend.is_postgres_backend():
+        backend.ensure_postgres_ready()
+        return
     CAMPAIGNS_DIR.mkdir(parents=True, exist_ok=True)
     registry = _read_json(REGISTRY_PATH, {"active_campaign_id": "", "campaigns": {}})
     changed = False
@@ -259,6 +256,8 @@ def ensure_campaign_system() -> None:
 
 
 def load_registry() -> dict[str, Any]:
+    if backend.is_postgres_backend():
+        return backend.postgres_load_registry()
     ensure_campaign_system()
     registry = _read_json(REGISTRY_PATH, {"active_campaign_id": LEGACY_CAMPAIGN_ID, "campaigns": {}})
     registry.setdefault("campaigns", {})
@@ -268,6 +267,11 @@ def load_registry() -> dict[str, Any]:
 
 
 def save_registry(registry: dict[str, Any]) -> None:
+    if backend.is_postgres_backend():
+        active_id = str(registry.get("active_campaign_id") or "").strip()
+        if active_id:
+            backend.postgres_set_active_campaign_id(active_id)
+        return
     _write_json(REGISTRY_PATH, registry)
 
 
@@ -295,6 +299,8 @@ def resolve_campaign_file(campaign: dict[str, Any], key: str) -> str:
 
 
 def get_campaign(campaign_id: str) -> dict[str, Any]:
+    if backend.is_postgres_backend():
+        return backend.postgres_get_campaign(campaign_id)
     registry = load_registry()
     meta = registry.get("campaigns", {}).get(campaign_id)
     if not meta:
@@ -310,6 +316,8 @@ def get_campaign(campaign_id: str) -> dict[str, Any]:
 
 
 def list_campaigns() -> list[dict[str, Any]]:
+    if backend.is_postgres_backend():
+        return backend.postgres_list_campaigns()
     registry = load_registry()
     campaigns: list[dict[str, Any]] = []
     for cid in sorted(registry.get("campaigns", {})):
@@ -322,12 +330,24 @@ def list_campaigns() -> list[dict[str, Any]]:
 
 
 def get_active_campaign() -> dict[str, Any]:
+    if backend.is_postgres_backend():
+        active_id = backend.postgres_get_active_campaign_id()
+        campaigns = backend.postgres_list_campaigns()
+        if not campaigns:
+            raise KeyError("No campaigns available. Run `python crm.py bootstrap-postgres` first.")
+        if not active_id:
+            active_id = campaigns[0]["id"]
+            backend.postgres_set_active_campaign_id(active_id)
+        return backend.postgres_get_campaign(active_id)
     registry = load_registry()
     active_id = registry.get("active_campaign_id") or LEGACY_CAMPAIGN_ID
     return get_campaign(active_id)
 
 
 def set_active_campaign(campaign_id: str) -> dict[str, Any]:
+    if backend.is_postgres_backend():
+        backend.postgres_set_active_campaign_id(campaign_id)
+        return backend.postgres_get_campaign(campaign_id)
     registry = load_registry()
     if campaign_id not in registry.get("campaigns", {}):
         raise KeyError(f"Unknown campaign: {campaign_id}")
@@ -341,6 +361,8 @@ def _campaign_config_path(campaign_id: str) -> Path:
 
 
 def save_campaign_config(config: dict[str, Any]) -> dict[str, Any]:
+    if backend.is_postgres_backend():
+        return backend.postgres_save_campaign(config)
     config_path = _campaign_config_path(config["id"])
     _write_json(config_path, config)
     registry = load_registry()
@@ -353,11 +375,20 @@ def save_campaign_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_campaign(keyword: str, location: str, activate: bool = True) -> dict[str, Any]:
+    if backend.is_postgres_backend():
+        campaign_id = build_campaign_id(keyword, location)
+        try:
+            config = backend.postgres_get_campaign(campaign_id)
+        except Exception:
+            config = _default_campaign_config(keyword, location, campaign_id=campaign_id)
+            backend.postgres_save_campaign(config)
+        if activate:
+            backend.postgres_set_active_campaign_id(campaign_id)
+        return config
     ensure_campaign_system()
     campaign_id = build_campaign_id(keyword, location)
     campaign_dir = CAMPAIGNS_DIR / campaign_id
-    (campaign_dir / "assets").mkdir(parents=True, exist_ok=True)
-    (campaign_dir / "portfolio").mkdir(parents=True, exist_ok=True)
+    campaign_dir.mkdir(parents=True, exist_ok=True)
     try:
         config = get_campaign(campaign_id)
     except Exception:
@@ -421,20 +452,22 @@ def format_rank_keyword(campaign: dict[str, Any], plz: str = "") -> str:
 
 
 def get_portfolio_dir(campaign: dict[str, Any]) -> str:
-    default_path = _campaign_layout_for_config(campaign)["portfolio_dir"]
-    return str(resolve_path(campaign.get("portfolio_dir") or default_path))
+    return ""
 
 
 def get_flyer_path(campaign: dict[str, Any]) -> str:
-    default_path = _campaign_layout_for_config(campaign)["flyer_path"]
-    return str(resolve_path(campaign.get("flyer_path") or default_path))
+    return ""
 
 
 def get_hooks_library_path(campaign: dict[str, Any]) -> str:
+    if backend.is_postgres_backend():
+        return f"postgres://campaigns/{campaign.get('id', '')}/hooks"
     default_path = _campaign_layout_for_config(campaign)["hooks_library_path"]
     return str(resolve_path(campaign.get("hooks_library_path") or default_path))
 
 
 def get_template_overrides_path(campaign: dict[str, Any]) -> str:
+    if backend.is_postgres_backend():
+        return f"postgres://campaigns/{campaign.get('id', '')}/template-overrides"
     default_path = _campaign_layout_for_config(campaign)["template_overrides_path"]
     return str(resolve_path(campaign.get("template_overrides_path") or default_path))

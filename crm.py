@@ -4,13 +4,15 @@ crm.py - CLI entry point for the multi-campaign CRM.
 
 Commands:
   migrate              One-time: add CRM columns + assign IDs to existing CSV
+  bootstrap-postgres   Import existing local campaigns/leads into hosted Postgres
   enrich [--id X]      Fill owner names from FirmenABC
   research [--id X]    Website + Google Reviews + rank + competitors
-  analyze [--id X] [--no-review]  Generate AI messages with Claude
+  analyze [--id X] [--no-review]  Generate AI messages with OpenAI
   refresh-drafts       Re-render saved drafts from current templates only
   daily [--limit N]    Show today's action list
   log <ID> <outcome>   Log a contact attempt
   send-email <ID>      Send the generated email via SMTP
+  send-scheduled       Process queued email sends that are due
   stats                Show pipeline overview
 """
 
@@ -114,8 +116,8 @@ def cmd_campaign_activate(args) -> None:
 
 
 def cmd_scrape(args) -> None:
-    from campaign_service import create_campaign, get_active_campaign, mark_campaign_stage_run, resolve_csv_path
-    from herold_scraper import scrape_to_csv
+    from campaign_service import create_campaign, get_active_campaign, mark_campaign_stage_run
+    from crm_scrape import scrape_campaign
 
     if bool(args.keyword) != bool(args.location):
         print("Use both --keyword and --location together, or neither.")
@@ -126,10 +128,8 @@ def cmd_scrape(args) -> None:
     else:
         campaign = get_active_campaign()
 
-    result = scrape_to_csv(
-        category=campaign["keyword"],
-        location=campaign["location"],
-        output=resolve_csv_path(campaign),
+    result = scrape_campaign(
+        campaign,
         pages=args.pages,
         page_pause=args.page_pause,
         search_pause=args.search_pause,
@@ -142,6 +142,19 @@ def cmd_scrape(args) -> None:
     print(f"Scraped {result['new_entries']} new entries into {result['output']}")
 
 
+def cmd_bootstrap_postgres(args) -> None:
+    import crm_backend as backend
+
+    result = backend.bootstrap_postgres_from_files(force=args.force)
+    print(f"Bootstrapped Postgres: {result['campaigns']} campaign(s), {result['leads']} lead(s).")
+
+
+def cmd_send_scheduled(args) -> None:
+    from crm_scheduled import main
+
+    main(limit=args.limit, dry_run=args.dry_run)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="crm",
@@ -150,6 +163,7 @@ def main() -> None:
         epilog="""
 Examples:
   python crm.py migrate
+  python crm.py bootstrap-postgres
   python crm.py enrich --id LEAD-001
   python crm.py research --id LEAD-001
   python crm.py analyze --id LEAD-001
@@ -159,6 +173,7 @@ Examples:
   python crm.py log LEAD-001 sent --channel email --notes "Sent intro email"
   python crm.py log LEAD-002 called --notes "Left voicemail"
   python crm.py send-email LEAD-001 --dry-run
+  python crm.py send-scheduled --dry-run
   python crm.py stats
   python crm.py campaigns
   python crm.py campaign-create Schluesseldienst Wien
@@ -170,7 +185,10 @@ Examples:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # migrate
-    subparsers.add_parser("migrate", help="Add CRM columns + assign IDs to CSV (run once)")
+    subparsers.add_parser("migrate", help="Add CRM columns + assign IDs to current campaign leads")
+
+    p = subparsers.add_parser("bootstrap-postgres", help="Import existing campaigns and leads into Postgres")
+    p.add_argument("--force", action="store_true", help="Replace existing Postgres campaign data before importing")
 
     # campaigns
     subparsers.add_parser("campaigns", help="List saved campaigns")
@@ -182,7 +200,7 @@ Examples:
     p = subparsers.add_parser("campaign-activate", help="Switch the active campaign")
     p.add_argument("campaign_id", help="Campaign id, e.g. schluesseldienst_wien")
 
-    p = subparsers.add_parser("scrape", help="Scrape Herold leads into the active campaign CSV")
+    p = subparsers.add_parser("scrape", help="Scrape Herold leads into the active campaign backend")
     p.add_argument("--keyword", default="", help="Optional keyword to create/activate before scraping")
     p.add_argument("--location", default="", help="Optional location to create/activate before scraping")
     p.add_argument("--pages", default="", help="Page range like 1-5")
@@ -205,7 +223,7 @@ Examples:
     p.add_argument("--force", action="store_true", help="Re-research even if already done")
 
     # analyze
-    p = subparsers.add_parser("analyze", help="Generate AI messages with Claude")
+    p = subparsers.add_parser("analyze", help="Generate AI messages with OpenAI")
     p.add_argument("--id", default="", help="Only analyze a single lead by ID")
     p.add_argument("--force", action="store_true", help="Re-analyze even if already done")
     p.add_argument("--no-review", action="store_true", help="Auto-approve drafts (skip review step)")
@@ -238,6 +256,10 @@ Examples:
     p.add_argument("id", help="Lead ID, e.g. LEAD-001")
     p.add_argument("--dry-run", action="store_true", help="Print email without sending")
 
+    p = subparsers.add_parser("send-scheduled", help="Send all queued emails that are due right now")
+    p.add_argument("--limit", type=int, default=100, help="Max queued emails to process (default: 100)")
+    p.add_argument("--dry-run", action="store_true", help="Show what would send without sending anything")
+
     # stats
     subparsers.add_parser("stats", help="Show pipeline overview stats")
 
@@ -249,6 +271,7 @@ Examples:
 
     commands = {
         "migrate": cmd_migrate,
+        "bootstrap-postgres": cmd_bootstrap_postgres,
         "campaigns": cmd_campaigns,
         "campaign-create": cmd_campaign_create,
         "campaign-activate": cmd_campaign_activate,
@@ -260,6 +283,7 @@ Examples:
         "daily": cmd_daily,
         "log": cmd_log,
         "send-email": cmd_send_email,
+        "send-scheduled": cmd_send_scheduled,
         "stats": cmd_stats,
         "generate-hooks": cmd_generate_hooks,
     }

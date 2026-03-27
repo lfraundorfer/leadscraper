@@ -9,12 +9,13 @@ import re
 import smtplib
 import urllib.parse
 import html
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid
 
 from campaign_service import get_active_campaign
-from crm_store import get_lead_by_id, TERMINAL_STATUSES
+from crm_store import get_lead_by_id, TERMINAL_STATUSES, update_lead
 from crm_tracker import log_contact
 
 
@@ -31,13 +32,13 @@ def format_phone_e164(phone: str) -> str:
     return "+" + digits
 
 
-def get_whatsapp_link(lead_id: str) -> str | None:
+def get_whatsapp_link(lead_id: str, campaign: dict | None = None) -> str | None:
     """
     Build a wa.me deep-link for the lead's WhatsApp draft.
     Returns the URL string, or None if phone/draft is missing.
     Opens WhatsApp (web or app) with the message pre-filled.
     """
-    lead = get_lead_by_id(lead_id)
+    lead = get_lead_by_id(lead_id, campaign=campaign)
     if lead is None:
         return None
     phone = lead.get("TelNr", "").strip()
@@ -81,50 +82,50 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def send_email(lead_id: str, dry_run: bool = False, notes: str = "") -> bool:
+def send_email_result(lead_id: str, dry_run: bool = False, notes: str = "", campaign: dict | None = None) -> dict[str, str | bool]:
     """
     Build and send the generated email for a lead.
     On success, logs the contact attempt.
-    Returns True on success.
+    Returns a dict with `ok`, `message_id`, and `error`.
     """
-    lead = get_lead_by_id(lead_id)
+    lead = get_lead_by_id(lead_id, campaign=campaign)
     if lead is None:
         print(f"Lead {lead_id} not found.")
-        return False
+        return {"ok": False, "message_id": "", "error": "lead_not_found"}
 
     # Validations
     if lead.get("Status") in TERMINAL_STATUSES:
         print(f"Lead {lead_id} is in terminal state '{lead['Status']}'. Not sending.")
-        return False
+        return {"ok": False, "message_id": "", "error": "terminal_status"}
 
     if not lead.get("Drafts_Approved", "0") == "1":
         print(f"Lead {lead_id} drafts not approved yet. Review in the app first.")
-        return False
+        return {"ok": False, "message_id": "", "error": "draft_not_approved"}
     if lead.get("Draft_Stale") == "1":
         print(f"Lead {lead_id} draft is stale for the current campaign config. Re-run analyze first.")
-        return False
+        return {"ok": False, "message_id": "", "error": "draft_stale"}
 
     to_addr = lead.get("Email", "").strip()
     if not to_addr:
         print(f"Lead {lead_id} has no email address.")
-        return False
+        return {"ok": False, "message_id": "", "error": "missing_email"}
 
     draft = lead.get("Email_Draft", "").strip()
     if not draft:
         print(f"Lead {lead_id} has no email draft. Run `python crm.py analyze` first.")
-        return False
+        return {"ok": False, "message_id": "", "error": "missing_draft"}
 
     subject, body = _parse_draft(draft)
     if not subject:
         print(f"Could not parse subject from Email_Draft for {lead_id}.")
-        return False
+        return {"ok": False, "message_id": "", "error": "missing_subject"}
 
-    campaign = get_active_campaign()
-    sender_name = (campaign.get("sender_name") or os.getenv("SENDER_NAME", "Linus")).strip()
-    sender_email = (campaign.get("sender_email") or os.getenv("SENDER_EMAIL", "")).strip()
+    active_campaign = campaign or get_active_campaign()
+    sender_name = (active_campaign.get("sender_name") or os.getenv("SENDER_NAME", "Linus")).strip()
+    sender_email = (active_campaign.get("sender_email") or os.getenv("SENDER_EMAIL", "")).strip()
     if not sender_email:
         print("SENDER_EMAIL not set in .env")
-        return False
+        return {"ok": False, "message_id": "", "error": "missing_sender_email"}
     from_header = formataddr((sender_name, sender_email))
     sender_domain = sender_email.split("@", 1)[1] if "@" in sender_email else ""
     include_html = _env_enabled("EMAIL_INCLUDE_HTML", default=True)
@@ -171,25 +172,43 @@ def send_email(lead_id: str, dry_run: bool = False, notes: str = "") -> bool:
         print("-" * 60)
         print(body)
         print("=" * 60)
-        return True
+        return {"ok": True, "message_id": str(msg.get("Message-ID") or ""), "error": ""}
 
     # Send via SMTP
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_host = os.getenv("SMTP_HOST", "smtp.hostinger.com")
     smtp_port = int(os.getenv("SMTP_PORT", "465"))
     smtp_user = os.getenv("SMTP_USER", sender_email)
     smtp_pass = os.getenv("SMTP_PASS", "")
 
     if not smtp_pass:
         print("SMTP_PASS not set in .env")
-        return False
+        return {"ok": False, "message_id": "", "error": "missing_smtp_pass"}
 
     try:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
         print(f"Email sent to {to_addr} ({lead.get('Unternehmen', '')})")
-        log_contact(lead_id, "sent", notes=notes, channel="email")
-        return True
+        updates = {
+            "Sent_At": datetime.now().astimezone().isoformat(),
+            "SMTP_Message_ID": str(msg.get("Message-ID") or ""),
+            "Scheduled_Send_Error": "",
+        }
+        if (lead.get("Scheduled_Send_Channel") or "").strip() == "email":
+            updates["Scheduled_Send_Status"] = "sent"
+        update_lead(lead_id, updates, campaign=active_campaign)
+        log_contact(lead_id, "sent", notes=notes, channel="email", campaign=active_campaign)
+        return {"ok": True, "message_id": str(msg.get("Message-ID") or ""), "error": ""}
     except Exception as e:
         print(f"Failed to send email for {lead_id}: {e}")
-        return False
+        return {"ok": False, "message_id": "", "error": str(e)}
+
+
+def send_email(lead_id: str, dry_run: bool = False, notes: str = "", campaign: dict | None = None) -> bool:
+    return bool(send_email_result(lead_id, dry_run=dry_run, notes=notes, campaign=campaign).get("ok"))

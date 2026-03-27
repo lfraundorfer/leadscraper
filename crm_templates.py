@@ -26,7 +26,6 @@ Available slots:
   {{competitors_short}}– First competitor name
   {{rank_keyword}}     – "Installateur 1140"
   {{rank_keyword_district}} – "1140" or "Wien"
-  {{portfolio_block}}  – All portfolio URLs as a block
 """
 
 from __future__ import annotations
@@ -38,21 +37,12 @@ import os
 from pathlib import Path
 import re
 
+import crm_backend as backend
+
 _LEGACY_HOOKS_LIBRARY_PATH = Path(__file__).parent / "hooks_library.json"
 _LEGACY_TEMPLATE_OVERRIDES_PATH = Path(__file__).parent / "template_overrides.json"
 _hooks_override_cache: dict[str, dict[str, list[str]]] = {}
 _template_override_cache: dict[str, dict] = {}
-
-# ---------------------------------------------------------------------------
-# Portfolio & sender config (read once at import time)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_PORTFOLIO_URLS = [
-    "https://installateur-wien.megaphonia.com",
-    "https://installateur-muster.megaphonia.com",
-    "https://muster-installateur.megaphonia.com",
-    "https://instant-install.megaphonia.com",
-]
 
 _PROTECTED_REFRESH_STATUSES = {
     "approved",
@@ -99,6 +89,14 @@ def _resolve_template_overrides_path(campaign: dict | None = None) -> Path:
 
 
 def _load_hooks_override(campaign: dict | None = None) -> dict[str, list[str]]:
+    active_campaign = _resolve_campaign(campaign)
+    if backend.is_postgres_backend() and active_campaign is not None:
+        cache_key = f"campaign:{active_campaign.get('id', '')}:hooks"
+        if cache_key not in _hooks_override_cache:
+            payload = active_campaign.get("hooks_library_json")
+            _hooks_override_cache[cache_key] = payload if isinstance(payload, dict) else {}
+        return _hooks_override_cache[cache_key]
+
     path = _resolve_hooks_library_path(campaign)
     cache_key = str(path)
     if cache_key not in _hooks_override_cache:
@@ -113,6 +111,14 @@ def _load_hooks_override(campaign: dict | None = None) -> dict[str, list[str]]:
 
 
 def _load_template_overrides(campaign: dict | None = None) -> dict:
+    active_campaign = _resolve_campaign(campaign)
+    if backend.is_postgres_backend() and active_campaign is not None:
+        cache_key = f"campaign:{active_campaign.get('id', '')}:template_overrides"
+        if cache_key not in _template_override_cache:
+            payload = active_campaign.get("template_overrides_json")
+            _template_override_cache[cache_key] = payload if isinstance(payload, dict) else {}
+        return _template_override_cache[cache_key]
+
     path = _resolve_template_overrides_path(campaign)
     cache_key = str(path)
     if cache_key not in _template_override_cache:
@@ -128,6 +134,11 @@ def _load_template_overrides(campaign: dict | None = None) -> dict:
 
 
 def invalidate_campaign_copy_cache(campaign: dict | None = None) -> None:
+    active_campaign = _resolve_campaign(campaign)
+    if backend.is_postgres_backend() and active_campaign is not None:
+        _hooks_override_cache.pop(f"campaign:{active_campaign.get('id', '')}:hooks", None)
+        _template_override_cache.pop(f"campaign:{active_campaign.get('id', '')}:template_overrides", None)
+        return
     _hooks_override_cache.pop(str(_resolve_hooks_library_path(campaign)), None)
     _template_override_cache.pop(str(_resolve_template_overrides_path(campaign)), None)
 
@@ -178,18 +189,6 @@ def _campaign_value(campaign: dict | None, key: str, env_key: str = "", default:
         if env_value:
             return env_value
     return default
-
-
-def _campaign_portfolio_urls(campaign: dict | None = None) -> list[str]:
-    active_campaign = _resolve_campaign(campaign)
-    if active_campaign is not None:
-        urls = active_campaign.get("portfolio_urls") or []
-        cleaned = [str(url).strip() for url in urls if str(url).strip()]
-        if cleaned:
-            return cleaned
-
-    env_urls = [line.strip() for line in os.getenv("PORTFOLIO_URLS", "").splitlines() if line.strip()]
-    return env_urls or list(_DEFAULT_PORTFOLIO_URLS)
 
 # ---------------------------------------------------------------------------
 # Hook building blocks (Bausteine) – pre-written, direct "Sie" address
@@ -474,8 +473,14 @@ Antworte AUSSCHLIESSLICH als JSON (kein Markdown, kein Text):
 
 def generate_hooks_library(force: bool = False, campaign: dict | None = None) -> None:
     """Call GPT once to generate quality hooks per category → saves to the active campaign hook library."""
+    active_campaign = _resolve_campaign(campaign)
     hooks_path = _resolve_hooks_library_path(campaign=campaign)
-    if hooks_path.exists() and not force:
+    if backend.is_postgres_backend() and active_campaign is not None:
+        existing = active_campaign.get("hooks_library_json") or {}
+        if existing and not force:
+            print(f"Hook library already exists for {active_campaign.get('id', '')}. Use --force to regenerate.")
+            return
+    elif hooks_path.exists() and not force:
         print(f"{hooks_path.name} already exists at {hooks_path}. Use --force to regenerate.")
         return
 
@@ -504,18 +509,24 @@ def generate_hooks_library(force: bool = False, campaign: dict | None = None) ->
 
     library = json.loads(raw)
 
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
-    hooks_path.write_text(
-        json.dumps(library, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    # Invalidate cache so get_hook() picks up new values immediately.
-    _hooks_override_cache.pop(str(hooks_path), None)
+    if backend.is_postgres_backend() and active_campaign is not None:
+        from campaign_service import update_campaign
+        update_campaign(active_campaign["id"], {"hooks_library_json": library})
+        invalidate_campaign_copy_cache(active_campaign)
+    else:
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
+        hooks_path.write_text(
+            json.dumps(library, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        _hooks_override_cache.pop(str(hooks_path), None)
 
     total = sum(len(v) for v in library.values())
-    print(f"Done. {total} hooks across {len(library)} categories saved to {hooks_path}")
-    print("Edit the campaign hooks_library.json freely — it overrides the built-in defaults.")
+    if backend.is_postgres_backend() and active_campaign is not None:
+        print(f"Done. {total} hooks across {len(library)} categories saved in the database for {active_campaign['id']}.")
+    else:
+        print(f"Done. {total} hooks across {len(library)} categories saved to {hooks_path}")
+        print("Edit the campaign hooks_library.json freely — it overrides the built-in defaults.")
 
 
 # ---------------------------------------------------------------------------
@@ -537,11 +548,6 @@ Betreff: {{subject}}
 
 Wenn jemand heute "Installateur{{rank_keyword_district}}" googelt, findet er{{competitors_line}} – aber nicht Ihr Unternehmen. Diese Kunden gehen zur Konkurrenz, ohne dass Sie auch nur die Chance bekommen anzurufen.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -550,7 +556,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – wir entwickeln für Installateurbetriebe professionelle Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von 2 Wochen um. Beispiel: {{portfolio_first}} – wäre das grundsätzlich interessant?""",
+{{salutation}} {{hook}} – wir entwickeln für Installateurbetriebe professionelle Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von 2 Wochen um. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – wäre das grundsätzlich interessant?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, mein Name ist {{sender_name}}{{sender_company_phone}}. Ich weiß, Sie arbeiten gerade – darf ich Ihnen ganz kurz eine Frage stellen? Es dauert auch nur 30 Sekunden."
@@ -565,11 +571,11 @@ LÖSUNG: "Als auf Handwerksbetriebe in Wien spezialisierte Digitalagentur entwic
 
 EINWÄNDE:
 "Zu teuer" → "€{{price}} einmalig – das ist weniger als ein einziger verlorener Auftrag. Und wir liefern in 2 Wochen."
-"Kein Interesse" → "Ich möchte Ihnen auch gar nichts am Telefon verkaufen. Ich würde Ihnen einfach nur den Link zu ein paar Beispielseiten schicken – Sie schauen sich das in Ruhe an, und wenn's nichts für Sie ist, ignorieren Sie's einfach."
+"Kein Interesse" → "Ich möchte Ihnen auch gar nichts am Telefon verkaufen. Ich würde Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken – Sie schauen sich das in Ruhe an, und wenn's nichts für Sie ist, ignorieren Sie's einfach."
 "Haben genug Kunden" → "Perfekt. Dann wäre eine Website gut um das auch in Zukunft zu sichern – Empfehlungen können schwanken."
 "Keine Zeit" → "Das läuft komplett auf unserer Seite – wir brauchen von Ihnen nur ein kurzes Gespräch fürs Briefing."
 
-CTA: "Okay, dann verbleiben wir so: Ich schicke Ihnen den Link zu unseren Beispielseiten per E-Mail oder WhatsApp. Sie schauen sich das kurz an – auf welche Adresse darf ich das schicken?" """,
+CTA: "Okay, dann verbleiben wir so: Ich schicke Ihnen 2-3 konkrete Ideen per E-Mail oder WhatsApp. Sie schauen sich das kurz an – auf welche Adresse darf ich das schicken?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -585,11 +591,6 @@ Betreff: {{subject}}
 
 Über 65% aller Google-Suchanfragen nach Installateuren kommen vom Smartphone. Eine Website die auf dem Handy nicht richtig funktioniert – zu kleine Schrift, Buttons nicht klickbar – verliert diese Besucher in Sekunden. Google bestraft das zusätzlich mit schlechterem Ranking.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -598,7 +599,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – 65% der Kunden suchen am Handy. Wir entwickeln mobiloptimierte Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von 2 Wochen um. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – 65% der Kunden suchen am Handy. Wir entwickeln mobiloptimierte Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von 2 Wochen um. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich Ihnen kurz eine Frage stellen, dauert 30 Sekunden?"
@@ -614,10 +615,10 @@ LÖSUNG: "Wir entwickeln mobiloptimierte Websites für Installateurbetriebe – 
 EINWÄNDE:
 "Wir haben schon eine Website" → "Ja, ich habe sie gesehen – das Problem ist die Mobildarstellung. Die lässt sich beheben."
 "Zu teuer" → "€{{price}} einmalig – der erste neue Kunde über die Website zahlt das locker."
-"Kein Interesse" → "Ich möchte Ihnen nichts am Telefon verkaufen. Darf ich Ihnen einfach den Link zu ein paar Beispielseiten schicken? Sie schauen's in Ruhe an."
+"Kein Interesse" → "Ich möchte Ihnen nichts am Telefon verkaufen. Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken? Sie schauen's in Ruhe an."
 "Keine Zeit" → "Das erledigen wir komplett – wir brauchen nur ein kurzes Briefing von Ihnen."
 
-CTA: "Dann schicke ich Ihnen den Link. Auf welche E-Mail-Adresse oder Handynummer darf ich das senden?" """,
+CTA: "Dann schicke ich Ihnen 2-3 konkrete Ideen. Auf welche E-Mail-Adresse oder Handynummer darf ich das senden?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -633,11 +634,6 @@ Betreff: {{subject}}
 
 Wenn jemand Ihre Website besucht und keinen einfachen Weg findet, Sie zu kontaktieren – kein Formular, kein Click-to-Call, kein WhatsApp-Button – verlässt er die Seite und ruft den Nächsten an. Der Aufwand des Abtippens einer Nummer reicht aus, um Kunden zu verlieren.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -646,7 +642,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – Kunden, die Ihre Website besuchen, finden keinen einfachen Kontaktweg. Wir lösen das mit einer professionellen Website mit klaren Kontaktwegen zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – Kunden, die Ihre Website besuchen, finden keinen einfachen Kontaktweg. Wir lösen das mit einer professionellen Website mit klaren Kontaktwegen zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – darf ich?"
@@ -662,10 +658,10 @@ PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von 2 Wochen."
 EINWÄNDE:
 "Haben schon eine Website" → "Sehe ich – das Problem ist der fehlende Kontaktweg. Das ist schnell nachgerüstet."
 "Zu teuer" → "€{{price}} einmalig – das zahlt sich beim ersten Auftrag aus."
-"Kein Interesse" → "Darf ich Ihnen einfach den Link zu Beispielseiten schicken? Schauen Sie's in Ruhe an."
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken? Schauen Sie's in Ruhe an."
 "Keine Zeit" → "Das läuft komplett bei uns – Sie brauchen nur einmal kurz Inputs geben."
 
-CTA: "Auf welche Adresse darf ich Ihnen die Beispiele schicken?" """,
+CTA: "Auf welche Adresse darf ich Ihnen die Ideen schicken?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -681,11 +677,6 @@ Betreff: {{subject}}
 
 Wer in Wien nach einem Installateur sucht, googelt "{{rank_keyword}}". Ganz oben erscheinen{{competitors_line}} – Sie tauchen auf der ersten Seite der Google-Suche nicht auf. Das sind täglich Kunden die aktiv nach Ihren Leistungen suchen und stattdessen zur Konkurrenz gehen.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -694,7 +685,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – bei "{{rank_keyword}}" findet man Sie nicht. Wir entwickeln SEO-optimierte Websites zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse an einem kurzen Gespräch?""",
+{{salutation}} {{hook}} – bei "{{rank_keyword}}" findet man Sie nicht. Wir entwickeln SEO-optimierte Websites zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse an einem kurzen Gespräch?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
@@ -710,10 +701,10 @@ PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von 2 Wochen."
 EINWÄNDE:
 "Haben schon eine Website" → "Sehe ich – das Problem liegt an der fehlenden SEO-Optimierung. Die Website ist da, aber Google zeigt sie nicht."
 "Zu teuer" → "€{{price}} einmalig – der erste Auftrag über Google zahlt das."
-"Kein Interesse" → "Dann schicke ich Ihnen einfach den Link zu Beispielseiten. Schauen Sie sich das in Ruhe an."
+"Kein Interesse" → "Dann schicke ich Ihnen einfach 2-3 konkrete Ideen per E-Mail. Schauen Sie sich das in Ruhe an."
 "Keine Zeit" → "Das läuft komplett bei uns. Wir brauchen nur ein kurzes Briefing."
 
-CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -729,11 +720,6 @@ Betreff: {{subject}}
 
 In einer Branche die auf Vertrauen und Qualität aufbaut, entscheidet der erste Eindruck. Eine veraltete Website sendet die falsche Botschaft: Kunden fragen sich, ob der Betrieb noch aktiv ist – und wählen lieber einen Mitbewerber mit modernerem Auftritt. Das kostet täglich Aufträge.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -742,7 +728,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – ein veralteter Webauftritt kostet täglich Kunden. Wir modernisieren Ihre Website zum Festpreis von €{{price}} einmalig und setzen das innerhalb von 2 Wochen um. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – ein veralteter Webauftritt kostet täglich Kunden. Wir modernisieren Ihre Website zum Festpreis von €{{price}} einmalig und setzen das innerhalb von 2 Wochen um. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
@@ -758,10 +744,10 @@ PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von 2 Wochen."
 EINWÄNDE:
 "Läuft so auch" → "Momentan vielleicht. Die Frage ist wie viele Kunden abspringen bevor sie anrufen."
 "Zu teuer" → "€{{price}} einmalig. Das zahlt sich beim ersten zusätzlichen Auftrag aus."
-"Kein Interesse" → "Ich schicke Ihnen einfach den Link zu Beispielseiten – schauen Sie's in Ruhe an."
+"Kein Interesse" → "Ich schicke Ihnen einfach 2-3 konkrete Ideen per E-Mail – schauen Sie's in Ruhe an."
 "Keine Zeit" → "Das erledigen wir – von Ihnen brauchen wir nur ein kurzes Briefing."
 
-CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -777,11 +763,6 @@ Betreff: {{subject}}
 
 Wer heute Ihre Website besucht, sieht eine Platzhalterseite – keine Leistungen, kein Kontakt, keine Information. Diese Besucher sind verloren bevor sie überhaupt die Chance hatten, Sie anzurufen.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -790,7 +771,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – Ihre Website zeigt gerade nur eine Platzhalterseite. Wir ersetzen sie durch eine vollständige Website zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – Ihre Website zeigt gerade nur eine Platzhalterseite. Wir ersetzen sie durch eine vollständige Website zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – darf ich?"
@@ -804,10 +785,10 @@ PREIS: "Festpreis: €{{price}} einmalig. Die vollständige Website steht innerh
 EINWÄNDE:
 "Bauen das selbst" → "Gut zu hören. Darf ich fragen wann das fertig sein soll? Wir könnten das schneller liefern."
 "Zu teuer" → "€{{price}} einmalig – schnell umgesetzt, sofort online."
-"Kein Interesse" → "Darf ich Ihnen einfach den Link zu Beispielseiten schicken?"
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken?"
 "Keine Zeit" → "Das erledigen wir komplett – wir brauchen nur kurze Inputs von Ihnen."
 
-CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -823,11 +804,6 @@ Betreff: {{subject}}
 
 Bevor ein neuer Kunde anruft, schaut er sich die Google-Bewertungen an. Wenige oder schlechte Bewertungen – und er wählt stattdessen einen Mitbewerber mit 50+ positiven Rezensionen. Eine gute Website schafft Vertrauen bevor Kunden überhaupt auf die Sternchen schauen. Das kostet täglich Aufträge, ohne dass Sie es merken.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -836,7 +812,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – wenige oder schlechte Google-Bewertungen kosten Aufträge. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – wenige oder schlechte Google-Bewertungen kosten Aufträge. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
@@ -852,9 +828,9 @@ PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von 2 Wochen."
 EINWÄNDE:
 "Bewertungen stimmen nicht" → "Das glaube ich Ihnen. Eine gute Website zeigt was wirklich dahintersteckt."
 "Zu teuer" → "€{{price}} einmalig – weniger als ein verlorener Auftrag."
-"Kein Interesse" → "Darf ich Ihnen einfach den Link zu Beispielseiten schicken?"
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken?"
 
-CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -870,11 +846,6 @@ Betreff: {{subject}}
 
 Wenn jemand heute "{{rank_keyword}}" googelt, erscheinen{{competitors_line}} ganz oben. Sie tauchen auf der ersten Seite der Google-Suche nicht auf – und die erste Seite ist alles was zählt. Diese Kunden suchen aktiv und gehen zur Konkurrenz.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -883,7 +854,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – bei "{{rank_keyword}}" findet man Sie nicht, aber{{competitors_line}}. Wir lösen das mit einer SEO-optimierten Website zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – bei "{{rank_keyword}}" findet man Sie nicht, aber{{competitors_line}}. Wir lösen das mit einer SEO-optimierten Website zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
@@ -899,10 +870,10 @@ PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von 2 Wochen."
 EINWÄNDE:
 "Haben schon eine Website" → "Sehe ich – das Problem liegt an der SEO. Die Website ist da, Google zeigt sie nur nicht."
 "Zu teuer" → "€{{price}} – der erste Auftrag über Google zahlt das."
-"Kein Interesse" → "Ich schicke Ihnen einfach den Link zu Beispielseiten."
+"Kein Interesse" → "Ich schicke Ihnen einfach 2-3 konkrete Ideen per E-Mail."
 "Keine Zeit" → "Läuft komplett bei uns – kurzes Briefing reicht."
 
-CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 
     # -----------------------------------------------------------------------
@@ -918,11 +889,6 @@ Betreff: {{subject}}
 
 Kunden die einen Installateur suchen, vergleichen Bewertungen. Ein Betrieb mit 50+ positiven Rezensionen gewinnt fast immer gegen einen mit kaum Bewertungen – egal wie gut die Arbeit ist. Eine professionelle Website schafft Vertrauen bevor Kunden auf die Sternchen schauen. Das ist die Realität der Google-Suche.
 
-Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
-{{portfolio_block}}
-
-Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
-
 Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
@@ -931,7 +897,7 @@ Mit freundlichen Grüßen,
 {{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
-{{salutation}} {{hook}} – mit wenigen Google-Bewertungen verlieren Betriebe täglich Kunden an Mitbewerber. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Beispiel: {{portfolio_first}} – Interesse?""",
+{{salutation}} {{hook}} – mit wenigen Google-Bewertungen verlieren Betriebe täglich Kunden an Mitbewerber. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?""",
 
         "phone_script": """\
 OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – 30 Sekunden?"
@@ -947,9 +913,9 @@ PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von 2 Wochen."
 EINWÄNDE:
 "Haben genug Kunden" → "Gut. Aber Empfehlungen schwanken – mit Google kommen Neukunden konstant."
 "Zu teuer" → "€{{price}} einmalig – das zahlt sich beim ersten Neukunden aus."
-"Kein Interesse" → "Darf ich Ihnen einfach den Link zu Beispielseiten schicken?"
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken?"
 
-CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 }
 
@@ -1189,11 +1155,6 @@ def build_slots(lead: dict, hook: str, urgency: str, campaign: dict | None = Non
     sender_phone = f"\n{sender_phone_raw}" if sender_phone_raw else ""
     sender_email = f"\n{sender_email_raw}" if sender_email_raw else ""
 
-    # Portfolio: multi-line block + first URL for WhatsApp
-    portfolio_lines = _campaign_portfolio_urls(active_campaign)
-    portfolio_block = "\n".join(portfolio_lines)
-    portfolio_first = portfolio_lines[0] if portfolio_lines else ""
-
     return {
         "hook": hook,
         "urgency": urgency,
@@ -1217,8 +1178,6 @@ def build_slots(lead: dict, hook: str, urgency: str, campaign: dict | None = Non
         "rank_keyword_district": rank_keyword_district,
         "rating": lead.get("Google_Rating", ""),
         "review_count": lead.get("Google_Review_Count", ""),
-        "portfolio_block": portfolio_block,
-        "portfolio_first": portfolio_first,
     }
 
 
