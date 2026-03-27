@@ -107,7 +107,9 @@ def cached_leads(campaign_id: str) -> list[dict]:
 @st.cache_data(ttl=300)
 def cached_campaign_metrics(campaign_id: str) -> dict[str, int]:
     if backend.is_postgres_backend():
-        return backend.postgres_load_lead_metrics(campaign_id)
+        metric_loader = getattr(backend, "postgres_load_lead_metrics", None)
+        if callable(metric_loader):
+            return metric_loader(campaign_id)
 
     campaign = cached_campaign(campaign_id)
     leads = load_leads(campaign=campaign)
