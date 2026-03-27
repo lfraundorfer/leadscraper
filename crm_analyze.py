@@ -19,36 +19,44 @@ from datetime import date, timedelta
 
 from openai import OpenAI
 
+from campaign_service import format_rank_keyword, get_active_campaign, mark_campaign_stage_run
 from herold_scraper import HeroldFetcher
-from crm_store import load_leads, save_leads, get_bezirk, is_mobile, WIEN_BEZIRK
+from crm_store import WIEN_BEZIRK, available_channels, get_bezirk, is_mobile, load_leads, save_leads
 from crm_research import (
     categorize_website, fetch_and_clean_html,
     ALL_DIRECTORY_DOMAINS, RATE_LIMIT_SEC
 )
-from crm_templates import render_drafts, pick_template_key, choose_hook
+from crm_templates import (
+    choose_hook,
+    is_pending_template_refresh_target,
+    pick_template_key,
+    render_drafts,
+    rerender_saved_draft,
+)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 MODEL = "gpt-4o-mini"
-SENDER_NAME = os.getenv("SENDER_NAME", "Linus")
-SENDER_PHONE = os.getenv("SENDER_PHONE", "")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
 
-NO_WEBSITE_ANALYSIS = {
-    "score": 0,
-    "score_reason": "Kein eigener Webauftritt vorhanden",
-    "pain_points": [
-        "Kein eigener Webauftritt – der Betrieb ist online unsichtbar",
-        "Keine Möglichkeit für Kunden, online Kontakt aufzunehmen",
-        "Konkurrenten mit Website gewinnen diese Kunden automatisch",
-    ],
-    "pain_categories": ["no_website"],
-    "strengths": [],
-    "best_hook": "Ihre Konkurrenten haben alle Websites – Kunden, die Sie suchen, finden nur diese",
-    "urgency_angle": "Jeder Tag ohne Website ist ein verlorener Auftrag",
-}
+
+def build_no_website_analysis(campaign: dict) -> dict:
+    keyword = campaign.get("keyword", "Betrieb")
+    search_phrase = format_rank_keyword(campaign)
+    return {
+        "score": 0,
+        "score_reason": "Kein eigener Webauftritt vorhanden",
+        "pain_points": [
+            "Kein eigener Webauftritt – der Betrieb ist online unsichtbar",
+            "Keine einfache Moeglichkeit fuer Kunden, online Kontakt aufzunehmen",
+            f"Konkurrenten, die bei '{search_phrase}' sichtbar sind, gewinnen diese Kunden automatisch",
+        ],
+        "pain_categories": ["no_website"],
+        "strengths": [],
+        "best_hook": f"Ohne eigene Website verlieren {keyword}-Betriebe Anfragen, bevor ueberhaupt ein Kontakt entsteht",
+        "urgency_angle": "Jeder Tag ohne Website ist ein verlorener Auftrag",
+    }
 
 # ---------------------------------------------------------------------------
 # Channel selection
@@ -56,7 +64,7 @@ NO_WEBSITE_ANALYSIS = {
 
 def select_channel_and_priority(lead: dict, analysis: dict) -> tuple[str, str, int]:
     """
-    Returns (primary_channel, next_action_type, priority 1-5).
+    Returns (preferred_channel, next_action_type, priority 1-5).
     """
     email = lead.get("Email", "").strip()
     tel = lead.get("TelNr", "").strip()
@@ -71,11 +79,7 @@ def select_channel_and_priority(lead: dict, analysis: dict) -> tuple[str, str, i
     if not has_email and not has_phone:
         return "none", "none", 5
 
-    if website_cat in ("none", "") or score == 0:
-        # No website → phone first (strongest pitch)
-        primary = "phone" if has_phone else ("whatsapp" if has_mobile else "email" if has_email else "none")
-    else:
-        primary = "email" if has_email else ("whatsapp" if has_mobile else "phone" if has_phone else "none")
+    primary = "email" if has_email else ("whatsapp" if has_mobile else "phone" if has_phone else "none")
 
     # Calculate priority
     base = 3
@@ -117,7 +121,7 @@ def select_channel_and_priority(lead: dict, analysis: dict) -> tuple[str, str, i
 
 WEBSITE_ANALYSIS_PROMPT = """\
 Du bist ein Webdesign-Experte für österreichische KMU (Handwerksbetriebe).
-Analysiere die folgende Website eines Wiener Installateurbetriebs.
+Analysiere die folgende Website eines Betriebs aus der Branche "{service_plural}" in {location}.
 Antworte AUSSCHLIESSLICH in diesem JSON-Format – kein Markdown, kein Text davor/danach:
 
 {{
@@ -149,9 +153,11 @@ SCORE-SKALA:
 8–9: Gut (modern, mobil, konversionsorientiert)
 10:  Ausgezeichnet
 
-Sei kritisch und realistisch. Die meisten Handwerkerbetriebe liegen bei 3–6.
+Sei kritisch und realistisch. Die meisten kleineren lokalen Betriebe liegen bei 3–6.
 
 UNTERNEHMEN: {company}
+BRANCHE: {service_plural}
+STANDORT: {location}
 URL: {url}
 WEBSITE-INHALT (bereinigter Text):
 ---
@@ -159,9 +165,15 @@ WEBSITE-INHALT (bereinigter Text):
 ---"""
 
 
-def analyze_website(company: str, url: str, html: str, client: OpenAI) -> dict:
+def analyze_website(company: str, url: str, html: str, client: OpenAI, campaign: dict) -> dict:
     """Call GPT-4o to score the website. Returns analysis dict."""
-    prompt = WEBSITE_ANALYSIS_PROMPT.format(company=company, url=url, html=html[:12_000])
+    prompt = WEBSITE_ANALYSIS_PROMPT.format(
+        company=company,
+        url=url,
+        html=html[:12_000],
+        service_plural=campaign.get("service_plural", campaign.get("keyword", "Branche")),
+        location=campaign.get("location", "Oesterreich"),
+    )
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -175,7 +187,7 @@ def analyze_website(company: str, url: str, html: str, client: OpenAI) -> dict:
         raw = re.sub(r"\s*```$", "", raw)
         return json.loads(raw)
     except Exception as e:
-        return {**NO_WEBSITE_ANALYSIS, "score_reason": f"Analyse-Fehler: {e}"}
+        return {**build_no_website_analysis(campaign), "score_reason": f"Analyse-Fehler: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +198,7 @@ def analyze_website(company: str, url: str, html: str, client: OpenAI) -> dict:
 CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "no_website":        "Kein eigener Webauftritt – online komplett unsichtbar",
     "platzhalter":       "Platzhalter-/Under-Construction-Seite – Kunden sehen nichts",
-    "kein_mobil":        "Nicht mobiloptimiert – 65%+ aller Suchen kommen vom Smartphone",
+    "kein_mobil":        "Nicht mobiloptimiert – ein grosser Teil aller Suchen kommt vom Smartphone",
     "kein_kontakt":      "Kein Kontaktweg online (kein Formular, kein Click-to-Call, kein WhatsApp)",
     "bad_reviews":       "Schlechte oder sehr wenige Google-Bewertungen – kostet Vertrauen",
     "not_ranked":        "Nicht auf Google Seite 1 – Konkurrenten nehmen diese Kunden",
@@ -199,7 +211,7 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
 
 HOOK_PROMPT = """\
 Du bist ein erfahrener Verkaufstexter in Wien.
-Schreibe einen personalisierten, knackigen Hook für einen Installateurbetrieb.
+Schreibe einen personalisierten, knackigen Hook fuer einen lokalen Betrieb in der Branche "{service_plural}".
 Antworte AUSSCHLIESSLICH als JSON – kein Markdown, kein Text davor/danach:
 
 {{
@@ -217,6 +229,7 @@ GEFUNDENE PROBLEME (alle, wichtigste zuerst):
 
 ECHTE DATEN:
 - Betrieb: {company}
+- Branche: {service_plural}
 - Website-Score: {score}/10
 - Google-Bewertungen: {rating}★ ({review_count} Rezensionen)
 - Google-Rank für "{rank_keyword}": {rank_position}
@@ -230,7 +243,7 @@ REGELN:
 - IMMER direkte Anrede: "Sie verlieren", "Ihr Betrieb", "Ihre Website" – niemals dritte Person ("Firma X verliert")"""
 
 
-def generate_hook(lead: dict, analysis: dict, client: OpenAI) -> tuple[str, str]:
+def generate_hook(lead: dict, analysis: dict, client: OpenAI, campaign: dict) -> tuple[str, str]:
     """
     Generate a 2-3 sentence hook + urgency line via GPT.
     Uses all pain categories, framed around the 3 core outcomes.
@@ -238,7 +251,7 @@ def generate_hook(lead: dict, analysis: dict, client: OpenAI) -> tuple[str, str]
     """
     adresse = lead.get("Adresse", "")
     plz, _ = get_bezirk(adresse)
-    rank_kw = lead.get("Google_Rank_Keyword") or f"Installateur {plz or 'Wien'}"
+    rank_kw = lead.get("Google_Rank_Keyword") or format_rank_keyword(campaign, plz=plz)
 
     # Build explained pain categories list (all of them, in priority order)
     pain_categories = analysis.get("pain_categories", [])
@@ -253,6 +266,7 @@ def generate_hook(lead: dict, analysis: dict, client: OpenAI) -> tuple[str, str]
 
     prompt = HOOK_PROMPT.format(
         company=lead.get("Unternehmen", ""),
+        service_plural=campaign.get("service_plural", campaign.get("keyword", "Branche")),
         score=analysis.get("score", "?"),
         pain_categories_explained=pain_categories_explained,
         rating=lead.get("Google_Rating", "keine Angabe") or "keine Angabe",
@@ -286,7 +300,7 @@ def generate_hook(lead: dict, analysis: dict, client: OpenAI) -> tuple[str, str]
 # ---------------------------------------------------------------------------
 
 MESSAGES_PROMPT = """\
-Du bist ein freiberuflicher Webdesigner aus Wien (Name: {sender_name}) und erstellst personalisierte Akquise-Materialien für einen konkreten Installateurbetrieb.
+Du bist ein freiberuflicher Webdesigner aus {location} (Name: {sender_name}) und erstellst personalisierte Akquise-Materialien fuer einen konkreten Betrieb in der Branche "{service_plural}".
 
 UNTERNEHMEN: {company}
 KONTAKT: {contact}
@@ -326,7 +340,7 @@ Antworte AUSSCHLIESSLICH in diesem JSON-Format (kein Markdown, kein Text davor/d
 • 2–3 konkrete Schwächen aus den Daten nennen (Website, Reviews, Ranking)
 • Wirtschaftlicher Schaden: Was verlieren sie dadurch konkret? (Aufträge, Vertrauen)
 • Soft CTA: "Darf ich Ihnen kurz zeigen...?" oder "Kurzgespräch nächste Woche?"
-• Signatur: {sender_name} | Webdesign Wien{sender_phone_line}{sender_email_line}
+• Signatur: {sender_name} | {sender_company}{sender_phone_line}{sender_email_line}
 
 --- WHATSAPP (60-80 Wörter, direkter Einstieg, respektvoll) ---
 • Keine formale Anrede ("Sehr geehrte...") – stattdessen: Name oder "Guten Tag"
@@ -348,7 +362,7 @@ EINWÄNDE:
 CTA: [Terminvorschlag mit 2 konkreten Optionen]"""
 
 
-def generate_messages(lead: dict, analysis: dict, client: OpenAI) -> dict:
+def generate_messages(lead: dict, analysis: dict, client: OpenAI, campaign: dict) -> dict:
     """Call Claude to generate email, WhatsApp, and phone script. Returns dict."""
     contact = lead.get("Kontaktname", "").strip() or "Sehr geehrte Damen und Herren"
     adresse = lead.get("Adresse", "")
@@ -359,13 +373,20 @@ def generate_messages(lead: dict, analysis: dict, client: OpenAI) -> dict:
 
     competitors = lead.get("Google_Competitors", "")
     rank_pos = lead.get("Google_Rank_Position", "")
-    rank_kw = lead.get("Google_Rank_Keyword", f"Installateur {plz}")
+    rank_kw = lead.get("Google_Rank_Keyword", format_rank_keyword(campaign, plz=plz))
 
-    phone_line = f"\n  Tel: {SENDER_PHONE}" if SENDER_PHONE else ""
-    email_line = f"\n  {SENDER_EMAIL}" if SENDER_EMAIL else ""
+    sender_name = campaign.get("sender_name") or os.getenv("SENDER_NAME", "Linus")
+    sender_company = campaign.get("sender_company") or os.getenv("SENDER_COMPANY", "Digitalagentur")
+    sender_phone = campaign.get("sender_phone") or os.getenv("SENDER_PHONE", "")
+    sender_email = campaign.get("sender_email") or os.getenv("SENDER_EMAIL", "")
+    phone_line = f"\n  Tel: {sender_phone}" if sender_phone else ""
+    email_line = f"\n  {sender_email}" if sender_email else ""
 
     prompt = MESSAGES_PROMPT.format(
-        sender_name=SENDER_NAME,
+        sender_name=sender_name,
+        sender_company=sender_company,
+        location=campaign.get("location", "Wien"),
+        service_plural=campaign.get("service_plural", campaign.get("keyword", "Branche")),
         company=lead.get("Unternehmen", ""),
         contact=contact,
         address=adresse,
@@ -431,7 +452,8 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
         return
 
     client = OpenAI(api_key=api_key)
-    leads = load_leads()
+    campaign = get_active_campaign()
+    leads = load_leads(campaign=campaign)
 
     if not leads:
         print("No leads found. Run `python crm.py migrate` first.")
@@ -443,7 +465,7 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
             print(f"Lead {single_id} not found.")
             return
     else:
-        targets = [l for l in leads if force or not l.get("Analyzed_At")]
+        targets = [l for l in leads if force or not l.get("Analyzed_At") or l.get("Draft_Stale") == "1"]
         if limit:
             targets = targets[:limit]
 
@@ -457,6 +479,22 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
             company = lead.get("Unternehmen", "")
             website = lead.get("Website", "").strip()
             print(f"\n  {lid} {company[:45]}")
+            was_stale = lead.get("Draft_Stale") == "1"
+
+            if (
+                was_stale
+                and not force
+                and not gpt_hooks
+                and lead.get("Research_Stale") != "1"
+                and is_pending_template_refresh_target(lead)
+            ):
+                print("       refreshing stored draft…", end=" ", flush=True)
+                rerender_saved_draft(lead, campaign=campaign)
+                lead["Drafts_Approved"] = "0"
+                print(f"done (template: {lead.get('Template_Used', '?')})")
+                save_leads(leads, campaign=campaign)
+                done += 1
+                continue
 
             # 1. Determine website category
             category = lead.get("Website_Category") or categorize_website(website)
@@ -467,15 +505,15 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
                 print(f"       fetching {website[:50]}…", end=" ", flush=True)
                 html = fetch_and_clean_html(website, fetcher)
                 if html:
-                    analysis = analyze_website(company, website, html, client)
+                    analysis = analyze_website(company, website, html, client, campaign)
                     print(f"score={analysis.get('score', '?')}/10")
                 else:
                     lead["Website_Category"] = "fetch_error"
-                    analysis = NO_WEBSITE_ANALYSIS
+                    analysis = build_no_website_analysis(campaign)
                     print("fetch error")
                 time.sleep(RATE_LIMIT_SEC)
             else:
-                analysis = NO_WEBSITE_ANALYSIS
+                analysis = build_no_website_analysis(campaign)
                 print(f"       website={category}, using default analysis")
 
             # Store analysis results
@@ -486,24 +524,31 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
             lead["Pain_Categories"] = " | ".join(pain_categories)
 
             # 3. Channel selection & priority
-            primary, next_type, priority = select_channel_and_priority(lead, analysis)
-            lead["Channel_Used"] = primary
+            primary, _, priority = select_channel_and_priority(lead, analysis)
+            if (lead.get("Preferred_Channel") or "").strip() in available_channels(lead):
+                lead["Preferred_Channel"] = lead["Preferred_Channel"].strip()
+            else:
+                lead["Preferred_Channel"] = primary
             lead["Priority"] = str(priority)
 
-            if not lead.get("Next_Action_Date") and primary != "none":
+            if not lead.get("Next_Action_Date") and lead["Preferred_Channel"] != "none":
                 lead["Next_Action_Date"] = date.today().isoformat()
-                lead["Next_Action_Type"] = next_type
+                lead["Next_Action_Type"] = lead["Preferred_Channel"]
+            elif lead.get("Status", "new") in {"new", "draft_ready", "approved"} and lead["Preferred_Channel"] != "none":
+                lead["Next_Action_Type"] = lead["Preferred_Channel"]
 
             # 4. Generate messages (local templates + local hooks by default)
             print(f"       building draft…", end=" ", flush=True)
             template_key = pick_template_key(pain_categories, lead)
             if gpt_hooks:
-                hook, urgency = generate_hook(lead, analysis, client)
+                hook, urgency = generate_hook(lead, analysis, client, campaign)
             else:
-                hook = choose_hook(template_key, lead)
+                hook = choose_hook(template_key, lead, campaign=campaign)
                 urgency = ""
-            messages = render_drafts(lead, hook, urgency, template_key=template_key)
+            messages = render_drafts(lead, hook, urgency, template_key=template_key, campaign=campaign)
             lead.update(messages)
+            lead["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
+            lead["Draft_Stale"] = "0"
             print(f"done (template: {messages.get('Template_Used', '?')})")
 
             # 5. Update status
@@ -512,10 +557,11 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
                 lead["Status"] = "approved"
                 lead["Drafts_Approved"] = "1"
             else:
-                if lead.get("Status", "new") == "new":
+                if lead.get("Status", "new") in {"new", "approved", "draft_ready"} or was_stale:
                     lead["Status"] = "draft_ready"
+                lead["Drafts_Approved"] = "0"
 
-            save_leads(leads)
+            save_leads(leads, campaign=campaign)
             done += 1
 
             # Brief pause between leads to be polite to Claude API
@@ -524,6 +570,7 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
     finally:
         fetcher.close()
 
+    mark_campaign_stage_run(campaign["id"], "analyzed")
     print(f"\nDone. Analyzed {done} lead(s). Status set to {'approved' if no_review else 'draft_ready'}.")
     if not no_review:
         print("Run `streamlit run app.py` to review and approve drafts.")

@@ -14,12 +14,14 @@ Available slots:
   {{salutation}}       – "Guten Tag Herr Mustermann," or "Sehr geehrte Damen und Herren,"
   {{contact}}          – Direct contact label for phone/email use
   {{subject_intro}}    – "Herr Mustermann, " or "" as a direct subject prefix
-  {{price}}            – Price from CSV or PRICE_DEFAULT env var
-  {{sender_name}}      – Fixed sender name for all messages
-  {{sender_company}}   – Fixed sender company for all messages
-  {{sender_website}}   – Fixed sender website for all messages
-  {{sender_phone}}     – From .env SENDER_PHONE
-  {{sender_email}}     – From .env SENDER_EMAIL
+  {{price}}            – Price from CSV, else active campaign default
+  {{sender_name}}      – Sender name from active campaign config
+  {{sender_company}}   – Sender company from active campaign config
+  {{sender_company_signature}} – Sender company line for signatures (deduplicated)
+  {{sender_company_phone}} – Optional " von ..." suffix for phone scripts
+  {{sender_website}}   – Sender website from active campaign config
+  {{sender_phone}}     – Sender phone from active campaign config
+  {{sender_email}}     – Sender email from active campaign config
   {{competitors_line}} – " Mustermann Haustechnik, WienInstall GmbH" or " Ihre Mitbewerber"
   {{competitors_short}}– First competitor name
   {{rank_keyword}}     – "Installateur 1140"
@@ -35,33 +37,90 @@ import os
 from pathlib import Path
 import re
 
-_HOOKS_LIBRARY_PATH = Path(__file__).parent / "hooks_library.json"
-_hooks_override: dict[str, list[str]] | None = None
-
-
-def _load_hooks_override() -> dict[str, list[str]]:
-    global _hooks_override
-    if _hooks_override is None:
-        if _HOOKS_LIBRARY_PATH.exists():
-            try:
-                _hooks_override = json.loads(_HOOKS_LIBRARY_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                _hooks_override = {}
-        else:
-            _hooks_override = {}
-    return _hooks_override
+_LEGACY_HOOKS_LIBRARY_PATH = Path(__file__).parent / "hooks_library.json"
+_hooks_override_cache: dict[str, dict[str, list[str]]] = {}
 
 # ---------------------------------------------------------------------------
 # Portfolio & sender config (read once at import time)
 # ---------------------------------------------------------------------------
 
-_PORTFOLIO_URLS = os.getenv(
-    "PORTFOLIO_URLS",
-    "https://installateur-wien.megaphonia.com\n"
-    "https://installateur-muster.megaphonia.com\n"
-    "https://muster-installateur.megaphonia.com\n"
+_DEFAULT_PORTFOLIO_URLS = [
+    "https://installateur-wien.megaphonia.com",
+    "https://installateur-muster.megaphonia.com",
+    "https://muster-installateur.megaphonia.com",
     "https://instant-install.megaphonia.com",
-)
+]
+
+_PROTECTED_REFRESH_STATUSES = {
+    "approved",
+    "contacted",
+    "replied",
+    "meeting_scheduled",
+    "won",
+    "lost",
+    "no_contact",
+    "blacklist",
+}
+
+
+def _resolve_campaign(campaign: dict | None = None) -> dict | None:
+    if campaign is not None:
+        return campaign
+    try:
+        from campaign_service import get_active_campaign
+        return get_active_campaign()
+    except Exception:
+        return None
+
+
+def _resolve_hooks_library_path(campaign: dict | None = None) -> Path:
+    active_campaign = _resolve_campaign(campaign)
+    if active_campaign is not None:
+        try:
+            from campaign_service import get_hooks_library_path
+            return Path(get_hooks_library_path(active_campaign))
+        except Exception:
+            pass
+    return _LEGACY_HOOKS_LIBRARY_PATH
+
+
+def _load_hooks_override(campaign: dict | None = None) -> dict[str, list[str]]:
+    path = _resolve_hooks_library_path(campaign)
+    cache_key = str(path)
+    if cache_key not in _hooks_override_cache:
+        if path.exists():
+            try:
+                _hooks_override_cache[cache_key] = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                _hooks_override_cache[cache_key] = {}
+        else:
+            _hooks_override_cache[cache_key] = {}
+    return _hooks_override_cache[cache_key]
+
+
+def _campaign_value(campaign: dict | None, key: str, env_key: str = "", default: str = "") -> str:
+    active_campaign = _resolve_campaign(campaign)
+    if active_campaign is not None:
+        value = active_campaign.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    if env_key:
+        env_value = os.getenv(env_key, "").strip()
+        if env_value:
+            return env_value
+    return default
+
+
+def _campaign_portfolio_urls(campaign: dict | None = None) -> list[str]:
+    active_campaign = _resolve_campaign(campaign)
+    if active_campaign is not None:
+        urls = active_campaign.get("portfolio_urls") or []
+        cleaned = [str(url).strip() for url in urls if str(url).strip()]
+        if cleaned:
+            return cleaned
+
+    env_urls = [line.strip() for line in os.getenv("PORTFOLIO_URLS", "").splitlines() if line.strip()]
+    return env_urls or list(_DEFAULT_PORTFOLIO_URLS)
 
 # ---------------------------------------------------------------------------
 # Hook building blocks (Bausteine) – pre-written, direct "Sie" address
@@ -135,34 +194,36 @@ HOOKS: dict[str, list[str]] = {
 # ---------------------------------------------------------------------------
 
 SUBJECT_TEMPLATES: list[str] = [
-    "{{subject_intro}}Sie verlieren täglich Kunden",
-    "{{subject_intro}}Ihre Konkurrenz wird zuerst gefunden",
-    "{{subject_intro}}Ihre Website bremst neue Anfragen",
-    "{{subject_intro}}Sie fehlen bei {{rank_keyword}}",
-    "{{subject_intro}}Sie werden online zu selten gefunden",
-    "{{subject_intro}}Ihre Website kostet Erstkontakte",
-    "{{subject_intro}}Sie schicken Interessenten weiter",
-    "{{subject_intro}}Sie verlieren Anfragen vor dem Anruf",
-    "{{subject_intro}}Ihre Konkurrenz wirkt online stärker",
-    "{{subject_intro}}Sie sehen diesen Verlust nur nicht",
-    "Potenzielle Kunden finden zuerst {{competitors_short}}",
-    "Bei {{rank_keyword}} sehen Kunden andere",
-    "Wer Sie sucht, ruft oft andere an",
-    "Vor dem Anruf geht Vertrauen verloren",
-    "Der erste Eindruck kostet Aufträge",
-    "Neue Aufträge landen gerade woanders",
-    "Zu viele Interessenten springen ab",
-    "Lokal gesucht. Zuerst erscheint {{competitors_short}}",
-    "Google schickt diese Anfragen weiter",
-    "Genau jetzt sucht jemand nach {{rank_keyword}}",
+    "{{subject_intro}}kurze Frage zu Ihrer Website",
+    "{{subject_intro}}kurzer Blick auf {{rank_keyword}}",
+    "{{subject_intro}}Idee für Ihren Webauftritt",
+    "{{subject_intro}}Ihre Website auf dem Handy",
+    "{{subject_intro}}Ihr Google-Auftritt in Wien",
+    "{{subject_intro}}mehr Klarheit für Ihre Website",
+    "{{subject_intro}}eine kleine Website-Idee",
+    "{{subject_intro}}Ihr Auftritt in der lokalen Suche",
+    "{{subject_intro}}ein kurzer Website-Check",
+    "{{subject_intro}}mehr Anfragen über die Website",
+    "Kurze Frage zu Ihrem Webauftritt",
+    "Ein Vorschlag für Ihre Website",
+    "Idee für {{rank_keyword}}",
+    "Ihr erster Eindruck online",
+    "Ihre Website in der lokalen Suche",
+    "Website-Beispiel für Ihren Betrieb",
+    "Kurze Rückfrage zu Ihrer Website",
+    "Ein modernerer Auftritt online",
+    "Ihr Webauftritt für {{rank_keyword}}",
+    "2 Ideen für Ihre Website",
 ]
 
+SPECIAL_SUBJECT_OPTION = "Ihre neue Website für nur 500 € Fixpreis"
 
-def get_hook(category: str, lead_id: str = "") -> str:
+
+def get_hook(category: str, lead_id: str = "", campaign: dict | None = None) -> str:
     """Pick a hook deterministically by lead ID (same lead always gets same hook).
-    Checks hooks_library.json first (GPT-generated), falls back to built-in HOOKS.
+    Checks the active campaign hooks_library.json first, falls back to built-in HOOKS.
     """
-    override = _load_hooks_override()
+    override = _load_hooks_override(campaign=campaign)
     options = override.get(category) or HOOKS.get(category) or HOOKS.get("kein_seo", [""])
     idx = int("".join(filter(str.isdigit, lead_id)) or "0") % len(options)
     return options[idx]
@@ -175,9 +236,15 @@ def _stable_index(seed: str, length: int) -> int:
     return int(digest[:8], 16) % length
 
 
-def get_subject_options(lead: dict, hook: str = "", urgency: str = "", current_subject: str = "") -> list[str]:
+def get_subject_options(
+    lead: dict,
+    hook: str = "",
+    urgency: str = "",
+    current_subject: str = "",
+    campaign: dict | None = None,
+) -> list[str]:
     """Render the 20 shared subject lines for a lead and optionally preserve a custom current subject."""
-    slots = build_slots(lead, hook, urgency)
+    slots = build_slots(lead, hook, urgency, campaign=campaign)
     seen: set[str] = set()
     options: list[str] = []
 
@@ -186,6 +253,10 @@ def get_subject_options(lead: dict, hook: str = "", urgency: str = "", current_s
         if current:
             seen.add(current)
             options.append(current)
+
+    if SPECIAL_SUBJECT_OPTION not in seen:
+        seen.add(SPECIAL_SUBJECT_OPTION)
+        options.append(SPECIAL_SUBJECT_OPTION)
 
     for template in SUBJECT_TEMPLATES:
         rendered = fill_template(template, slots).strip()
@@ -196,9 +267,9 @@ def get_subject_options(lead: dict, hook: str = "", urgency: str = "", current_s
     return options
 
 
-def get_subject(lead: dict, hook: str = "", urgency: str = "") -> str:
+def get_subject(lead: dict, hook: str = "", urgency: str = "", campaign: dict | None = None) -> str:
     """Pick one of the shared subject lines deterministically by lead ID."""
-    options = get_subject_options(lead, hook=hook, urgency=urgency)
+    options = get_subject_options(lead, hook=hook, urgency=urgency, campaign=campaign)
     idx = _stable_index(lead.get("ID", ""), len(options))
     return options[idx] if options else "Kurze Frage zu Ihrer Sichtbarkeit"
 
@@ -221,7 +292,7 @@ def _normalize_for_repetition(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9äöüß%+ ]+", " ", (text or "").lower())).strip()
 
 
-def _hook_repetition_score(candidate: str, template_key: str, lead: dict) -> int:
+def _hook_repetition_score(candidate: str, template_key: str, lead: dict, campaign: dict | None = None) -> int:
     """
     Lower score is better.
     Penalizes:
@@ -230,8 +301,8 @@ def _hook_repetition_score(candidate: str, template_key: str, lead: dict) -> int
     - repeated opening trigrams
     - hooks that start with very generic patterns
     """
-    slots = build_slots(lead, hook="", urgency="")
-    slots["subject"] = get_subject(lead)
+    slots = build_slots(lead, hook="", urgency="", campaign=campaign)
+    slots["subject"] = get_subject(lead, campaign=campaign)
 
     tmpl = TEMPLATES.get(template_key, TEMPLATES["default"])
     context = " ".join(
@@ -274,12 +345,12 @@ def _hook_repetition_score(candidate: str, template_key: str, lead: dict) -> int
     return score
 
 
-def choose_hook(template_key: str, lead: dict) -> str:
+def choose_hook(template_key: str, lead: dict, campaign: dict | None = None) -> str:
     """
     Pick the least repetitive local hook for the chosen template.
     Still deterministic: ties are broken by lead ID.
     """
-    override = _load_hooks_override()
+    override = _load_hooks_override(campaign=campaign)
     options = override.get(template_key) or HOOKS.get(template_key) or HOOKS.get("kein_seo", [""])
     if not options:
         return ""
@@ -287,7 +358,7 @@ def choose_hook(template_key: str, lead: dict) -> str:
     ranked = sorted(
         enumerate(options),
         key=lambda item: (
-            _hook_repetition_score(item[1], template_key, lead),
+            _hook_repetition_score(item[1], template_key, lead, campaign=campaign),
             abs(item[0] - _stable_index(lead.get("ID", ""), len(options))),
             item[0],
         ),
@@ -328,10 +399,11 @@ Antworte AUSSCHLIESSLICH als JSON (kein Markdown, kein Text):
 }"""
 
 
-def generate_hooks_library(force: bool = False) -> None:
-    """Call GPT once to generate quality hooks per category → saves to hooks_library.json."""
-    if _HOOKS_LIBRARY_PATH.exists() and not force:
-        print(f"hooks_library.json already exists. Use --force to regenerate.")
+def generate_hooks_library(force: bool = False, campaign: dict | None = None) -> None:
+    """Call GPT once to generate quality hooks per category → saves to the active campaign hook library."""
+    hooks_path = _resolve_hooks_library_path(campaign=campaign)
+    if hooks_path.exists() and not force:
+        print(f"{hooks_path.name} already exists at {hooks_path}. Use --force to regenerate.")
         return
 
     import re
@@ -359,18 +431,18 @@ def generate_hooks_library(force: bool = False) -> None:
 
     library = json.loads(raw)
 
-    _HOOKS_LIBRARY_PATH.write_text(
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(
         json.dumps(library, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    # Invalidate cache so get_hook() picks up new values immediately
-    global _hooks_override
-    _hooks_override = None
+    # Invalidate cache so get_hook() picks up new values immediately.
+    _hooks_override_cache.pop(str(hooks_path), None)
 
     total = sum(len(v) for v in library.values())
-    print(f"Done. {total} hooks across {len(library)} categories saved to {_HOOKS_LIBRARY_PATH}")
-    print("Edit hooks_library.json freely — it overrides the built-in defaults.")
+    print(f"Done. {total} hooks across {len(library)} categories saved to {hooks_path}")
+    print("Edit the campaign hooks_library.json freely — it overrides the built-in defaults.")
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +460,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – als auf Handwerksbetriebe in Wien spezialisierte Digitalagentur realisieren wir innerhalb von 2 Wochen Ihren professionellen Webauftritt: mobil optimiert, mit klaren Kontaktwegen und lokal besser sichtbar bei Google.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Wenn jemand heute "Installateur{{rank_keyword_district}}" googelt, findet er{{competitors_line}} – aber nicht Ihr Unternehmen. Diese Kunden gehen zur Konkurrenz, ohne dass Sie auch nur die Chance bekommen anzurufen.
 
@@ -397,18 +469,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – wir entwickeln für Installateurbetriebe professionelle Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von 2 Wochen um. Beispiel: {{portfolio_first}} – wäre das grundsätzlich interessant?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, mein Name ist {{sender_name}} von {{sender_company}}. Ich weiß, Sie arbeiten gerade – darf ich Ihnen ganz kurz eine Frage stellen? Es dauert auch nur 30 Sekunden."
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, mein Name ist {{sender_name}}{{sender_company_phone}}. Ich weiß, Sie arbeiten gerade – darf ich Ihnen ganz kurz eine Frage stellen? Es dauert auch nur 30 Sekunden."
 
 HOOK: "{{hook}} – Und das bedeutet: Kunden die online nach einem Installateur in Wien suchen, finden Sie nicht und rufen jemand anderen an."
 
@@ -436,7 +508,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine mobiloptimierte Website mit Click-to-Call, WhatsApp-Button und lokaler Google-Optimierung.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Über 65% aller Google-Suchanfragen nach Installateuren kommen vom Smartphone. Eine Website die auf dem Handy nicht richtig funktioniert – zu kleine Schrift, Buttons nicht klickbar – verliert diese Besucher in Sekunden. Google bestraft das zusätzlich mit schlechterem Ranking.
 
@@ -445,18 +517,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – 65% der Kunden suchen am Handy. Wir entwickeln mobiloptimierte Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von 2 Wochen um. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Darf ich Ihnen kurz eine Frage stellen, dauert 30 Sekunden?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich Ihnen kurz eine Frage stellen, dauert 30 Sekunden?"
 
 HOOK: "{{hook}} – Und das ist ein Problem, weil über 65% der Kunden heute am Handy nach einem Installateur suchen. Wenn die Website auf dem Handy nicht funktioniert, gehen die Leute einfach weiter."
 
@@ -484,7 +556,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine Website mit direktem Anruf-Button, optimiert für Google und für alle Geräte.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Wenn jemand Ihre Website besucht und keinen einfachen Weg findet, Sie zu kontaktieren – kein Formular, kein Click-to-Call, kein WhatsApp-Button – verlässt er die Seite und ruft den Nächsten an. Der Aufwand des Abtippens einer Nummer reicht aus, um Kunden zu verlieren.
 
@@ -493,18 +565,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – Kunden, die Ihre Website besuchen, finden keinen einfachen Kontaktweg. Wir lösen das mit einer professionellen Website mit klaren Kontaktwegen zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Kurze Frage – darf ich?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – darf ich?"
 
 HOOK: "{{hook}} – Das bedeutet: Wer Ihre Website findet, kann Sie nicht direkt kontaktieren. Kein Klick-zum-Anruf, kein Formular – viele gehen dann einfach weiter."
 
@@ -532,7 +604,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine SEO-optimierte Website mit klarer lokaler SEO-Ausrichtung auf Suchanfragen wie "{{rank_keyword}}".
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Wer in Wien nach einem Installateur sucht, googelt "{{rank_keyword}}". Ganz oben erscheinen{{competitors_line}} – Sie tauchen auf der ersten Seite der Google-Suche nicht auf. Das sind täglich Kunden die aktiv nach Ihren Leistungen suchen und stattdessen zur Konkurrenz gehen.
 
@@ -541,18 +613,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – bei "{{rank_keyword}}" findet man Sie nicht. Wir entwickeln SEO-optimierte Websites zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse an einem kurzen Gespräch?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Darf ich kurz?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
 
 HOOK: "{{hook}} – Ich habe '{{rank_keyword}}' gegoogelt – da erscheinen{{competitors_line}}, aber Sie nicht. Das sind täglich Kunden die aktiv suchen und jemand anderen finden."
 
@@ -580,7 +652,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen modernisieren wir Ihren Webauftritt: zeitgemäß, mobil optimiert und lokal besser sichtbar bei Google.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 In einer Branche die auf Vertrauen und Qualität aufbaut, entscheidet der erste Eindruck. Eine veraltete Website sendet die falsche Botschaft: Kunden fragen sich, ob der Betrieb noch aktiv ist – und wählen lieber einen Mitbewerber mit modernerem Auftritt. Das kostet täglich Aufträge.
 
@@ -589,18 +661,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – ein veralteter Webauftritt kostet täglich Kunden. Wir modernisieren Ihre Website zum Festpreis von €{{price}} einmalig und setzen das innerhalb von 2 Wochen um. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Darf ich kurz?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
 
 HOOK: "{{hook}} – Eine veraltete Website kann potenzielle Kunden abschrecken bevor sie überhaupt anrufen. Sie sehen das Design und denken: ist der Betrieb noch aktiv?"
 
@@ -628,7 +700,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine vollständige, professionelle Website mit Leistungsübersicht, Click-to-Call und lokaler Google-Optimierung.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Wer heute Ihre Website besucht, sieht eine Platzhalterseite – keine Leistungen, kein Kontakt, keine Information. Diese Besucher sind verloren bevor sie überhaupt die Chance hatten, Sie anzurufen.
 
@@ -637,18 +709,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – Ihre Website zeigt gerade nur eine Platzhalterseite. Wir ersetzen sie durch eine vollständige Website zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Kurze Frage – darf ich?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – darf ich?"
 
 HOOK: "{{hook}} – Ich habe Ihre Website aufgerufen und gesehen, dass sie noch im Aufbau ist. Das bedeutet: Kunden die Sie online finden, sehen nichts und gehen weiter."
 
@@ -674,7 +746,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine professionelle Website mit klarer Leistungsübersicht, Referenzprojekten und persönlicher Vorstellung, die Vertrauen aufbaut.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Bevor ein neuer Kunde anruft, schaut er sich die Google-Bewertungen an. Wenige oder schlechte Bewertungen – und er wählt stattdessen einen Mitbewerber mit 50+ positiven Rezensionen. Eine gute Website schafft Vertrauen bevor Kunden überhaupt auf die Sternchen schauen. Das kostet täglich Aufträge, ohne dass Sie es merken.
 
@@ -683,18 +755,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – wenige oder schlechte Google-Bewertungen kosten Aufträge. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Darf ich kurz?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
 
 HOOK: "{{hook}} – Kunden schauen sich vor dem Anruf die Google-Bewertungen an. Wenige oder schlechte Bewertungen reichen aus, damit sie den Nächsten anrufen."
 
@@ -721,7 +793,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine SEO-optimierte Website mit klarer lokaler SEO-Ausrichtung auf Suchanfragen wie "{{rank_keyword}}".
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Wenn jemand heute "{{rank_keyword}}" googelt, erscheinen{{competitors_line}} ganz oben. Sie tauchen auf der ersten Seite der Google-Suche nicht auf – und die erste Seite ist alles was zählt. Diese Kunden suchen aktiv und gehen zur Konkurrenz.
 
@@ -730,18 +802,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – bei "{{rank_keyword}}" findet man Sie nicht, aber{{competitors_line}}. Wir lösen das mit einer SEO-optimierten Website zum Festpreis von €{{price}} einmalig. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Darf ich kurz?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
 
 HOOK: "{{hook}} – Ich habe '{{rank_keyword}}' gegoogelt – da erscheinen{{competitors_line}}, aber Sie nicht. Täglich verlieren Sie so Kunden die aktiv suchen."
 
@@ -769,7 +841,7 @@ Betreff: {{subject}}
 
 {{hook}}
 
-**Festpreis: €{{price}} einmalig** – innerhalb von 2 Wochen realisieren wir eine professionelle Website mit Referenzprojekten, klarer Leistungsübersicht und persönlicher Vorstellung, die Vertrauen aufbaut.
+**Festpreis: €{{price}} einmalig.** Wir entwickeln Websites für Handwerksbetriebe in Wien: modern, mobiloptimiert, mit klaren Kontaktwegen und einer sauberen Basis für lokale Sichtbarkeit bei Google.
 
 Kunden die einen Installateur suchen, vergleichen Bewertungen. Ein Betrieb mit 50+ positiven Rezensionen gewinnt fast immer gegen einen mit kaum Bewertungen – egal wie gut die Arbeit ist. Eine professionelle Website schafft Vertrauen bevor Kunden auf die Sternchen schauen. Das ist die Realität der Google-Suche.
 
@@ -778,18 +850,18 @@ Hier ein paar Beispiele wie das bei Ihnen aussehen könnte:
 
 Farben, Logo, Leistungen und Inhalte passen wir komplett auf Ihren Betrieb an – die Beispiele zeigen nur die Struktur.
 
-Bitte melden Sie sich einfach bei Interesse.
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
 
 Mit freundlichen Grüßen,
 {{sender_name}}
-{{sender_company}}
-{{sender_website}}""",
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}""",
 
         "whatsapp": """\
 {{salutation}} {{hook}} – mit wenigen Google-Bewertungen verlieren Betriebe täglich Kunden an Mitbewerber. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Beispiel: {{portfolio_first}} – Interesse?""",
 
         "phone_script": """\
-OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}} von {{sender_company}}. Kurze Frage – 30 Sekunden?"
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – 30 Sekunden?"
 
 HOOK: "{{hook}} – Kunden vergleichen Bewertungen bevor sie anrufen. Wenige Rezensionen reichen, damit sie den Nächsten wählen."
 
@@ -982,10 +1054,12 @@ def _format_contact_for_direct_use(contact_name: str) -> tuple[str, str]:
     return fallback, f"Guten Tag {fallback},"
 
 
-def build_slots(lead: dict, hook: str, urgency: str) -> dict:
+def build_slots(lead: dict, hook: str, urgency: str, campaign: dict | None = None) -> dict:
     """Build the full slots dict for a lead."""
+    from campaign_service import format_rank_keyword
     from crm_store import get_bezirk
 
+    active_campaign = _resolve_campaign(campaign)
     company = lead.get("Unternehmen", "")
     contact_name = (lead.get("Kontaktname") or "").strip()
     contact_direct, salutation = _format_contact_for_direct_use(contact_name)
@@ -1003,21 +1077,29 @@ def build_slots(lead: dict, hook: str, urgency: str) -> dict:
         competitors_line = " Ihre Mitbewerber"
         competitors_short = "Ihre Mitbewerber"
 
-    rank_keyword = lead.get("Google_Rank_Keyword") or f"Installateur {plz or 'Wien'}"
+    rank_keyword = lead.get("Google_Rank_Keyword") or (
+        format_rank_keyword(active_campaign, plz=plz) if active_campaign is not None else f"Installateur {plz or 'Wien'}"
+    )
     rank_keyword_district = plz or "Wien"
 
-    price = lead.get("Price") or os.getenv("PRICE_DEFAULT", "500")
+    price = lead.get("Price") or _campaign_value(active_campaign, "price_default", "PRICE_DEFAULT", "500")
 
-    sender_name = "Linus Fraundorfer"
-    sender_company = "Digitalagentur Megaphonia"
-    sender_website = "www.megaphonia.com"
-    sender_phone_raw = os.getenv("SENDER_PHONE", "")
-    sender_email_raw = os.getenv("SENDER_EMAIL", "")
+    sender_name = _campaign_value(active_campaign, "sender_name", "SENDER_NAME", "Linus Fraundorfer")
+    sender_company = _campaign_value(active_campaign, "sender_company", "SENDER_COMPANY", "Digitalagentur Megaphonia")
+    sender_website = _campaign_value(active_campaign, "sender_website", "SENDER_WEBSITE", "https://www.megaphonia.com")
+    sender_phone_raw = _campaign_value(active_campaign, "sender_phone", "SENDER_PHONE", "0677 617 517 70")
+    sender_email_raw = _campaign_value(active_campaign, "sender_email", "SENDER_EMAIL", "")
+    sender_name_norm = re.sub(r"\s+", " ", sender_name).strip().lower()
+    sender_company_norm = re.sub(r"\s+", " ", sender_company).strip().lower()
+    sender_company_signature = sender_company
+    if sender_company_norm and sender_company_norm in sender_name_norm:
+        sender_company_signature = ""
+    sender_company_phone = f" von {sender_company}" if sender_company else ""
     sender_phone = f"\n{sender_phone_raw}" if sender_phone_raw else ""
     sender_email = f"\n{sender_email_raw}" if sender_email_raw else ""
 
     # Portfolio: multi-line block + first URL for WhatsApp
-    portfolio_lines = [u.strip() for u in _PORTFOLIO_URLS.strip().splitlines() if u.strip()]
+    portfolio_lines = _campaign_portfolio_urls(active_campaign)
     portfolio_block = "\n".join(portfolio_lines)
     portfolio_first = portfolio_lines[0] if portfolio_lines else ""
 
@@ -1032,6 +1114,8 @@ def build_slots(lead: dict, hook: str, urgency: str) -> dict:
         "price": price,
         "sender_name": sender_name,
         "sender_company": sender_company,
+        "sender_company_signature": sender_company_signature,
+        "sender_company_phone": sender_company_phone,
         "sender_website": sender_website,
         "sender_phone": sender_phone,
         "sender_email": sender_email,
@@ -1047,7 +1131,13 @@ def build_slots(lead: dict, hook: str, urgency: str) -> dict:
     }
 
 
-def render_drafts(lead: dict, hook: str, urgency: str, template_key: str | None = None) -> dict:
+def render_drafts(
+    lead: dict,
+    hook: str,
+    urgency: str,
+    template_key: str | None = None,
+    campaign: dict | None = None,
+) -> dict:
     """
     Fill the appropriate template with lead data + selected hook.
     Returns {"Email_Draft": str, "WhatsApp_Draft": str, "Phone_Script": str, "Template_Used": str}
@@ -1058,11 +1148,11 @@ def render_drafts(lead: dict, hook: str, urgency: str, template_key: str | None 
     key = template_key or pick_template_key(pain_categories, lead)
     tmpl = TEMPLATES.get(key, TEMPLATES["default"])
     if not (hook or "").strip():
-        hook = choose_hook(key, lead)
-    slots = build_slots(lead, hook, urgency)
+        hook = choose_hook(key, lead, campaign=campaign)
+    slots = build_slots(lead, hook, urgency, campaign=campaign)
 
     # Inject one shared subject line from the universal subject library
-    slots["subject"] = get_subject(lead, hook=hook, urgency=urgency)
+    slots["subject"] = get_subject(lead, hook=hook, urgency=urgency, campaign=campaign)
 
     email_filled = fill_template(tmpl["email"], slots)
     subject, body = parse_email_draft(email_filled)
@@ -1074,3 +1164,55 @@ def render_drafts(lead: dict, hook: str, urgency: str, template_key: str | None 
         "Phone_Script": fill_template(tmpl["phone_script"], slots),
         "Template_Used": key,
     }
+
+
+def has_saved_drafts(lead: dict) -> bool:
+    return any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+
+
+def is_pending_template_refresh_target(lead: dict) -> bool:
+    if not has_saved_drafts(lead):
+        return False
+    if (lead.get("Drafts_Approved") or "0") == "1":
+        return False
+    status = (lead.get("Status") or "new").strip()
+    return status not in _PROTECTED_REFRESH_STATUSES
+
+
+def rerender_saved_draft(lead: dict, campaign: dict | None = None) -> dict:
+    pain_categories_raw = lead.get("Pain_Categories", "") or ""
+    pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
+    template_key = (lead.get("Template_Used") or "").strip()
+    if template_key not in TEMPLATES:
+        template_key = pick_template_key(pain_categories, lead)
+
+    hook = choose_hook(template_key, lead, campaign=campaign)
+    drafts = render_drafts(lead, hook, "", template_key=template_key, campaign=campaign)
+    lead.update(drafts)
+
+    active_campaign = _resolve_campaign(campaign) or {}
+    lead["Draft_Config_Version"] = str(active_campaign.get("draft_config_version") or active_campaign.get("config_version") or "1")
+    lead["Draft_Stale"] = "0"
+    if (lead.get("Status") or "new").strip() == "new":
+        lead["Status"] = "draft_ready"
+    return drafts
+
+
+def refresh_saved_drafts(
+    leads: list[dict],
+    campaign: dict | None = None,
+    lead_ids: set[str] | None = None,
+    pending_only: bool = True,
+) -> int:
+    count = 0
+    for lead in leads:
+        lead_id = (lead.get("ID") or "").strip()
+        if lead_ids is not None and lead_id not in lead_ids:
+            continue
+        if pending_only and not is_pending_template_refresh_target(lead):
+            continue
+        if not has_saved_drafts(lead):
+            continue
+        rerender_saved_draft(lead, campaign=campaign)
+        count += 1
+    return count

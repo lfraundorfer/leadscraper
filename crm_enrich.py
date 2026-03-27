@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
+from campaign_service import get_active_campaign, mark_campaign_stage_run
 from herold_scraper import HeroldFetcher, fetch_firmenabc_contacts
 from crm_store import load_leads, save_leads
 
@@ -39,7 +40,8 @@ def main(force: bool = False, single_id: str = "") -> None:
     Enriches all leads missing Kontaktname (or a single lead if --id given).
     Saves after each lead to survive interruption.
     """
-    leads = load_leads()
+    campaign = get_active_campaign()
+    leads = load_leads(campaign=campaign)
     if not leads:
         print("No leads found. Run `python crm.py migrate` first.")
         return
@@ -87,10 +89,11 @@ def main(force: bool = False, single_id: str = "") -> None:
                 print(f"  {lid} {company[:40]} → (no name found)")
 
             # Save after each lead (survives interruption)
-            save_leads(leads)
+            save_leads(leads, campaign=campaign)
             time.sleep(RATE_LIMIT_SEC)
 
     finally:
         fetcher.close()
 
+    mark_campaign_stage_run(campaign["id"], "enriched")
     print(f"\nDone. Enriched: {enriched} | Skipped (already had name): {skipped}")

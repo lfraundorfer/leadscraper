@@ -8,15 +8,14 @@ import os
 import re
 import smtplib
 import urllib.parse
-from email.mime.image import MIMEImage
+import html
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr, formatdate, make_msgid
 
+from campaign_service import get_active_campaign
 from crm_store import get_lead_by_id, TERMINAL_STATUSES
 from crm_tracker import log_contact
-
-# Optional flyer image — set FLYER_IMAGE=flyer.png (or full path) in .env
-_FLYER_PATH = os.getenv("FLYER_IMAGE", "flyer.png")
 
 
 def format_phone_e164(phone: str) -> str:
@@ -75,7 +74,14 @@ def _parse_draft(draft: str) -> tuple[str, str]:
     return subject, body
 
 
-def send_email(lead_id: str, dry_run: bool = False) -> bool:
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def send_email(lead_id: str, dry_run: bool = False, notes: str = "") -> bool:
     """
     Build and send the generated email for a lead.
     On success, logs the contact attempt.
@@ -94,6 +100,9 @@ def send_email(lead_id: str, dry_run: bool = False) -> bool:
     if not lead.get("Drafts_Approved", "0") == "1":
         print(f"Lead {lead_id} drafts not approved yet. Review in the app first.")
         return False
+    if lead.get("Draft_Stale") == "1":
+        print(f"Lead {lead_id} draft is stale for the current campaign config. Re-run analyze first.")
+        return False
 
     to_addr = lead.get("Email", "").strip()
     if not to_addr:
@@ -110,59 +119,54 @@ def send_email(lead_id: str, dry_run: bool = False) -> bool:
         print(f"Could not parse subject from Email_Draft for {lead_id}.")
         return False
 
-    sender_name = os.getenv("SENDER_NAME", "Linus")
-    sender_email = os.getenv("SENDER_EMAIL", "")
+    campaign = get_active_campaign()
+    sender_name = (campaign.get("sender_name") or os.getenv("SENDER_NAME", "Linus")).strip()
+    sender_email = (campaign.get("sender_email") or os.getenv("SENDER_EMAIL", "")).strip()
     if not sender_email:
         print("SENDER_EMAIL not set in .env")
         return False
+    from_header = formataddr((sender_name, sender_email))
+    sender_domain = sender_email.split("@", 1)[1] if "@" in sender_email else ""
+    include_html = _env_enabled("EMAIL_INCLUDE_HTML", default=True)
 
     # Build HTML: escape, bold **text**, preserve line breaks
     def _to_html(text: str) -> str:
-        escaped = text.replace("&", "&amp;").replace("<", "&lt;")
+        escaped = html.escape(text)
         bolded = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-        return "<br>\n".join(bolded.splitlines())
+
+        def _linkify(match: re.Match[str]) -> str:
+            raw_url = match.group(0)
+            url = raw_url.rstrip(".,);:]")
+            suffix = raw_url[len(url):]
+            return f"<a href=\"{url}\">{url}</a>{suffix}"
+
+        linked = re.sub(r"https?://[^\s<]+", _linkify, bolded)
+        return "<br>\n".join(linked.splitlines())
 
     html_lines = _to_html(body)
 
-    flyer_path = _FLYER_PATH
-    has_flyer = bool(flyer_path and os.path.isfile(flyer_path))
+    def _apply_headers(message) -> None:
+        message["Subject"] = subject
+        message["From"] = from_header
+        message["To"] = to_addr
+        message["Reply-To"] = sender_email
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid(domain=sender_domain) if sender_domain else make_msgid()
 
-    if has_flyer:
-        # multipart/related so the inline image CID resolves
-        msg = MIMEMultipart("related")
-        msg["Subject"] = subject
-        msg["From"] = f"{sender_name} <{sender_email}>"
-        msg["To"] = to_addr
-
-        alt = MIMEMultipart("alternative")
-        msg.attach(alt)
-        alt.attach(MIMEText(body, "plain", "utf-8"))
-        html = (
-            f"<html><body>"
-            f"<p>{html_lines}</p>"
-            f"<br><img src='cid:flyer' style='max-width:600px;display:block;'>"
-            f"</body></html>"
-        )
-        alt.attach(MIMEText(html, "html", "utf-8"))
-
-        with open(flyer_path, "rb") as fh:
-            img = MIMEImage(fh.read())
-        img.add_header("Content-ID", "<flyer>")
-        img.add_header("Content-Disposition", "inline", filename=os.path.basename(flyer_path))
-        msg.attach(img)
-    else:
+    if include_html:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{sender_name} <{sender_email}>"
-        msg["To"] = to_addr
+        _apply_headers(msg)
         msg.attach(MIMEText(body, "plain", "utf-8"))
-        html = f"<html><body><p>{html_lines}</p></body></html>"
-        msg.attach(MIMEText(html, "html", "utf-8"))
+        html_body = f"<html><body><p>{html_lines}</p></body></html>"
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+        _apply_headers(msg)
 
     if dry_run:
         print("=" * 60)
         print(f"DRY RUN – would send to: {to_addr}")
-        print(f"From: {sender_name} <{sender_email}>")
+        print(f"From: {from_header}")
         print(f"Subject: {subject}")
         print("-" * 60)
         print(body)
@@ -184,7 +188,7 @@ def send_email(lead_id: str, dry_run: bool = False) -> bool:
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
         print(f"Email sent to {to_addr} ({lead.get('Unternehmen', '')})")
-        log_contact(lead_id, "sent", channel="email")
+        log_contact(lead_id, "sent", notes=notes, channel="email")
         return True
     except Exception as e:
         print(f"Failed to send email for {lead_id}: {e}")

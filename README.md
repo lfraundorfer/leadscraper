@@ -1,20 +1,11 @@
-# Installateur Wien CRM
+# Multi-Niche Campaign CRM
 
-AI-powered outreach automation for Installateurbetriebe in Wien.
-Scrapes leads → researches websites + Google → generates personalized messages → lets you send email / open WhatsApp in one click.
+AI-powered outreach automation for local service businesses.
+Create saved campaigns like `Installateur Wien` or `Schluesseldienst Wien`, scrape leads from Herold, research them, generate niche-specific drafts, and run outreach from one dashboard.
 
 ---
 
 ## Quick Start
-
-Drop your flyer as flyer.png in the project folder, then add to .env:
-
-FLYER_IMAGE=flyer.png
-That's it — the code in crm_mailer.py already handles it. When send_email() runs, it:
-
-Checks if flyer.png exists
-Embeds it inline at the bottom of the HTML via Content-ID: <flyer>
-No click needed — the image just shows up in the email body
 
 ```bash
 python -m venv .venv
@@ -23,13 +14,17 @@ pip install -r requirements.txt
 playwright install chromium
 
 cp .env.example .env
-# → fill in your keys (see setup below)
+# -> fill in your API keys / SMTP settings
 
-python crm.py migrate          # add CRM columns to CSV
-python crm.py research         # fetch websites + Google reviews
-python crm.py analyze          # generate message drafts
 streamlit run app.py           # open dashboard
 ```
+
+Then in the app:
+
+1. Open **Campaigns**
+2. Create a campaign from `keyword + location`
+3. Run `Scrape -> Migrate -> Enrich -> Research -> Analyze`
+4. Review drafts, approve them, and send outreach
 
 ---
 
@@ -99,7 +94,9 @@ SENDER_EMAIL=your@domain.com
 
 ---
 
-### 4. Sender Identity (shown in emails + messages)
+### 4. Sender Identity
+
+These values are used as defaults when creating a new campaign. You can override them per campaign in the dashboard.
 
 ```
 SENDER_NAME=Linus
@@ -138,49 +135,45 @@ If you want fully automated sending without opening WhatsApp manually:
 
 ---
 
-### 6. Pricing Config
+### 5. Campaign Config vs .env
 
-```
-PRICE_DEFAULT=500       # one-time price shown in email/WhatsApp (€)
-PRICE_MONTHLY=25        # monthly hosting fee shown in templates
-```
+`.env` is now only for infrastructure and secrets:
 
-Override per lead in the **All Leads** dashboard (Price field, editable inline).
+- OpenAI API key
+- Google Places API key
+- SMTP settings
+- default sender identity used to seed new campaigns
 
----
+Each saved campaign owns its own:
 
-### 7. Portfolio URLs
-
-Shown as example links in email templates.
-
-```
-PORTFOLIO_URLS=https://installateur-wien.megaphonia.com
-# https://installateur-muster.megaphonia.com
-# https://muster-installateur.megaphonia.com
-# https://instant-install.megaphonia.com
-```
-
-Uncomment the lines you want included. All active URLs appear in emails; only the first appears in WhatsApp.
-
-Drop PNG screenshots into a `portfolio/` folder — they'll appear in the dashboard alongside drafts.
+- keyword + location
+- leads CSV
+- flyer
+- example / portfolio links
+- portfolio images
+- prices
+- sender-facing copy
+- outreach wording and rank keywords
 
 ---
 
 ## CLI Commands
 
 ```bash
-python crm.py migrate                             # one-time: add CRM columns + assign IDs
-python crm.py enrich [--id INSTWIEN-0001]         # fill contact names from FirmenABC
-python crm.py research [--id X] [--from X]        # website + Google reviews + rank
-python crm.py analyze [--id X] [--limit 50]       # generate AI message drafts (1 GPT call/lead)
-python crm.py analyze --gpt-hooks                 # use GPT for custom hooks (2 GPT calls/lead)
-python crm.py generate-hooks                      # generate hook library via GPT (run once)
-python crm.py daily                               # today's action list
-python crm.py log INSTWIEN-0001 sent              # log a contact attempt
-python crm.py log INSTWIEN-0001 called --notes "Left voicemail"
-python crm.py send-email INSTWIEN-0001            # send email via SMTP
-python crm.py send-email INSTWIEN-0001 --dry-run  # preview without sending
-python crm.py stats                               # pipeline overview
+python crm.py campaigns
+python crm.py campaign-create Schluesseldienst Wien
+python crm.py campaign-activate schluesseldienst_wien
+python crm.py scrape                              # scrape active campaign from Herold
+python crm.py migrate                             # add CRM columns + assign campaign IDs
+python crm.py enrich [--id SCHLWIEN-0001]
+python crm.py research [--id X] [--from X]
+python crm.py analyze [--id X] [--limit 50]
+python crm.py analyze --gpt-hooks
+python crm.py generate-hooks                      # writes the active campaign hook library
+python crm.py daily
+python crm.py log SCHLWIEN-0001 sent
+python crm.py send-email SCHLWIEN-0001 --dry-run
+python crm.py stats
 ```
 
 ---
@@ -193,10 +186,11 @@ streamlit run app.py
 
 | Page             | What it does                                                           |
 | ---------------- | ---------------------------------------------------------------------- |
+| **Campaigns**    | Create / activate campaigns, edit niche config, upload flyer/assets, run pipeline stages |
 | **Dashboard**    | KPIs, pipeline funnel, today's actions, bulk draft generation          |
 | **Review Queue** | Review AI drafts with research data → approve or edit before sending   |
 | **Outreach**     | One-click Send Email / Open WhatsApp / phone script for approved leads |
-| **All Leads**    | Search, filter, sort all leads; edit price and notes inline            |
+| **All Leads**    | Search and filter active-campaign leads; inspect stale research/drafts |
 
 ---
 
@@ -207,6 +201,8 @@ new → draft_ready → approved → contacted → replied → meeting_scheduled
                                                                         → lost
                                          → (3x no reply, 14 days)     → no_contact
 ```
+
+Campaign config changes mark old drafts / research as stale. Re-run the relevant step to refresh them.
 
 ---
 
@@ -226,20 +222,18 @@ new → draft_ready → approved → contacted → replied → meeting_scheduled
 ## File Structure
 
 ```
-├── crm.py              CLI entry point
-├── crm_store.py        CSV persistence (atomic reads/writes)
-├── crm_research.py     Website fetch + Google Places API + rank checking
-├── crm_enrich.py       Contact name enrichment from FirmenABC
-├── crm_analyze.py      OpenAI website scoring + pain point detection
-├── crm_templates.py    Pre-written message templates + hook/subject library
-├── crm_mailer.py       SMTP email sender + WhatsApp link generator
-├── crm_tracker.py      Contact logging + follow-up scheduling
-├── crm_daily.py        Daily action list + pipeline stats
-├── app.py              Streamlit dashboard
-├── hooks_library.json  GPT-generated hooks (created by generate-hooks, edit freely)
-├── new_leads.csv       Lead database
-├── screenshots/        Mobile screenshots (INSTWIEN-0001_mobile.png)
-├── portfolio/          Your portfolio PNGs (shown in dashboard)
-├── .env                Your secrets — never commit this
-└── .env.example        Template — copy to .env and fill in
+├── crm.py                 CLI entry point
+├── campaign_service.py    Saved campaign registry + active campaign resolution
+├── crm_store.py           CSV persistence for the active campaign
+├── crm_research.py        Website fetch + Google Places API + rank checking
+├── crm_enrich.py          Contact name enrichment from FirmenABC
+├── crm_analyze.py         OpenAI website scoring + draft generation
+├── crm_templates.py       Campaign-aware templates + hook library handling
+├── crm_mailer.py          SMTP email sender + WhatsApp link generator
+├── crm_tracker.py         Contact logging + follow-up scheduling
+├── crm_daily.py           Daily action list + pipeline stats
+├── app.py                 Streamlit dashboard
+├── campaigns/             Saved campaign configs, assets, portfolio, and CSVs
+├── .env                   Your secrets / infrastructure config
+└── .env.example           Template for .env
 ```

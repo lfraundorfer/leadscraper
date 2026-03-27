@@ -4,9 +4,10 @@ crm_tracker.py – State machine for logging contact attempts and scheduling fol
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+import json
+from datetime import date, datetime, timedelta
 
-from crm_store import load_leads, save_leads, update_lead, TERMINAL_STATUSES
+from crm_store import default_preferred_channel, load_leads, save_leads, update_lead, TERMINAL_STATUSES
 
 # Follow-up delays in days after each contact attempt
 FOLLOWUP_DAYS = [3, 4, 7]  # Day 0→3, Day 3→7, Day 7→14 (then auto-archive)
@@ -21,6 +22,7 @@ OUTCOME_STATUS = {
     "replied":    "replied",
     "meeting":    "meeting_scheduled",
     "won":        "won",
+    "done":       "done",
     "lost":       "lost",
     "blacklist":  "blacklist",
 }
@@ -34,6 +36,47 @@ OUTCOME_CHANNEL = {
 }
 
 
+def parse_contact_log(raw: str) -> list[dict]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    entries: list[dict] = []
+    for item in data:
+        if isinstance(item, dict):
+            entries.append(
+                {
+                    "at": str(item.get("at") or "").strip(),
+                    "channel": str(item.get("channel") or "").strip(),
+                    "outcome": str(item.get("outcome") or "").strip(),
+                    "notes": str(item.get("notes") or "").strip(),
+                }
+            )
+    return entries
+
+
+def format_contact_log(entries: list[dict]) -> str:
+    return json.dumps(entries, ensure_ascii=False)
+
+
+def append_contact_log(lead: dict, *, at: str, channel: str, outcome: str, notes: str = "") -> None:
+    entries = parse_contact_log(lead.get("Contact_Log", ""))
+    entries.append(
+        {
+            "at": at,
+            "channel": channel,
+            "outcome": outcome,
+            "notes": notes.strip(),
+        }
+    )
+    lead["Contact_Log"] = format_contact_log(entries)
+
+
 def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") -> None:
     """
     Log a contact attempt and update the lead state accordingly.
@@ -42,7 +85,7 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
       sent / called / voicemail / no_answer  → Status = "contacted" + schedule follow-up
       replied       → Status = "replied"
       meeting       → Status = "meeting_scheduled"
-      won / lost / blacklist → terminal states
+      done / won / lost / blacklist → terminal states
     """
     leads = load_leads()
     lead = next((l for l in leads if l.get("ID", "").strip() == lead_id.strip()), None)
@@ -50,7 +93,9 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
         print(f"Lead {lead_id} not found.")
         return
 
-    today_str = date.today().isoformat()
+    now = datetime.now()
+    today_str = now.date().isoformat()
+    timestamp = now.strftime("%Y-%m-%d %H:%M")
     new_status = OUTCOME_STATUS.get(outcome, "contacted")
 
     # Infer channel if not provided
@@ -66,7 +111,7 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
             lead["Kontaktdatum"] = today_str
 
         # Schedule next follow-up
-        next_date, next_type = _calculate_next_action(lead, count)
+        next_date, next_type = _calculate_next_action(lead, count, current_channel=used_channel)
         lead["Next_Action_Date"] = next_date
         lead["Next_Action_Type"] = next_type
     else:
@@ -77,6 +122,7 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
     lead["Status"] = new_status
     lead["Last_Contact_Date"] = today_str
     lead["Channel_Used"] = used_channel
+    append_contact_log(lead, at=timestamp, channel=used_channel, outcome=outcome, notes=notes)
 
     # Append notes
     if notes:
@@ -88,7 +134,7 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "") 
     print(f"Logged: {lead_id} → {new_status} | next: {lead.get('Next_Action_Type', '-')} on {lead.get('Next_Action_Date', '-')}")
 
 
-def _calculate_next_action(lead: dict, contact_count: int) -> tuple[str, str]:
+def _calculate_next_action(lead: dict, contact_count: int, current_channel: str = "") -> tuple[str, str]:
     """Return (next_action_date_str, next_action_type) based on contact count."""
     today = date.today()
 
@@ -101,7 +147,13 @@ def _calculate_next_action(lead: dict, contact_count: int) -> tuple[str, str]:
     next_date = (today + timedelta(days=delay)).isoformat()
 
     # Determine next channel (secondary/tertiary)
-    primary = lead.get("Next_Action_Type") or lead.get("Channel_Used") or "phone"
+    primary = (
+        current_channel
+        or lead.get("Next_Action_Type")
+        or lead.get("Preferred_Channel")
+        or lead.get("Channel_Used")
+        or default_preferred_channel(lead)
+    )
     tel = lead.get("TelNr", "")
     email = lead.get("Email", "")
 

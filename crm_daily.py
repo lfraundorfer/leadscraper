@@ -7,7 +7,8 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date
 
-from crm_store import load_leads, save_leads, VALID_STATUSES, TERMINAL_STATUSES
+from campaign_service import get_active_campaign
+from crm_store import TERMINAL_STATUSES, VALID_STATUSES, load_leads, preferred_channel, save_leads
 from crm_tracker import check_and_archive_stale
 
 PRIORITY_LABELS = {1: "P1 🔴", 2: "P2 🟠", 3: "P3 🟡", 4: "P4 🟢", 5: "P5 ⚫"}
@@ -16,6 +17,7 @@ CHANNEL_EMOJI = {"email": "📧", "phone": "📞", "whatsapp": "💬", "none": "
 
 def show_daily(limit: int = 10) -> None:
     """Show today's action list — leads that need attention today."""
+    campaign = get_active_campaign()
     leads = load_leads()
     if not leads:
         print("No leads. Run `python crm.py migrate` first.")
@@ -45,7 +47,7 @@ def show_daily(limit: int = 10) -> None:
     # Sort by priority (asc), then next_action_date (asc)
     actionable.sort(key=lambda l: (int(l.get("Priority") or 5), l.get("Next_Action_Date") or ""))
 
-    print(f"\n=== TODAY'S ACTIONS ({today}) ===\n")
+    print(f"\n=== TODAY'S ACTIONS ({today}) | {campaign.get('label', campaign['id'])} ===\n")
 
     if not actionable:
         print("Nothing to do today! Check back tomorrow.")
@@ -88,6 +90,7 @@ def show_daily(limit: int = 10) -> None:
 
 def show_stats() -> None:
     """Show pipeline overview stats."""
+    campaign = get_active_campaign()
     leads = load_leads()
     if not leads:
         print("No leads.")
@@ -95,7 +98,7 @@ def show_stats() -> None:
 
     status_counts = Counter(l.get("Status", "new") for l in leads)
     priority_counts = Counter(l.get("Priority", "5") for l in leads)
-    channel_counts = Counter(l.get("Channel_Used") or l.get("Next_Action_Type", "none") for l in leads)
+    channel_counts = Counter(preferred_channel(l) for l in leads)
 
     score_buckets = {"No website": 0, "1-3 (bad)": 0, "4-6 (avg)": 0, "7-10 (good)": 0, "Not analyzed": 0}
     for l in leads:
@@ -112,7 +115,7 @@ def show_stats() -> None:
         else:
             score_buckets["7-10 (good)"] += 1
 
-    print(f"\n=== CRM PIPELINE STATS ===\n")
+    print(f"\n=== CRM PIPELINE STATS | {campaign.get('label', campaign['id'])} ===\n")
     print(f"Total leads: {len(leads)}\n")
 
     print("Pipeline:")
@@ -127,7 +130,7 @@ def show_stats() -> None:
         label = PRIORITY_LABELS.get(int(p), f"P{p}")
         print(f"  {label:<12} {n:>4}")
 
-    print("\nPrimary channel:")
+    print("\nPreferred start channel:")
     for ch, emoji in CHANNEL_EMOJI.items():
         n = channel_counts.get(ch, 0)
         print(f"  {emoji} {ch:<10} {n:>4}")

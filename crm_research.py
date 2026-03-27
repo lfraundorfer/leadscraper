@@ -1,10 +1,8 @@
 """
-crm_research.py – Deep research per lead:
-  1. Website HTML fetch + cleaning (for Claude to analyze)
-  2. Google Reviews (rating, count, snippets) via Google Maps link
-  3. Google local search rank + top competitors for "Installateur [PLZ]"
-
-Reuses HeroldFetcher (Playwright) from herold_scraper.py.
+crm_research.py - Deep research per lead for the active campaign:
+  1. Website HTML fetch + cleaning
+  2. Google Reviews (rating, count, snippets) via Places API
+  3. Google local search rank + top competitors for the campaign keyword
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
+from campaign_service import format_rank_keyword, get_active_campaign, mark_campaign_stage_run
 from herold_scraper import HeroldFetcher, DIRECTORY_DOMAINS
 from crm_store import load_leads, save_leads, get_bezirk
 
@@ -134,9 +133,9 @@ def get_places_data(company_name: str, address: str, api_key: str) -> dict:
 # Google local search rank + competitors
 # ---------------------------------------------------------------------------
 
-def check_google_rank(company_name: str, plz: str, fetcher: HeroldFetcher) -> dict:
+def check_google_rank(company_name: str, plz: str, campaign: dict, fetcher: HeroldFetcher) -> dict:
     """
-    Search Google for "Installateur [PLZ]" and find:
+    Search Google for the active campaign rank keyword and find:
     - The rank/position of this company (1-10 or "not_found")
     - Whether it appears in the local map pack
     - Top 3 organic competitor names
@@ -149,10 +148,10 @@ def check_google_rank(company_name: str, plz: str, fetcher: HeroldFetcher) -> di
         "map_pack": "",
         "competitors": [],
     }
-    if not plz:
+    keyword = format_rank_keyword(campaign, plz=plz)
+    if not keyword:
         return result
 
-    keyword = f"Installateur {plz}"
     result["rank_keyword"] = keyword
     search_url = f"https://www.google.com/search?q={keyword.replace(' ', '+')}&hl=de&gl=at&num=10"
 
@@ -166,6 +165,7 @@ def check_google_rank(company_name: str, plz: str, fetcher: HeroldFetcher) -> di
 
     # Normalize company name for matching
     norm_company = _normalize_name(company_name)
+    stop_words = _campaign_stop_words(campaign)
 
     # --- Map pack (local 3-pack) ---
     # Google local pack results have specific containers
@@ -179,7 +179,7 @@ def check_google_rank(company_name: str, plz: str, fetcher: HeroldFetcher) -> di
         name_text = name_el.get_text(separator=" ", strip=True)
         if name_text:
             local_pack_names.append(name_text[:60])
-            if _name_matches(norm_company, _normalize_name(name_text)):
+            if _name_matches(norm_company, _normalize_name(name_text), stop_words=stop_words):
                 map_pack_found = True
 
     result["map_pack"] = "yes" if map_pack_found else "no"
@@ -205,7 +205,7 @@ def check_google_rank(company_name: str, plz: str, fetcher: HeroldFetcher) -> di
             continue
         position += 1
         organic_names.append(name_text[:60])
-        if _name_matches(norm_company, _normalize_name(name_text)):
+        if _name_matches(norm_company, _normalize_name(name_text), stop_words=stop_words):
             found_position = str(position)
         if position >= 10:
             break
@@ -215,7 +215,7 @@ def check_google_rank(company_name: str, plz: str, fetcher: HeroldFetcher) -> di
     # Top 3 competitors = first 3 organic results that are NOT our company
     competitors = [
         n for n in organic_names
-        if not _name_matches(norm_company, _normalize_name(n))
+        if not _name_matches(norm_company, _normalize_name(n), stop_words=stop_words)
     ][:3]
     result["competitors"] = competitors
 
@@ -231,12 +231,19 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip()
 
 
-def _name_matches(a: str, b: str) -> bool:
+def _campaign_stop_words(campaign: dict) -> set[str]:
+    words: set[str] = {"und", "der", "die", "in", "wien"}
+    for value in [campaign.get("keyword", ""), campaign.get("location", "")]:
+        normalized = _normalize_name(str(value))
+        words.update(w for w in normalized.split() if len(w) > 1)
+    return words
+
+
+def _name_matches(a: str, b: str, stop_words: set[str] | None = None) -> bool:
     """Check if two normalized company names overlap significantly."""
     words_a = set(a.split())
     words_b = set(b.split())
-    # Remove very common words
-    stop = {"wien", "installateur", "haustechnik", "installation", "und", "der", "die"}
+    stop = stop_words or {"und", "der", "die", "wien"}
     words_a -= stop
     words_b -= stop
     if not words_a or not words_b:
@@ -248,42 +255,10 @@ def _name_matches(a: str, b: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Mobile screenshot
-# ---------------------------------------------------------------------------
-
-SCREENSHOTS_DIR = "screenshots"
-
-
-def _take_mobile_screenshot(url: str, lead_id: str, fetcher: HeroldFetcher) -> str:
-    """
-    Navigate to url at iPhone 14 viewport and save screenshot.
-    Returns the path to the saved PNG, or '' on failure.
-    """
-    try:
-        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-        path = os.path.join(SCREENSHOTS_DIR, f"{lead_id}_mobile.png")
-
-        page = fetcher._page
-        # Save original viewport to restore later
-        page.set_viewport_size({"width": 390, "height": 844})
-        page.goto(url, wait_until="networkidle", timeout=30_000)
-        page.screenshot(path=path, full_page=False)
-        # Restore desktop viewport
-        page.set_viewport_size({"width": 1280, "height": 800})
-        return path
-    except Exception:
-        try:
-            fetcher._page.set_viewport_size({"width": 1280, "height": 800})
-        except Exception:
-            pass
-        return ""
-
-
-# ---------------------------------------------------------------------------
 # Main research function
 # ---------------------------------------------------------------------------
 
-def research_lead(lead: dict, fetcher: HeroldFetcher) -> dict:
+def research_lead(lead: dict, fetcher: HeroldFetcher, campaign: dict) -> dict:
     """
     Run all research steps for a single lead.
     Returns dict of updates to apply to the lead.
@@ -295,19 +270,12 @@ def research_lead(lead: dict, fetcher: HeroldFetcher) -> dict:
     category = categorize_website(website)
     updates["Website_Category"] = category
 
-    # 2. Website HTML + mobile screenshot
+    # 2. Website HTML
     if category == "real":
         html_text = fetch_and_clean_html(website, fetcher)
         updates["_website_html"] = html_text  # in-memory only, not persisted
         if not html_text:
             updates["Website_Category"] = "fetch_error"
-        else:
-            # Take a mobile screenshot (iPhone 14 viewport)
-            lead_id = lead.get("ID", "")
-            if lead_id:
-                screenshot_path = _take_mobile_screenshot(website, lead_id, fetcher)
-                if screenshot_path:
-                    updates["Mobile_Screenshot"] = "yes"
         time.sleep(RATE_LIMIT_SEC)
 
     # 3. Google Reviews via Places API
@@ -327,12 +295,15 @@ def research_lead(lead: dict, fetcher: HeroldFetcher) -> dict:
     adresse = lead.get("Adresse", "")
     plz, bezirk = get_bezirk(adresse)
     if plz:
-        rank_info = check_google_rank(lead.get("Unternehmen", ""), plz, fetcher)
+        rank_info = check_google_rank(lead.get("Unternehmen", ""), plz, campaign, fetcher)
         updates["Google_Rank_Keyword"] = rank_info["rank_keyword"]
         updates["Google_Rank_Position"] = rank_info["rank_position"]
         updates["Google_Map_Pack"] = rank_info["map_pack"]
         updates["Google_Competitors"] = " | ".join(rank_info["competitors"])
         time.sleep(RATE_LIMIT_SEC)
+
+    updates["Research_Config_Version"] = str(campaign.get("research_config_version") or campaign.get("config_version") or "1")
+    updates["Research_Stale"] = "0"
 
     return updates
 
@@ -342,7 +313,7 @@ def research_lead(lead: dict, fetcher: HeroldFetcher) -> dict:
 # ---------------------------------------------------------------------------
 
 def _id_number(lead_id: str) -> int:
-    """Extract numeric part from INSTWIEN-0581 → 581. Returns 0 if unparseable."""
+    """Extract numeric suffix from LEAD-0581 -> 581. Returns 0 if unparseable."""
     parts = lead_id.rsplit("-", 1)
     try:
         return int(parts[-1])
@@ -359,7 +330,8 @@ def main(force: bool = False, single_id: str = "", from_id: str = "") -> None:
         print("WARNING: GOOGLE_PLACES_API_KEY not set — Google Reviews will be skipped.")
         print("         Add it to your .env file to enable review data.")
 
-    leads = load_leads()
+    campaign = get_active_campaign()
+    leads = load_leads(campaign=campaign)
     if not leads:
         print("No leads found. Run `python crm.py migrate` first.")
         return
@@ -372,7 +344,7 @@ def main(force: bool = False, single_id: str = "", from_id: str = "") -> None:
     else:
         targets = [
             l for l in leads
-            if force or not l.get("Website_Category")
+            if force or not l.get("Website_Category") or l.get("Research_Stale") == "1"
         ]
         if from_id:
             from_num = _id_number(from_id)
@@ -390,14 +362,14 @@ def main(force: bool = False, single_id: str = "", from_id: str = "") -> None:
             company = lead.get("Unternehmen", "")
             print(f"  {lid} {company[:40]}…", end=" ", flush=True)
 
-            updates = research_lead(lead, fetcher)
+            updates = research_lead(lead, fetcher, campaign)
 
             # Apply updates (skip _website_html — it's in-memory only)
             for k, v in updates.items():
                 if not k.startswith("_"):
                     lead[k] = v
 
-            save_leads(leads)
+            save_leads(leads, campaign=campaign)
             done += 1
 
             score_info = f"cat={lead.get('Website_Category', '?')} | ★{lead.get('Google_Rating', '?')} | rank={lead.get('Google_Rank_Position', '?')}"
@@ -406,4 +378,5 @@ def main(force: bool = False, single_id: str = "", from_id: str = "") -> None:
     finally:
         fetcher.close()
 
+    mark_campaign_stage_run(campaign["id"], "researched")
     print(f"\nDone. Researched {done} lead(s).")

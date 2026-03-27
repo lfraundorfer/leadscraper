@@ -1,85 +1,527 @@
 """
-app.py – Streamlit CRM frontend for Installateur Wien outreach.
-
-Pages:
-  Dashboard    – Pipeline funnel + today's quick actions
-  Review Queue – Review & edit AI drafts before approving
-  Outreach     – Act on approved leads (send email, log calls, copy WhatsApp)
-  All Leads    – Full filterable table with expand/edit
-
-Run: streamlit run app.py
+app.py - Streamlit CRM frontend with saved multi-niche campaigns.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import urllib.parse
+from copy import deepcopy
 from collections import Counter
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from crm_templates import get_subject_options, parse_email_draft, compose_email_draft
-from crm_store import load_leads, save_leads, ALL_COLUMNS, TERMINAL_STATUSES, get_bezirk
-from crm_tracker import log_contact, check_and_archive_stale
+from campaign_service import (
+    bump_campaign_version,
+    create_campaign,
+    get_active_campaign,
+    get_campaign,
+    get_flyer_path,
+    get_portfolio_dir,
+    list_campaigns,
+    mark_campaign_stage_run,
+    resolve_csv_path,
+    set_active_campaign,
+    update_campaign,
+)
+from crm_mailer import format_phone_e164, send_email
+from crm_store import (
+    ALL_COLUMNS,
+    TERMINAL_STATUSES,
+    available_channels,
+    get_bezirk,
+    load_leads,
+    planned_channel,
+    preferred_channel,
+    save_leads,
+)
+from crm_templates import compose_email_draft, get_subject_options, parse_email_draft
+from crm_tracker import check_and_archive_stale, log_contact, parse_contact_log
 
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
+
+ACTIVE_ON_LOAD = get_active_campaign()
 
 st.set_page_config(
-    page_title="Installateur Wien CRM",
-    page_icon="🔧",
+    page_title=f"{ACTIVE_ON_LOAD.get('label', 'CRM')} CRM",
+    page_icon="🧭",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 PRIORITY_COLOR = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🟢", 5: "⚫"}
 CHANNEL_EMOJI = {"email": "📧", "phone": "📞", "whatsapp": "💬", "none": "⛔", "": "⛔"}
+CHANNEL_LABELS = {"email": "📧 Email", "whatsapp": "💬 WhatsApp", "phone": "📞 Phone call", "none": "⛔ None"}
 STATUS_EMOJI = {
     "new": "🆕", "draft_ready": "✍️", "approved": "✅",
     "contacted": "📤", "replied": "💬", "meeting_scheduled": "📅",
-    "won": "🏆", "lost": "❌", "no_contact": "👻", "blacklist": "🚫",
+    "won": "🏆", "lost": "❌", "done": "🏁", "no_contact": "👻", "blacklist": "🚫",
 }
+ALL_LEADS_PAGE_SIZE_OPTIONS = [10, 25, 50]
 
 
-@st.cache_data(ttl=5)
-def cached_leads():
-    return load_leads()
-
-
-def reload():
+def reload() -> None:
     st.cache_data.clear()
     st.rerun()
 
 
+@st.cache_data(ttl=5)
+def cached_leads(campaign_id: str) -> list[dict]:
+    campaign = get_campaign(campaign_id)
+    return load_leads(campaign=campaign)
+
+
+def _score_bar(score_str: str) -> str:
+    try:
+        score = int(score_str)
+    except (TypeError, ValueError):
+        return "-"
+    filled = "█" * score
+    empty = "░" * (10 - score)
+    return f"{filled}{empty} {score}/10"
+
+
+def _save_upload(uploaded_file, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(uploaded_file.getbuffer())
+
+
+def _campaign_state_key(campaign: dict, name: str) -> str:
+    return f"{name}_{campaign.get('id', 'default')}"
+
+
+def _copy_state_default(value):
+    return deepcopy(value)
+
+
+def _next_review_selection(queue_ids: list[str], current_id: str) -> str:
+    remaining = [lead_id for lead_id in queue_ids if lead_id != current_id]
+    if not remaining:
+        return ""
+    try:
+        current_index = queue_ids.index(current_id)
+    except ValueError:
+        return remaining[0]
+    return remaining[current_index] if current_index < len(remaining) else remaining[-1]
+
+
+def _channel_label(channel: str) -> str:
+    return CHANNEL_LABELS.get(channel, channel)
+
+
+def _extract_urls(*texts: str) -> list[str]:
+    seen: set[str] = set()
+    urls: list[str] = []
+    for text in texts:
+        for match in re.findall(r"https?://[^\s<>\"]+", text or ""):
+            url = match.rstrip(".,);:]")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def _render_draft_links(*texts: str) -> None:
+    urls = _extract_urls(*texts)
+    if not urls:
+        return
+    st.caption("Links")
+    for url in urls:
+        st.markdown(f"- [{url}]({url})")
+
+
+def _build_whatsapp_link(phone: str, draft: str) -> str | None:
+    if not (phone or "").strip() or not (draft or "").strip():
+        return None
+    e164 = format_phone_e164(phone)
+    return f"https://wa.me/{e164.lstrip('+')}?text={urllib.parse.quote(draft)}"
+
+
+def _contact_log_entries(lead: dict) -> list[dict]:
+    entries = parse_contact_log(lead.get("Contact_Log", ""))
+    if entries:
+        return entries
+
+    fallback_at = (lead.get("Last_Contact_Date") or lead.get("Kontaktdatum") or "").strip()
+    if not fallback_at:
+        return []
+    return [
+        {
+            "at": fallback_at,
+            "channel": (lead.get("Channel_Used") or "").strip(),
+            "outcome": (lead.get("Status") or "").strip(),
+            "notes": "",
+        }
+    ]
+
+
+def _first_contact_at(lead: dict) -> str:
+    entries = _contact_log_entries(lead)
+    timestamps = [entry.get("at", "").strip() for entry in entries if entry.get("at", "").strip()]
+    if timestamps:
+        return min(timestamps)
+    return (lead.get("Kontaktdatum") or lead.get("Last_Contact_Date") or "").strip()
+
+
+def _first_contact_sort_key(lead: dict) -> tuple[int, str]:
+    first_contact = _first_contact_at(lead)
+    if not first_contact:
+        return (1, "9999-99-99")
+    return (0, first_contact[:10])
+
+
+def _days_since_first_contact(lead: dict) -> int | None:
+    first_contact = _first_contact_at(lead)
+    if not first_contact:
+        return None
+    try:
+        first_date = date.fromisoformat(first_contact[:10])
+    except ValueError:
+        return None
+    return (date.today() - first_date).days
+
+
+def _has_contact_history(lead: dict) -> bool:
+    if (lead.get("Kontaktdatum") or "").strip():
+        return True
+    if _contact_log_entries(lead):
+        return True
+    try:
+        return int(lead.get("Contact_Count") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _render_contact_log(lead: dict) -> None:
+    st.markdown("**Contact Log**")
+    entries = _contact_log_entries(lead)
+    if not entries:
+        st.caption("No contact activity yet.")
+        return
+    for entry in reversed(entries[-10:]):
+        at = entry.get("at") or "-"
+        channel = entry.get("channel") or "-"
+        outcome = entry.get("outcome") or "-"
+        notes = entry.get("notes") or ""
+        line = f"- `{at}` | `{channel}` | `{outcome}`"
+        if notes:
+            line += f" | {notes}"
+        st.markdown(line)
+
+
+def _set_manual_status(
+    campaign: dict,
+    lead_id: str,
+    *,
+    status: str,
+    notes: str = "",
+    channel: str = "",
+) -> None:
+    from crm_tracker import append_contact_log
+
+    all_leads = load_leads(campaign=campaign)
+    for row in all_leads:
+        if row.get("ID") != lead_id:
+            continue
+        row["Status"] = status
+        if status in TERMINAL_STATUSES or status in {"replied", "meeting_scheduled", "no_contact"}:
+            row["Next_Action_Type"] = "none"
+            row["Next_Action_Date"] = ""
+        if channel:
+            row["Channel_Used"] = channel
+        append_contact_log(
+            row,
+            at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+            channel=channel or (row.get("Channel_Used") or "").strip(),
+            outcome=status,
+            notes=notes or f"Marked as {status}",
+        )
+        break
+    save_leads(all_leads, campaign=campaign)
+
+
+def _save_draft_edits(
+    campaign: dict,
+    lead_id: str,
+    *,
+    subject: str,
+    body: str,
+    whatsapp: str,
+    phone_script: str,
+    selected_channel: str,
+) -> dict | None:
+    all_leads = load_leads(campaign=campaign)
+    updated: dict | None = None
+    for row in all_leads:
+        if row.get("ID") != lead_id:
+            continue
+        row["Email_Draft"] = compose_email_draft(subject, body)
+        row["WhatsApp_Draft"] = whatsapp.strip()
+        row["Phone_Script"] = phone_script.strip()
+        valid_channels = available_channels(row)
+        if selected_channel in valid_channels:
+            row["Preferred_Channel"] = selected_channel
+            if row.get("Status") not in TERMINAL_STATUSES:
+                row["Next_Action_Type"] = selected_channel
+        row["Drafts_Approved"] = "1"
+        row["Draft_Stale"] = "0"
+        row["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
+        if row.get("Status") in {"new", "draft_ready"}:
+            row["Status"] = "approved"
+        updated = dict(row)
+        break
+    if updated is not None:
+        save_leads(all_leads, campaign=campaign)
+    return updated
+
+
+def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: str) -> None:
+    lid = lead.get("ID", "?")
+    channel_options = available_channels(lead)
+    if not channel_options:
+        st.warning("No usable outreach channel on this lead.")
+        return
+
+    current_subject, current_body = parse_email_draft(lead.get("Email_Draft", ""))
+    subject_options = get_subject_options(lead, current_subject=current_subject, campaign=campaign)
+    planned = planned_channel(lead)
+
+    selected_channel = st.selectbox(
+        "Planned channel",
+        options=channel_options,
+        index=channel_options.index(planned) if planned in channel_options else 0,
+        format_func=_channel_label,
+        key=f"{key_prefix}_planned_channel",
+    )
+    selected_subject = st.selectbox(
+        "Email subject",
+        options=subject_options,
+        index=subject_options.index(current_subject) if current_subject in subject_options else 0,
+        key=f"{key_prefix}_subject",
+    )
+    email_body = st.text_area("Email body", value=current_body, height=240, key=f"{key_prefix}_email_body")
+    wa_draft = st.text_area("WhatsApp draft", value=lead.get("WhatsApp_Draft", ""), height=120, key=f"{key_prefix}_wa")
+    phone_script = st.text_area("Phone script", value=lead.get("Phone_Script", ""), height=220, key=f"{key_prefix}_phone")
+    _render_draft_links(email_body, wa_draft, phone_script)
+    action_note = st.text_input("Action note", value="", key=f"{key_prefix}_action_note", placeholder="Optional note for the contact log")
+
+    save_col, log_col = st.columns([1, 2])
+    if save_col.button("Save Drafts", key=f"{key_prefix}_save_drafts", type="primary"):
+        _save_draft_edits(
+            campaign,
+            lid,
+            subject=selected_subject,
+            body=email_body,
+            whatsapp=wa_draft,
+            phone_script=phone_script,
+            selected_channel=selected_channel,
+        )
+        reload()
+    log_col.caption("Saving here also marks the draft as approved/fresh so you can send it immediately.")
+
+    if "email" in channel_options:
+        st.markdown("**Email**")
+        c1, c2 = st.columns(2)
+        if c1.button("Send Email", key=f"{key_prefix}_send_email"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+            )
+            with st.spinner("Sending email..."):
+                ok = send_email(lid, notes=action_note)
+            if ok:
+                reload()
+        if c2.button("Mark Email Sent", key=f"{key_prefix}_mark_email"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+            )
+            log_contact(lid, "sent", notes=action_note, channel="email")
+            reload()
+
+    if "whatsapp" in channel_options:
+        st.markdown("**WhatsApp**")
+        wa_link = _build_whatsapp_link(lead.get("TelNr", ""), wa_draft)
+        c1, c2 = st.columns(2)
+        if wa_link:
+            c1.link_button("Open WhatsApp", wa_link)
+        else:
+            c1.caption("WhatsApp link unavailable.")
+        if c2.button("Mark WhatsApp Sent", key=f"{key_prefix}_mark_whatsapp"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+            )
+            log_contact(lid, "sent", notes=action_note, channel="whatsapp")
+            reload()
+
+    if "phone" in channel_options:
+        st.markdown("**Phone**")
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Called", key=f"{key_prefix}_called"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+            )
+            log_contact(lid, "called", notes=action_note, channel="phone")
+            reload()
+        if c2.button("Voicemail", key=f"{key_prefix}_voicemail"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+            )
+            log_contact(lid, "voicemail", notes=action_note, channel="phone")
+            reload()
+        if c3.button("No Answer", key=f"{key_prefix}_no_answer"):
+            _save_draft_edits(
+                campaign,
+                lid,
+                subject=selected_subject,
+                body=email_body,
+                whatsapp=wa_draft,
+                phone_script=phone_script,
+                selected_channel=selected_channel,
+            )
+            log_contact(lid, "no_answer", notes=action_note, channel="phone")
+            reload()
+
+    st.markdown("**Status**")
+    status_cols = st.columns(2)
+    if status_cols[0].button("Mark Done", key=f"{key_prefix}_done"):
+        _save_draft_edits(
+            campaign,
+            lid,
+            subject=selected_subject,
+            body=email_body,
+            whatsapp=wa_draft,
+            phone_script=phone_script,
+            selected_channel=selected_channel,
+        )
+        _set_manual_status(campaign, lid, status="done", notes=action_note, channel=selected_channel)
+        reload()
+
+
+def _persist_channel_choice(campaign: dict, lead_id: str, channel: str) -> None:
+    all_leads = load_leads(campaign=campaign)
+    for row in all_leads:
+        if row.get("ID") != lead_id:
+            continue
+        row["Preferred_Channel"] = channel
+        if row.get("Status") in {"new", "draft_ready", "approved", "contacted"}:
+            row["Next_Action_Type"] = channel
+        break
+    save_leads(all_leads, campaign=campaign)
+
+
+def _init_all_leads_state(campaign: dict) -> dict[str, str]:
+    key_map = {
+        "search": _campaign_state_key(campaign, "all_leads_search"),
+        "status": _campaign_state_key(campaign, "all_leads_status"),
+        "channel": _campaign_state_key(campaign, "all_leads_channel"),
+        "priority": _campaign_state_key(campaign, "all_leads_priority"),
+        "stale": _campaign_state_key(campaign, "all_leads_stale"),
+        "page_size": _campaign_state_key(campaign, "all_leads_page_size"),
+        "page": _campaign_state_key(campaign, "all_leads_page"),
+    }
+    defaults = {
+        "search": "",
+        "status": [],
+        "channel": [],
+        "priority": [],
+        "stale": "All",
+        "page_size": 25,
+        "page": 1,
+    }
+    for name, key in key_map.items():
+        if key not in st.session_state:
+            st.session_state[key] = _copy_state_default(defaults[name])
+    return key_map
+
+
+def _reset_all_leads_state(key_map: dict[str, str]) -> None:
+    defaults = {
+        "search": "",
+        "status": [],
+        "channel": [],
+        "priority": [],
+        "stale": "All",
+        "page_size": 25,
+        "page": 1,
+    }
+    for name, key in key_map.items():
+        st.session_state[key] = _copy_state_default(defaults[name])
+
+
+def _campaign_counts(leads: list[dict]) -> dict[str, int]:
+    counts = Counter(lead.get("Status", "new") for lead in leads)
+    counts["draft_stale"] = sum(1 for lead in leads if lead.get("Draft_Stale") == "1")
+    counts["research_stale"] = sum(1 for lead in leads if lead.get("Research_Stale") == "1")
+    counts["approved_fresh"] = sum(
+        1 for lead in leads
+        if lead.get("Status") == "approved" and lead.get("Drafts_Approved") == "1" and lead.get("Draft_Stale") != "1"
+    )
+    return counts
+
+
 def _generate_drafts(lead_ids: list[str], container) -> int:
-    """Generate AI message drafts for the given lead IDs. Shows progress in container."""
     import datetime
     import time
+
     from openai import OpenAI
-    from crm_analyze import (
-        analyze_website, select_channel_and_priority, NO_WEBSITE_ANALYSIS
+
+    from campaign_service import get_active_campaign, mark_campaign_stage_run
+    from crm_analyze import analyze_website, build_no_website_analysis, select_channel_and_priority
+    from crm_research import RATE_LIMIT_SEC, categorize_website, fetch_and_clean_html
+    from crm_templates import (
+        choose_hook,
+        is_pending_template_refresh_target,
+        pick_template_key,
+        render_drafts,
+        rerender_saved_draft,
     )
-    from crm_templates import render_drafts, pick_template_key, choose_hook
-    from crm_research import categorize_website, fetch_and_clean_html, RATE_LIMIT_SEC
     from herold_scraper import HeroldFetcher
 
+    campaign = get_active_campaign()
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         container.error("OPENAI_API_KEY not set in .env")
         return 0
 
     client = OpenAI(api_key=api_key)
-    all_leads = load_leads()
-    target_set = set(lead_ids)
-    targets = [l for l in all_leads if l.get("ID") in target_set]
+    all_leads = load_leads(campaign=campaign)
+    target_ids = set(lead_ids)
+    targets = [lead for lead in all_leads if lead.get("ID") in target_ids]
     if not targets:
         return 0
 
@@ -89,11 +531,20 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
     done = 0
 
     try:
-        for i, lead in enumerate(targets):
+        for idx, lead in enumerate(targets):
             lid = lead.get("ID", "?")
             company = lead.get("Unternehmen", "")[:35]
-            status_txt.caption(f"⏳ {lid} – {company}…")
-            prog.progress(i / len(targets))
+            was_stale = lead.get("Draft_Stale") == "1"
+            status_txt.caption(f"Building drafts for {lid} - {company}")
+            prog.progress(idx / len(targets))
+
+            if was_stale and lead.get("Research_Stale") != "1" and is_pending_template_refresh_target(lead):
+                status_txt.caption(f"Refreshing drafts for {lid} - {company}")
+                rerender_saved_draft(lead, campaign=campaign)
+                lead["Drafts_Approved"] = "0"
+                save_leads(all_leads, campaign=campaign)
+                done += 1
+                continue
 
             website = lead.get("Website", "").strip()
             category = lead.get("Website_Category") or categorize_website(website)
@@ -102,761 +553,774 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
             if category == "real":
                 html = fetch_and_clean_html(website, fetcher)
                 if html:
-                    analysis = analyze_website(lead.get("Unternehmen", ""), website, html, client)
+                    analysis = analyze_website(lead.get("Unternehmen", ""), website, html, client, campaign)
                 else:
                     lead["Website_Category"] = "fetch_error"
-                    analysis = NO_WEBSITE_ANALYSIS
+                    analysis = build_no_website_analysis(campaign)
                 time.sleep(RATE_LIMIT_SEC)
             else:
-                analysis = NO_WEBSITE_ANALYSIS
+                analysis = build_no_website_analysis(campaign)
 
             lead["Website_Score"] = str(analysis.get("score", 0))
             lead["Pain_Points"] = " | ".join(analysis.get("pain_points", []))
             lead["Pain_Categories"] = " | ".join(analysis.get("pain_categories", []))
 
             primary, _, priority = select_channel_and_priority(lead, analysis)
-            lead["Channel_Used"] = primary
+            if (lead.get("Preferred_Channel") or "").strip() in available_channels(lead):
+                lead["Preferred_Channel"] = lead["Preferred_Channel"].strip()
+            else:
+                lead["Preferred_Channel"] = primary
             lead["Priority"] = str(priority)
-            if not lead.get("Next_Action_Date") and primary != "none":
+            if not lead.get("Next_Action_Date") and lead["Preferred_Channel"] != "none":
                 lead["Next_Action_Date"] = date.today().isoformat()
-                lead["Next_Action_Type"] = primary
+                lead["Next_Action_Type"] = lead["Preferred_Channel"]
+            elif lead.get("Status", "new") in {"new", "draft_ready", "approved"} and lead["Preferred_Channel"] != "none":
+                lead["Next_Action_Type"] = lead["Preferred_Channel"]
 
             template_key = pick_template_key(analysis.get("pain_categories", []), lead)
-            hook = choose_hook(template_key, lead)
-            msgs = render_drafts(lead, hook, "", template_key=template_key)
-            lead.update(msgs)
+            hook = choose_hook(template_key, lead, campaign=campaign)
+            drafts = render_drafts(lead, hook, "", template_key=template_key, campaign=campaign)
+            lead.update(drafts)
+            lead["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
+            lead["Draft_Stale"] = "0"
             lead["Analyzed_At"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            if lead.get("Status", "new") == "new":
+            lead["Drafts_Approved"] = "0"
+            if lead.get("Status", "new") in {"new", "approved", "draft_ready"} or was_stale:
                 lead["Status"] = "draft_ready"
 
-            save_leads(all_leads)
+            save_leads(all_leads, campaign=campaign)
             done += 1
             time.sleep(1)
     finally:
         fetcher.close()
 
+    mark_campaign_stage_run(campaign["id"], "analyzed")
     prog.progress(1.0)
-    status_txt.caption(f"✅ Done — {done} draft(s) generated")
+    status_txt.caption(f"Finished {done} draft(s)")
     return done
 
 
-def score_bar(score_str: str) -> str:
-    try:
-        s = int(score_str)
-    except (ValueError, TypeError):
-        return "–"
-    filled = "█" * s
-    empty = "░" * (10 - s)
-    color = "🔴" if s <= 3 else "🟠" if s <= 5 else "🟡" if s <= 7 else "🟢"
-    return f"{color} {filled}{empty} {s}/10"
+def _active_campaign_switch() -> dict:
+    campaigns = list_campaigns()
+    campaign_ids = [campaign["id"] for campaign in campaigns]
+    labels = {campaign["id"]: campaign.get("label", campaign["id"]) for campaign in campaigns}
+    active = get_active_campaign()
+
+    st.sidebar.title("Campaign CRM")
+    selected_id = st.sidebar.selectbox(
+        "Active Campaign",
+        options=campaign_ids,
+        index=campaign_ids.index(active["id"]) if active["id"] in campaign_ids else 0,
+        format_func=lambda cid: labels.get(cid, cid),
+    )
+    if selected_id != active["id"]:
+        set_active_campaign(selected_id)
+        reload()
+
+    st.sidebar.caption(f"ID: `{selected_id}`")
+    return get_active_campaign()
 
 
-def _lead_header(lead: dict) -> str:
-    lid = lead.get("ID", "?")
-    company = lead.get("Unternehmen", "")
-    adresse = lead.get("Adresse", "")
-    plz, bezirk = get_bezirk(adresse)
-    pri = lead.get("Priority", "?")
-    pri_icon = PRIORITY_COLOR.get(int(pri) if str(pri).isdigit() else 5, "⚫")
-    status = lead.get("Status", "new")
-    st_icon = STATUS_EMOJI.get(status, "")
-    return f"{lid}  |  **{company}**  |  {plz} {bezirk}  |  {st_icon} {status}  |  {pri_icon} P{pri}"
-
-
-# ---------------------------------------------------------------------------
-# Sidebar navigation
-# ---------------------------------------------------------------------------
-
-st.sidebar.title("🔧 Installateur CRM")
-page = st.sidebar.radio(
-    "Navigation",
-    ["Dashboard", "Review Queue", "Outreach", "All Leads"],
-    label_visibility="collapsed",
-)
-
-# Auto-archive stale leads once per session
-if "archived_stale" not in st.session_state:
-    leads_raw = load_leads()
-    leads_raw, n = check_and_archive_stale(leads_raw)
-    if n:
-        save_leads(leads_raw)
-    st.session_state["archived_stale"] = True
-
-# ---------------------------------------------------------------------------
-# PAGE: Dashboard
-# ---------------------------------------------------------------------------
-
-if page == "Dashboard":
+def _render_dashboard(campaign: dict, leads: list[dict]) -> None:
     st.title("Dashboard")
+    st.caption(f"Active campaign: {campaign.get('label', campaign['id'])}")
 
-    leads = cached_leads()
     if not leads:
-        st.warning("No leads found. Run `python crm.py migrate` first.")
-        st.stop()
+        st.warning("No leads found yet. Start on the Campaigns page and run Scrape.")
+        return
 
-    today = date.today().isoformat()
-    status_counts = Counter(l.get("Status", "new") for l in leads)
-
-    # KPI row
+    counts = _campaign_counts(leads)
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Leads", len(leads))
-    col2.metric("Draft Ready", status_counts.get("draft_ready", 0), help="AI drafts waiting for your review")
-    col3.metric("Approved", status_counts.get("approved", 0), help="Ready to send")
-    col4.metric("In Progress", status_counts.get("contacted", 0) + status_counts.get("replied", 0))
-    col5.metric("Won", status_counts.get("won", 0))
+    col2.metric("Draft Ready", counts.get("draft_ready", 0))
+    col3.metric("Approved", counts.get("approved_fresh", 0))
+    col4.metric("Drafts Stale", counts.get("draft_stale", 0))
+    col5.metric("Research Stale", counts.get("research_stale", 0))
 
-    st.divider()
-
-    # Generate Drafts section
-    needs_gen = [
-        l for l in leads
-        if l.get("Website_Category") and not l.get("Analyzed_At") and l.get("Status") == "new"
+    pending_drafts = [
+        lead for lead in leads
+        if lead.get("Website_Category") and (not lead.get("Analyzed_At") or lead.get("Draft_Stale") == "1")
+        and lead.get("Status") not in TERMINAL_STATUSES
     ]
-    if needs_gen:
-        st.subheader(f"🤖 Generate Drafts ({len(needs_gen)} leads ready)")
-        st.caption("These leads have research data but no AI drafts yet.")
-        gen_col, _ = st.columns([1, 3])
-        gen_all_btn = gen_col.button(f"Generate All ({len(needs_gen)})", type="primary", key="gen_all")
-        gen_container = st.container()
-        if gen_all_btn:
-            count = _generate_drafts([l["ID"] for l in needs_gen], gen_container)
-            if count:
-                reload()
+    if pending_drafts:
         st.divider()
+        st.subheader(f"Generate Drafts ({len(pending_drafts)})")
+        st.caption("Includes never-analyzed leads and drafts made stale by campaign changes.")
+        if st.button(f"Generate All Pending ({len(pending_drafts)})", type="primary", key="gen_all_pending"):
+            container = st.container()
+            if _generate_drafts([lead["ID"] for lead in pending_drafts], container):
+                reload()
 
-    # Pipeline funnel
-    st.subheader("Pipeline")
-    pipeline_order = ["new", "draft_ready", "approved", "contacted", "replied", "meeting_scheduled", "won", "lost", "no_contact"]
-    funnel_data = {s: status_counts.get(s, 0) for s in pipeline_order}
-
-    cols = st.columns(len(pipeline_order))
-    for col, (status, count) in zip(cols, funnel_data.items()):
-        icon = STATUS_EMOJI.get(status, "")
-        col.metric(f"{icon} {status.replace('_', ' ').title()}", count)
+    today = date.today().isoformat()
+    actionable = [
+        lead for lead in leads
+        if lead.get("Status") not in TERMINAL_STATUSES
+        and lead.get("Status") != "no_contact"
+        and lead.get("Next_Action_Type", "none") not in ("none", "")
+        and (not lead.get("Next_Action_Date") or lead.get("Next_Action_Date") <= today)
+    ]
+    actionable.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Next_Action_Date") or ""))
 
     st.divider()
-
-    # Today's actions
     st.subheader(f"Today's Actions ({today})")
-    actionable = [
-        l for l in leads
-        if l.get("Status") not in TERMINAL_STATUSES
-        and l.get("Status") != "no_contact"
-        and l.get("Next_Action_Type", "none") not in ("none", "")
-        and (not l.get("Next_Action_Date") or l.get("Next_Action_Date") <= today)
-    ]
-    actionable.sort(key=lambda l: (int(l.get("Priority") or 5), l.get("Next_Action_Date") or ""))
-
     if not actionable:
-        st.success("Nothing to do today!")
+        st.success("Nothing due today.")
     else:
-        st.info(f"**{len(actionable)} leads** need attention today")
-        for lead in actionable[:5]:
+        for lead in actionable[:6]:
             lid = lead.get("ID", "?")
             company = lead.get("Unternehmen", "")
-            ch = lead.get("Next_Action_Type", "?")
-            pri = lead.get("Priority", "?")
-            score = lead.get("Website_Score", "")
-            rating = lead.get("Google_Rating", "")
-            rank = lead.get("Google_Rank_Position", "")
-
+            priority = lead.get("Priority", "5")
+            channel = lead.get("Next_Action_Type", "none")
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-                c1.markdown(f"**{lid}** – {company}")
-                c2.markdown(f"{CHANNEL_EMOJI.get(ch, '?')} {ch}")
-                c3.markdown(f"{PRIORITY_COLOR.get(int(pri) if str(pri).isdigit() else 5, '⚫')} P{pri}")
-                score_s = f"{score}/10" if score else "no web"
-                rating_s = f"★{rating}" if rating else "–"
-                rank_s = f"#{rank}" if rank and rank not in ("not_found", "error", "") else (rank or "–")
-                c4.markdown(f"{score_s} | {rating_s} | {rank_s}")
-
-        if len(actionable) > 5:
-            st.caption(f"+ {len(actionable)-5} more — go to **Review Queue** tab")
+                c1.markdown(f"**{lid}** - {company}")
+                c2.markdown(f"{CHANNEL_EMOJI.get(channel, '?')} {channel}")
+                c3.markdown(f"{PRIORITY_COLOR.get(int(priority) if str(priority).isdigit() else 5, '⚫')} P{priority}")
+                c4.markdown(lead.get("Next_Action_Date") or today)
 
     st.divider()
+    st.subheader("Pipeline")
+    pipeline_order = ["new", "draft_ready", "approved", "contacted", "replied", "meeting_scheduled", "done", "won", "lost", "no_contact"]
+    cols = st.columns(len(pipeline_order))
+    for col, status in zip(cols, pipeline_order):
+        icon = STATUS_EMOJI.get(status, "")
+        col.metric(f"{icon} {status.replace('_', ' ').title()}", counts.get(status, 0))
 
-    # Priority breakdown
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("Priority Breakdown")
-        priority_counts = Counter(l.get("Priority", "5") for l in leads)
-        for p in ["1", "2", "3", "4", "5"]:
-            n = priority_counts.get(p, 0)
-            icon = PRIORITY_COLOR.get(int(p), "⚫")
-            st.progress(n / max(len(leads), 1), text=f"{icon} P{p}: {n} leads")
 
-    with col_b:
-        st.subheader("Website Scores")
-        no_web = sum(1 for l in leads if l.get("Website_Category") == "none" or l.get("Website_Score") == "0")
-        bad = sum(1 for l in leads if l.get("Website_Score") and int(l.get("Website_Score") or 0) in range(1, 4))
-        avg = sum(1 for l in leads if l.get("Website_Score") and int(l.get("Website_Score") or 0) in range(4, 7))
-        good = sum(1 for l in leads if l.get("Website_Score") and int(l.get("Website_Score") or 0) >= 7)
-        not_analyzed = sum(1 for l in leads if not l.get("Website_Score") and l.get("Website_Category") != "none")
-
-        for label, count in [("🔴 No website", no_web), ("🟠 Bad (1-3)", bad), ("🟡 Average (4-6)", avg), ("🟢 Good (7-10)", good), ("⚫ Not analyzed", not_analyzed)]:
-            st.text(f"{label}: {count}")
-
-# ---------------------------------------------------------------------------
-# PAGE: Review Queue
-# ---------------------------------------------------------------------------
-
-elif page == "Review Queue":
-    st.title("✍️ Review Queue")
-    st.caption("Review AI-generated drafts before approving. Edit freely — changes are saved on Approve.")
-
-    leads = cached_leads()
-    queue = [l for l in leads if l.get("Status") == "draft_ready"]
-    queue.sort(key=lambda l: (int(l.get("Priority") or 5), l.get("Analyzed_At") or ""))
+def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
+    st.title("Review Queue")
+    queue = [lead for lead in leads if lead.get("Status") == "draft_ready" and lead.get("Draft_Stale") != "1"]
+    queue.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Analyzed_At") or ""))
 
     if not queue:
-        st.success("Queue is empty! All drafts have been reviewed.")
-        st.info("Go to **Dashboard** and click **Generate All** to create new drafts.")
-        st.stop()
+        st.success("No drafts waiting for review.")
+        return
 
-    st.info(f"**{len(queue)} draft(s)** waiting for review")
+    stale_research = sum(1 for lead in queue if lead.get("Research_Stale") == "1")
+    if stale_research:
+        st.warning(f"{stale_research} lead(s) in this queue still use stale research data.")
 
-    # Lead selector
-    lead_options = {f"{l['ID']} – {l['Unternehmen'][:40]}": l for l in queue}
-    selected_key = st.selectbox("Select lead to review:", list(lead_options.keys()))
-    lead = lead_options[selected_key]
+    skipped_key = _campaign_state_key(campaign, "review_queue_skipped")
+    selected_key = _campaign_state_key(campaign, "review_queue_selected")
+    selected_widget_key = _campaign_state_key(campaign, "review_queue_selected_widget")
+    if skipped_key not in st.session_state:
+        st.session_state[skipped_key] = []
 
-    st.divider()
+    skipped_ids = set(st.session_state.get(skipped_key, []))
+    visible_queue = [lead for lead in queue if lead.get("ID") not in skipped_ids]
 
-    lid = lead.get("ID", "?")
-    company = lead.get("Unternehmen", "")
-    website = lead.get("Website", "")
-    adresse = lead.get("Adresse", "")
-    plz, bezirk = get_bezirk(adresse)
-    score = lead.get("Website_Score", "")
-    category = lead.get("Website_Category", "")
-    pain_pts = [p for p in lead.get("Pain_Points", "").split(" | ") if p]
-    rating = lead.get("Google_Rating", "")
-    rev_count = lead.get("Google_Review_Count", "")
-    snippets = [s for s in lead.get("Google_Review_Snippets", "").split(" | ") if s]
-    rank_kw = lead.get("Google_Rank_Keyword", "")
-    rank_pos = lead.get("Google_Rank_Position", "")
-    map_pack = lead.get("Google_Map_Pack", "")
-    competitors = [c for c in lead.get("Google_Competitors", "").split(" | ") if c]
-    channel = lead.get("Channel_Used") or lead.get("Next_Action_Type", "?")
-    pri = lead.get("Priority", "?")
+    info_col, action_col = st.columns([4, 1])
+    info_col.info(f"{len(queue)} draft(s) waiting for review")
+    if skipped_ids and action_col.button("Restore Skipped", key=f"restore_skipped_{campaign['id']}"):
+        st.session_state[skipped_key] = []
+        st.session_state[selected_key] = queue[0].get("ID", "")
+        st.session_state[selected_widget_key] = queue[0].get("ID", "")
+        reload()
 
-    # Header
-    pri_icon = PRIORITY_COLOR.get(int(pri) if str(pri).isdigit() else 5, "⚫")
-    st.markdown(f"### {lid} – {company}")
-    col_h1, col_h2, col_h3 = st.columns(3)
-    col_h1.markdown(f"📍 {plz} {bezirk}")
-    col_h2.markdown(f"{CHANNEL_EMOJI.get(channel, '?')} Primary: **{channel}**")
-    col_h3.markdown(f"{pri_icon} Priority: **P{pri}**")
+    if not visible_queue:
+        st.warning("Everything in the review queue is skipped for this session.")
+        return
 
-    st.divider()
+    queue_ids = [lead.get("ID", "") for lead in visible_queue]
+    if st.session_state.get(selected_key) not in queue_ids:
+        st.session_state[selected_key] = queue_ids[0]
+    if st.session_state.get(selected_widget_key) not in queue_ids:
+        st.session_state[selected_widget_key] = st.session_state[selected_key]
+    selected_id = st.selectbox(
+        "Select lead",
+        options=queue_ids,
+        format_func=lambda lead_id: next(
+            f"{lead.get('ID', '?')} - {lead.get('Unternehmen', '')[:45]}"
+            for lead in visible_queue
+            if lead.get("ID") == lead_id
+        ),
+        key=selected_widget_key,
+    )
+    if selected_id != st.session_state.get(selected_key):
+        st.session_state[selected_key] = selected_id
+    selected = next(lead for lead in visible_queue if lead.get("ID") == selected_id)
+    lid = selected.get("ID", "?")
+    company = selected.get("Unternehmen", "")
+    website = selected.get("Website", "")
+    plz, bezirk = get_bezirk(selected.get("Adresse", ""))
 
-    # Two-column layout: research left, drafts right
+    st.markdown(f"### {lid} - {company}")
+    meta1, meta2, meta3 = st.columns(3)
+    meta1.markdown(f"**Location:** {plz or '-'} {bezirk}")
+    meta2.markdown(f"**Website:** {selected.get('Website_Category') or '-'}")
+    meta3.markdown(f"**Priority:** {selected.get('Priority') or '-'}")
+
     left, right = st.columns([2, 3])
 
     with left:
-        st.subheader("📊 Research Summary")
+        st.subheader("Contact Info")
+        st.text(f"Name:    {selected.get('Kontaktname') or '-'}")
+        st.text(f"Email:   {selected.get('Email') or '-'}")
+        st.text(f"Tel:     {selected.get('TelNr') or '-'}")
+        st.text(f"Adresse: {selected.get('Adresse') or '-'}")
+        st.divider()
+        st.subheader("Research")
+        st.markdown(f"**Website score:** {_score_bar(selected.get('Website_Score', ''))}")
+        st.markdown(f"**Google rank keyword:** `{selected.get('Google_Rank_Keyword') or '-'}`")
+        st.markdown(f"**Google rank:** {selected.get('Google_Rank_Position') or '-'}")
+        st.markdown(f"**Google rating:** {selected.get('Google_Rating') or '-'}")
+        if website and website not in ("X", ""):
+            st.markdown(f"[Open website]({website})")
+        if selected.get("Google_Maps_Link"):
+            st.markdown(f"[Google Maps]({selected['Google_Maps_Link']})")
+        if selected.get("Pain_Points"):
+            st.markdown("**Pain points:**")
+            for item in selected["Pain_Points"].split(" | "):
+                if item.strip():
+                    st.markdown(f"- {item.strip()}")
 
-        # Website
-        with st.expander("🌐 Website", expanded=True):
-            if category == "none":
-                st.error("No website found")
-            elif category == "directory":
-                st.warning(f"Directory link only: {website}")
-            elif category == "fetch_error":
-                st.warning(f"Couldn't fetch: {website}")
-            else:
-                st.markdown(f"[{website}]({website})")
-                if score:
-                    st.markdown(score_bar(score))
-
-            if pain_pts:
-                st.markdown("**Pain points:**")
-                for p in pain_pts:
-                    st.markdown(f"- {p}")
-
-            # Mobile screenshot
-            if lead.get("Mobile_Screenshot") == "yes":
-                ss_path = f"screenshots/{lid}_mobile.png"
-                if os.path.exists(ss_path):
-                    st.image(ss_path, caption="📱 Mobile view", width="stretch")
-
-        # Google Reviews
-        with st.expander("⭐ Google Reviews", expanded=True):
-            if rating or rev_count:
-                stars = float(rating) if rating else 0
-                st.markdown(f"**{'★' * int(stars)}{'☆' * (5 - int(stars))} {rating}** ({rev_count} Bewertungen)")
-                if int(rev_count or 0) < 5:
-                    st.error("Very few reviews — strong pain point!")
-                elif float(rating or 5) < 4.0:
-                    st.warning("Below-average rating")
-            else:
-                st.info("No review data collected")
-            if snippets:
-                for s in snippets:
-                    if s.startswith("[NEG]"):
-                        st.error(f'🚨 "{s[5:].strip()}"')
-                    else:
-                        st.caption(f'"{s}"')
-
-        # Google Rank
-        with st.expander("🔍 Google Rank", expanded=True):
-            if rank_kw:
-                st.markdown(f"**Keyword:** `{rank_kw}`")
-                if rank_pos == "not_found":
-                    st.error("Not found in top 10!")
-                elif rank_pos and rank_pos.isdigit():
-                    pos = int(rank_pos)
-                    if pos <= 3:
-                        st.success(f"Position #{rank_pos} ✓")
-                    elif pos <= 7:
-                        st.warning(f"Position #{rank_pos}")
-                    else:
-                        st.error(f"Position #{rank_pos} (barely visible)")
-                if map_pack == "yes":
-                    st.success("✓ In Google Map Pack (3-pack)")
-                elif map_pack == "no":
-                    st.warning("Not in local 3-pack")
-                if competitors:
-                    st.markdown("**Competitors ranking ahead:**")
-                    for c in competitors:
-                        st.markdown(f"- {c}")
-            else:
-                st.info("No rank data collected")
-
-        # Contact info
-        with st.expander("📇 Contact Info"):
-            st.text(f"Name:  {lead.get('Kontaktname', '–') or '–'}")
-            st.text(f"Email: {lead.get('Email', '–') or '–'}")
-            st.text(f"Tel:   {lead.get('TelNr', '–') or '–'}")
-            if website and website not in ("X", ""):
-                st.markdown(f"[Open website ↗]({website})")
-            maps = lead.get("Google_Maps_Link", "")
-            if maps:
-                st.markdown(f"[Google Maps ↗]({maps})")
+        portfolio_dir = Path(get_portfolio_dir(campaign))
+        portfolio_imgs = sorted(path for path in portfolio_dir.glob("*.png"))
+        if portfolio_imgs:
+            with st.expander("Portfolio reference", expanded=False):
+                cols = st.columns(min(3, len(portfolio_imgs)))
+                for idx, img in enumerate(portfolio_imgs[:3]):
+                    cols[idx].image(str(img), caption=img.name, width="stretch")
 
     with right:
-        st.subheader("✏️ Message Drafts")
-        st.caption("Pick your preferred channel, edit any draft, then approve.")
+        st.subheader("Drafts")
+        channel_options = available_channels(selected)
+        if not channel_options:
+            st.error("No usable channel on this lead.")
+            return
 
-        # Portfolio thumbnails (reference for Linus)
-        portfolio_imgs = sorted([
-            f for f in os.listdir("portfolio") if f.lower().endswith(".png")
-        ]) if os.path.isdir("portfolio") else []
-        if portfolio_imgs:
-            with st.expander("🖼️ My Portfolio (reference)", expanded=False):
-                cols_p = st.columns(min(len(portfolio_imgs), 3))
-                for i, img in enumerate(portfolio_imgs[:3]):
-                    cols_p[i].image(f"portfolio/{img}", caption=img, width="stretch")
-
-        from crm_store import is_mobile
-        has_mobile = is_mobile(lead.get("TelNr", ""))
-        has_email = bool(lead.get("Email", "").strip())
-        has_phone = bool(lead.get("TelNr", "").strip())
-
-        # Build available channel options
-        channel_options = []
-        if has_email:
-            channel_options.append("📧 Email")
-        if has_mobile:
-            channel_options.append("💬 WhatsApp")
-        if has_phone:
-            channel_options.append("📞 Phone call")
-
-        # Pre-select the AI-suggested channel
-        ai_channel = lead.get("Channel_Used") or lead.get("Next_Action_Type", "")
-        channel_map = {"email": "📧 Email", "whatsapp": "💬 WhatsApp", "phone": "📞 Phone call"}
-        default_option = channel_map.get(ai_channel, channel_options[0] if channel_options else "📧 Email")
-        default_idx = channel_options.index(default_option) if default_option in channel_options else 0
-
-        if channel_options:
-            selected_channel_label = st.radio(
-                "Which channel do you want to use for first contact?",
-                channel_options,
-                index=default_idx,
-                horizontal=True,
-                key=f"ch_{lid}",
-            )
-            selected_channel = {"📧 Email": "email", "💬 WhatsApp": "whatsapp", "📞 Phone call": "phone"}[selected_channel_label]
-        else:
-            st.error("No contact channels available for this lead.")
-            selected_channel = "none"
-
-        st.divider()
-
-        current_subject, current_email_body = parse_email_draft(lead.get("Email_Draft", ""))
-        subject_options = get_subject_options(lead, current_subject=current_subject)
-        subject_index = subject_options.index(current_subject) if current_subject in subject_options else 0
+        current_subject, current_body = parse_email_draft(selected.get("Email_Draft", ""))
+        subject_options = get_subject_options(selected, current_subject=current_subject, campaign=campaign)
+        selected_channel = st.radio(
+            "Default starting channel",
+            options=channel_options,
+            index=channel_options.index(preferred_channel(selected)),
+            format_func=_channel_label,
+            help="This is just the default first touch. You can change it later in Outreach or All Leads.",
+            horizontal=True,
+        )
 
         with st.form(key=f"approve_{lid}"):
             selected_subject = st.selectbox(
-                "📧 Subject",
+                "Email subject",
                 options=subject_options,
-                index=subject_index,
-                key=f"subject_{lid}",
-                help="One of 20 personalized subject lines for this lead. You can switch before approving.",
+                index=subject_options.index(current_subject) if current_subject in subject_options else 0,
             )
-
-            email_body = st.text_area(
-                "📧 Email Body",
-                value=current_email_body,
-                height=250,
-                key=f"email_body_{lid}",
-            )
-
-            # WhatsApp
-            if has_mobile:
-                wa_draft = st.text_area(
-                    "💬 WhatsApp Draft",
-                    value=lead.get("WhatsApp_Draft", ""),
-                    height=110,
-                    key=f"wa_{lid}",
-                )
-            else:
-                wa_draft = lead.get("WhatsApp_Draft", "")
-                st.caption("💬 WhatsApp not available (no mobile number)")
-
-            # Phone script
-            phone_script = st.text_area(
-                "📞 Phone Script",
-                value=lead.get("Phone_Script", ""),
-                height=230,
-                key=f"phone_{lid}",
-            )
-
-            # Action buttons
-            b1, b2, b3 = st.columns(3)
-            approve = b1.form_submit_button("✅ Approve & Next", type="primary", width="stretch")
-            skip = b2.form_submit_button("⏭ Skip", width="stretch")
-            blacklist = b3.form_submit_button("🚫 Blacklist", width="stretch")
+            email_body = st.text_area("Email body", value=current_body, height=260)
+            wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120)
+            phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240)
+            _render_draft_links(email_body, wa_draft, phone_script)
+            c1, c2, c3 = st.columns(3)
+            approve = c1.form_submit_button("Approve", type="primary", width="stretch")
+            skip = c2.form_submit_button("Skip", width="stretch")
+            blacklist = c3.form_submit_button("Blacklist", width="stretch")
 
         if approve:
-            email_draft = compose_email_draft(selected_subject, email_body)
-            all_leads = load_leads()
-            for l in all_leads:
-                if l.get("ID") == lid:
-                    l["Email_Draft"] = email_draft
-                    l["WhatsApp_Draft"] = wa_draft
-                    l["Phone_Script"] = phone_script
-                    l["Channel_Used"] = selected_channel
-                    l["Next_Action_Type"] = selected_channel
-                    l["Status"] = "approved"
-                    l["Drafts_Approved"] = "1"
+            all_leads = load_leads(campaign=campaign)
+            for lead in all_leads:
+                if lead.get("ID") == lid:
+                    lead["Email_Draft"] = compose_email_draft(selected_subject, email_body)
+                    lead["WhatsApp_Draft"] = wa_draft
+                    lead["Phone_Script"] = phone_script
+                    lead["Preferred_Channel"] = selected_channel
+                    lead["Next_Action_Type"] = selected_channel
+                    lead["Status"] = "approved"
+                    lead["Drafts_Approved"] = "1"
+                    lead["Draft_Stale"] = "0"
                     break
-            save_leads(all_leads)
-            st.success(f"✅ {lid} approved via {selected_channel}!")
+            save_leads(all_leads, campaign=campaign)
+            skipped_ids.discard(lid)
+            st.session_state[skipped_key] = sorted(skipped_ids)
+            st.session_state[selected_key] = _next_review_selection(queue_ids, lid)
             reload()
 
         if skip:
-            st.info(f"Skipped {lid} — will appear again next time.")
+            skipped_ids.add(lid)
+            st.session_state[skipped_key] = sorted(skipped_ids)
+            st.session_state[selected_key] = _next_review_selection(queue_ids, lid)
             reload()
 
         if blacklist:
-            all_leads = load_leads()
-            for l in all_leads:
-                if l.get("ID") == lid:
-                    l["Status"] = "blacklist"
-                    l["Next_Action_Type"] = "none"
+            all_leads = load_leads(campaign=campaign)
+            for lead in all_leads:
+                if lead.get("ID") == lid:
+                    lead["Status"] = "blacklist"
+                    lead["Next_Action_Type"] = "none"
                     break
-            save_leads(all_leads)
-            st.warning(f"🚫 {lid} blacklisted.")
+            save_leads(all_leads, campaign=campaign)
+            skipped_ids.discard(lid)
+            st.session_state[skipped_key] = sorted(skipped_ids)
+            st.session_state[selected_key] = _next_review_selection(queue_ids, lid)
             reload()
 
-# ---------------------------------------------------------------------------
-# PAGE: Ready to Send (Phase 2)
-# ---------------------------------------------------------------------------
 
-elif page == "Outreach":
-    from crm_mailer import send_email as _send_email, get_whatsapp_link
-    from crm_tracker import log_contact as _log_contact
-
-    st.title("📬 Outreach")
-
-    leads = cached_leads()
-
-    approved = [l for l in leads if l.get("Status") == "approved" and l.get("Drafts_Approved") == "1"]
-    approved.sort(key=lambda l: (int(l.get("Priority") or 5), l.get("Unternehmen") or ""))
+def _render_outreach(campaign: dict, leads: list[dict]) -> None:
+    st.title("Outreach")
+    approved = [
+        lead for lead in leads
+        if lead.get("Status") == "approved"
+        and lead.get("Drafts_Approved") == "1"
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+    ]
+    approved.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Unternehmen") or ""))
 
     if not approved:
-        st.success("No approved leads yet — go to **Review Queue** to approve drafts.")
-        st.stop()
+        st.success("No approved leads ready in Outreach.")
+        return
 
-    st.caption(f"{len(approved)} lead(s) ready to send")
+    stale_count = sum(1 for lead in approved if lead.get("Draft_Stale") == "1")
+    if stale_count:
+        st.warning(f"{stale_count} approved lead(s) have stale drafts. You can still edit or send them here.")
+    st.caption("Outreach is for approved leads only. Use Re-contact for leads you already touched before.")
 
     for lead in approved:
         lid = lead.get("ID", "?")
         company = lead.get("Unternehmen", "")
-        channel = lead.get("Channel_Used") or lead.get("Next_Action_Type", "?")
-        pri = lead.get("Priority", "?")
-        pri_icon = PRIORITY_COLOR.get(int(pri) if str(pri).isdigit() else 5, "⚫")
-        email_addr = lead.get("Email", "").strip()
-        tel = lead.get("TelNr", "").strip()
-
-        label = f"{lid} – {company[:40]}  |  {CHANNEL_EMOJI.get(channel, '?')} {channel}  |  {pri_icon} P{pri}"
+        channel = planned_channel(lead)
+        priority = lead.get("Priority", "5")
+        status = lead.get("Status", "new")
+        stale_suffix = " | stale draft" if lead.get("Draft_Stale") == "1" else ""
+        label = (
+            f"{lid} - {company[:40]} | {STATUS_EMOJI.get(status, '')} {status}"
+            f" | {CHANNEL_EMOJI.get(channel, '?')} {channel} | "
+            f"{PRIORITY_COLOR.get(int(priority) if str(priority).isdigit() else 5, '⚫')} P{priority}{stale_suffix}"
+        )
         with st.expander(label):
-            # Contact details header
-            info_col, action_col = st.columns([3, 1])
-            if channel == "email" and email_addr:
-                info_col.caption(f"To: **{email_addr}**")
-            elif channel in ("whatsapp", "phone") and tel:
-                info_col.caption(f"Number: **{tel}**")
+            if lead.get("Draft_Stale") == "1":
+                st.warning("These drafts are stale for the current campaign config. You can still edit and send them here.")
+            _render_editable_draft_workspace(campaign, lead, key_prefix=f"outreach_{lid}")
+            _render_contact_log(lead)
 
-            # ── Email channel ──────────────────────────────────────────────
-            if channel == "email":
-                draft = lead.get("Email_Draft", "")
-                if draft:
-                    st.text_area("Email draft", value=draft, height=250, key=f"prev_email_{lid}")
-                if email_addr:
-                    send_col, log_col = st.columns(2)
-                    if send_col.button("📧 Send Email", key=f"send_email_{lid}", type="primary"):
-                        with st.spinner("Sending…"):
-                            ok = _send_email(lid)
-                        if ok:
-                            st.success(f"Sent to {email_addr} ✓")
-                            st.rerun()
-                        else:
-                            st.error("Send failed — check SMTP settings in .env")
-                    if log_col.button("✅ Mark as Sent (manual)", key=f"log_email_{lid}"):
-                        _log_contact(lid, "sent", channel="email")
-                        st.success("Logged ✓")
-                        st.rerun()
-                else:
-                    st.warning("No email address on file — cannot send.")
-                    if st.button("✅ Mark as Sent (manual)", key=f"log_email_naddr_{lid}"):
-                        _log_contact(lid, "sent", channel="email")
-                        st.success("Logged ✓")
-                        st.rerun()
 
-            # ── WhatsApp channel ───────────────────────────────────────────
-            elif channel == "whatsapp":
-                draft = lead.get("WhatsApp_Draft", "")
-                if draft:
-                    st.text_area("WhatsApp message", value=draft, height=120, key=f"prev_wa_{lid}")
-                if tel:
-                    wa_link = get_whatsapp_link(lid)
-                    wa_col, log_col = st.columns(2)
-                    if wa_link:
-                        wa_col.link_button("💬 Open WhatsApp", wa_link)
-                    else:
-                        wa_col.warning("Could not build WhatsApp link")
-                    if log_col.button("✅ Mark as Sent", key=f"log_wa_{lid}"):
-                        _log_contact(lid, "sent", channel="whatsapp")
-                        st.success("Logged ✓")
-                        st.rerun()
-                else:
-                    st.warning("No phone number — cannot open WhatsApp.")
-                    if st.button("✅ Mark as Sent (manual)", key=f"log_wa_ntel_{lid}"):
-                        _log_contact(lid, "sent", channel="whatsapp")
-                        st.success("Logged ✓")
-                        st.rerun()
+def _render_recontact(campaign: dict, leads: list[dict]) -> None:
+    st.title("Re-contact")
+    candidates = [
+        lead for lead in leads
+        if lead.get("Status") not in TERMINAL_STATUSES
+        and _has_contact_history(lead)
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+        and lead.get("Status") != "approved"
+    ]
+    candidates.sort(key=lambda lead: (_first_contact_sort_key(lead), int(lead.get("Priority") or 5), lead.get("Unternehmen") or ""))
 
-            # ── Phone channel ──────────────────────────────────────────────
-            elif channel == "phone":
-                script = lead.get("Phone_Script", "")
-                if script:
-                    st.text_area("Phone script", value=script, height=280, key=f"prev_phone_{lid}")
-                if tel:
-                    st.markdown(f"📞 **[Call {tel}](tel:{tel})**")
-                log_c1, log_c2, log_c3 = st.columns(3)
-                if log_c1.button("✅ Called", key=f"log_called_{lid}"):
-                    _log_contact(lid, "called", channel="phone")
-                    st.success("Logged ✓"); st.rerun()
-                if log_c2.button("📭 Voicemail", key=f"log_vm_{lid}"):
-                    _log_contact(lid, "voicemail", channel="phone")
-                    st.success("Logged ✓"); st.rerun()
-                if log_c3.button("📵 No Answer", key=f"log_na_{lid}"):
-                    _log_contact(lid, "no_answer", channel="phone")
-                    st.success("Logged ✓"); st.rerun()
+    if not candidates:
+        st.success("No previously contacted leads need re-contact right now.")
+        return
 
-            # ── Other drafts (collapsed) ───────────────────────────────────
-            other_drafts = []
-            if channel != "email" and lead.get("Email_Draft"):
-                other_drafts.append(("📧 Email draft", lead["Email_Draft"], 200))
-            if channel != "whatsapp" and lead.get("WhatsApp_Draft"):
-                other_drafts.append(("💬 WhatsApp draft", lead["WhatsApp_Draft"], 100))
-            if channel != "phone" and lead.get("Phone_Script"):
-                other_drafts.append(("📞 Phone script", lead["Phone_Script"], 200))
+    st.caption("Leads you already touched at least once, sorted by longest time since first contact.")
 
-            if other_drafts:
-                with st.expander("Other channel drafts"):
-                    for lbl, content, h in other_drafts:
-                        st.text_area(lbl, value=content, height=h, disabled=True, key=f"other_{lid}_{lbl[:8]}")
-
-# ---------------------------------------------------------------------------
-# PAGE: All Leads
-# ---------------------------------------------------------------------------
-
-elif page == "All Leads":
-    st.title("📋 All Leads")
-
-    leads = cached_leads()
-    if not leads:
-        st.warning("No leads. Run `python crm.py migrate` first.")
-        st.stop()
-
-    # Search
-    search_q = st.text_input("🔎 Search", placeholder="Company name, address, contact, email…", label_visibility="collapsed")
-
-    # Filters + Sort
-    with st.expander("🔍 Filters & Sort", expanded=True):
-        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-        all_statuses = sorted({l.get("Status", "new") for l in leads})
-        sel_status = fc1.multiselect("Status", all_statuses, default=[])
-
-        all_priorities = sorted({l.get("Priority", "5") for l in leads if l.get("Priority")})
-        sel_priority = fc2.multiselect("Priority", all_priorities, default=[])
-
-        all_channels = sorted({l.get("Channel_Used") or l.get("Next_Action_Type", "none") for l in leads})
-        sel_channel = fc3.multiselect("Channel", all_channels, default=[])
-
-        bezirks = sorted({get_bezirk(l.get("Adresse", ""))[1] for l in leads if get_bezirk(l.get("Adresse", ""))[1]})
-        sel_bezirk = fc4.multiselect("Bezirk", bezirks, default=[])
-
-        sort_by = fc5.selectbox("Sort by", ["Priority", "Website Score", "Google Rating", "Company A-Z"])
-
-    filtered = leads
-    if search_q:
-        q = search_q.lower()
-        filtered = [
-            l for l in filtered
-            if q in (l.get("Unternehmen") or "").lower()
-            or q in (l.get("Adresse") or "").lower()
-            or q in (l.get("Kontaktname") or "").lower()
-            or q in (l.get("Email") or "").lower()
-        ]
-    if sel_status:
-        filtered = [l for l in filtered if l.get("Status", "new") in sel_status]
-    if sel_priority:
-        filtered = [l for l in filtered if l.get("Priority", "5") in sel_priority]
-    if sel_channel:
-        filtered = [l for l in filtered if (l.get("Channel_Used") or l.get("Next_Action_Type", "none")) in sel_channel]
-    if sel_bezirk:
-        filtered = [l for l in filtered if get_bezirk(l.get("Adresse", ""))[1] in sel_bezirk]
-
-    if sort_by == "Website Score":
-        filtered.sort(key=lambda l: -(int(l.get("Website_Score") or 0)))
-    elif sort_by == "Google Rating":
-        filtered.sort(key=lambda l: -(float(l.get("Google_Rating") or 0)))
-    elif sort_by == "Company A-Z":
-        filtered.sort(key=lambda l: l.get("Unternehmen") or "")
-    else:
-        filtered.sort(key=lambda l: (int(l.get("Priority") or 5), l.get("Unternehmen") or ""))
-
-    st.caption(f"Showing {len(filtered)} of {len(leads)} leads")
-
-    for lead in filtered:
+    for lead in candidates:
         lid = lead.get("ID", "?")
         company = lead.get("Unternehmen", "")
         status = lead.get("Status", "new")
-        pri = lead.get("Priority", "?")
-        pri_icon = PRIORITY_COLOR.get(int(pri) if str(pri).isdigit() else 5, "⚫")
-        st_icon = STATUS_EMOJI.get(status, "")
-        channel = lead.get("Channel_Used") or lead.get("Next_Action_Type", "none")
-        score = lead.get("Website_Score", "")
-
-        label = f"{lid} | {company[:35]} | {st_icon} {status} | {pri_icon} P{pri} | {CHANNEL_EMOJI.get(channel, '?')} {channel}"
+        channel = planned_channel(lead)
+        priority = lead.get("Priority", "5")
+        days = _days_since_first_contact(lead)
+        age_label = f"{days}d since first contact" if days is not None else "no first-contact date"
+        label = (
+            f"{lid} - {company[:38]} | {STATUS_EMOJI.get(status, '')} {status}"
+            f" | {CHANNEL_EMOJI.get(channel, '?')} {channel} | "
+            f"{PRIORITY_COLOR.get(int(priority) if str(priority).isdigit() else 5, '⚫')} P{priority} | {age_label}"
+        )
         with st.expander(label):
-            c1, c2 = st.columns([2, 3])
+            if lead.get("Draft_Stale") == "1":
+                st.warning("These drafts are stale for the current campaign config. You can still edit and send them here.")
+            st.caption(f"First contact: {_first_contact_at(lead) or '-'}")
+            _render_editable_draft_workspace(campaign, lead, key_prefix=f"recontact_{lid}")
+            _render_contact_log(lead)
 
-            with c1:
+
+def _render_all_leads(campaign: dict, leads: list[dict]) -> None:
+    st.title("All Leads")
+    if not leads:
+        st.warning("No leads in the active campaign yet.")
+        return
+
+    st.caption("Search applies on submit and results are paginated to keep the page responsive with large lead lists and browser extensions like Bitwarden.")
+
+    state_keys = _init_all_leads_state(campaign)
+    statuses = sorted({lead.get("Status", "new") for lead in leads})
+    channels = sorted({planned_channel(lead) for lead in leads})
+    priorities = sorted({lead.get("Priority", "5") for lead in leads if lead.get("Priority")})
+
+    with st.form(key=f"all_leads_filters_{campaign['id']}"):
+        search = st.text_input(
+            "Search",
+            placeholder="Company, address, contact, email...",
+            key=state_keys["search"],
+        )
+        with st.expander("Filters", expanded=True):
+            c1, c2, c3, c4, c5 = st.columns(5)
+            sel_status = c1.multiselect("Status", statuses, key=state_keys["status"])
+            sel_channel = c2.multiselect("Channel", channels, key=state_keys["channel"])
+            sel_priority = c3.multiselect("Priority", priorities, key=state_keys["priority"])
+            sel_stale = c4.selectbox("Freshness", ["All", "Draft stale", "Research stale", "Fresh only"], key=state_keys["stale"])
+            page_size = c5.selectbox("Page size", ALL_LEADS_PAGE_SIZE_OPTIONS, key=state_keys["page_size"])
+
+        f1, f2 = st.columns(2)
+        apply_filters = f1.form_submit_button("Apply Filters", type="primary", width="stretch")
+        reset_filters = f2.form_submit_button("Reset Filters", width="stretch")
+
+    if reset_filters:
+        _reset_all_leads_state(state_keys)
+        reload()
+
+    if apply_filters:
+        st.session_state[state_keys["page"]] = 1
+
+    filtered = list(leads)
+    if search:
+        q = search.lower()
+        filtered = [
+            lead for lead in filtered
+            if q in (lead.get("Unternehmen") or "").lower()
+            or q in (lead.get("Adresse") or "").lower()
+            or q in (lead.get("Kontaktname") or "").lower()
+            or q in (lead.get("Email") or "").lower()
+        ]
+    if sel_status:
+        filtered = [lead for lead in filtered if lead.get("Status", "new") in sel_status]
+    if sel_channel:
+        filtered = [lead for lead in filtered if planned_channel(lead) in sel_channel]
+    if sel_priority:
+        filtered = [lead for lead in filtered if lead.get("Priority", "5") in sel_priority]
+    if sel_stale == "Draft stale":
+        filtered = [lead for lead in filtered if lead.get("Draft_Stale") == "1"]
+    elif sel_stale == "Research stale":
+        filtered = [lead for lead in filtered if lead.get("Research_Stale") == "1"]
+    elif sel_stale == "Fresh only":
+        filtered = [lead for lead in filtered if lead.get("Draft_Stale") != "1" and lead.get("Research_Stale") != "1"]
+
+    filtered.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Unternehmen") or ""))
+
+    total_filtered = len(filtered)
+    current_page = st.session_state.get(state_keys["page"], 1)
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    if current_page > total_pages:
+        current_page = total_pages
+        st.session_state[state_keys["page"]] = current_page
+    if current_page < 1:
+        current_page = 1
+        st.session_state[state_keys["page"]] = current_page
+
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+    if nav1.button("Prev", key=f"all_leads_prev_{campaign['id']}", disabled=current_page <= 1):
+        st.session_state[state_keys["page"]] = current_page - 1
+        reload()
+    nav2.caption(f"Page {current_page} of {total_pages}")
+    if nav3.button("Next", key=f"all_leads_next_{campaign['id']}", disabled=current_page >= total_pages):
+        st.session_state[state_keys["page"]] = current_page + 1
+        reload()
+
+    start = (current_page - 1) * page_size
+    end = start + page_size
+    paged_leads = filtered[start:end]
+    if total_filtered:
+        st.caption(f"Showing {start + 1}-{min(end, total_filtered)} of {total_filtered} filtered leads ({len(leads)} total)")
+    else:
+        st.caption(f"Showing 0 of {len(leads)} leads")
+
+    for lead in paged_leads:
+        lid = lead.get("ID", "?")
+        company = lead.get("Unternehmen", "")
+        status = lead.get("Status", "new")
+        priority = lead.get("Priority", "5")
+        channel = planned_channel(lead)
+        stale_tags = []
+        if lead.get("Draft_Stale") == "1":
+            stale_tags.append("draft stale")
+        if lead.get("Research_Stale") == "1":
+            stale_tags.append("research stale")
+        stale_suffix = f" | {', '.join(stale_tags)}" if stale_tags else ""
+        label = f"{lid} | {company[:35]} | {STATUS_EMOJI.get(status, '')} {status} | {CHANNEL_EMOJI.get(channel, '?')} {channel}{stale_suffix}"
+
+        with st.expander(label):
+            left, right = st.columns([2, 3])
+            with left:
                 st.markdown("**Contact Info**")
-                st.text(f"Name:    {lead.get('Kontaktname', '–') or '–'}")
-                st.text(f"Email:   {lead.get('Email', '–') or '–'}")
-                st.text(f"Tel:     {lead.get('TelNr', '–') or '–'}")
-                st.text(f"Adresse: {lead.get('Adresse', '–') or '–'}")
+                st.text(f"Kontakt: {lead.get('Kontaktname') or '-'}")
+                st.text(f"Email:   {lead.get('Email') or '-'}")
+                st.text(f"Telefon: {lead.get('TelNr') or '-'}")
+                st.text(f"Adresse: {lead.get('Adresse') or '-'}")
                 website = lead.get("Website", "")
                 if website and website not in ("X", ""):
-                    st.markdown(f"[Website ↗]({website})")
-                maps = lead.get("Google_Maps_Link", "")
-                if maps:
-                    st.markdown(f"[Maps ↗]({maps})")
-                firmenabc = lead.get("FirmenABC_Link", "")
-                if firmenabc and "firmenabc.at" in firmenabc:
-                    st.markdown(f"[FirmenABC ↗]({firmenabc})")
-
+                    st.markdown(f"[Website]({website})")
+                if lead.get("Google_Maps_Link"):
+                    st.markdown(f"[Maps]({lead['Google_Maps_Link']})")
                 st.divider()
                 st.markdown("**Research**")
-                st.text(f"Website Score:  {score}/10" if score else "Website Score: –")
-                # Mobile screenshot
-                if lead.get("Mobile_Screenshot") == "yes":
-                    ss_path = f"screenshots/{lid}_mobile.png"
-                    if os.path.exists(ss_path):
-                        with st.expander("📱 Mobile view"):
-                            st.image(ss_path, caption="Mobile screenshot (390px)")
+                st.text(f"Website score: {lead.get('Website_Score') or '-'}")
+                st.text(f"Google rank:   {lead.get('Google_Rank_Position') or '-'}")
+                st.text(f"Template:      {lead.get('Template_Used') or '-'}")
 
-                # Expandable Google Reviews
-                rating = lead.get("Google_Rating", "") or ""
-                rev_count = lead.get("Google_Review_Count", "") or ""
-                snippets_raw = lead.get("Google_Review_Snippets", "") or ""
-                snippets = [s.strip() for s in snippets_raw.split(" | ") if s.strip()]
-                review_header = f"⭐ {rating}★ ({rev_count} reviews)" if rating else "⭐ Google Reviews (no data)"
-                with st.expander(review_header):
-                    if snippets:
-                        for s in snippets:
-                            if s.startswith("[NEG]"):
-                                st.error(s[5:].strip())
-                            else:
-                                st.caption(f'"{s}"')
-                    else:
-                        st.caption("No review snippets collected yet.")
-
-                rank_pos = lead.get("Google_Rank_Position", "")
-                st.text(f"Google Rank:    #{rank_pos}" if rank_pos and rank_pos not in ("not_found", "error", "") else f"Google Rank:    {rank_pos or '–'}")
-
-                pain_pts = [p for p in lead.get("Pain_Points", "").split(" | ") if p]
-                if pain_pts:
-                    st.markdown("**Pain Points:**")
-                    for p in pain_pts:
-                        st.caption(f"• {p}")
-
+                default_price = campaign.get("price_default") or "500"
+                price_value = st.text_input("Price", value=lead.get("Price") or default_price, key=f"price_{lid}")
+                lead_channel_options = available_channels(lead)
+                if lead_channel_options:
+                    selected_channel = st.selectbox(
+                        "Planned channel",
+                        options=lead_channel_options,
+                        index=lead_channel_options.index(planned_channel(lead)),
+                        format_func=_channel_label,
+                        key=f"channel_{lid}",
+                    )
+                else:
+                    selected_channel = "none"
+                    st.caption("No usable outreach channel on this lead.")
+                notes_value = st.text_area("Notes", value=lead.get("Notes", ""), key=f"notes_{lid}", height=100)
+                if st.button("Save", key=f"save_{lid}"):
+                    all_leads = load_leads(campaign=campaign)
+                    for row in all_leads:
+                        if row.get("ID") == lid:
+                            row["Price"] = price_value
+                            row["Preferred_Channel"] = selected_channel
+                            if selected_channel != "none" and row.get("Status") not in TERMINAL_STATUSES:
+                                row["Next_Action_Type"] = selected_channel
+                            row["Notes"] = notes_value
+                            break
+                    save_leads(all_leads, campaign=campaign)
+                    reload()
+                if st.button("Blacklist", key=f"blacklist_{lid}"):
+                    all_leads = load_leads(campaign=campaign)
+                    for row in all_leads:
+                        if row.get("ID") == lid:
+                            row["Status"] = "blacklist"
+                            row["Next_Action_Type"] = "none"
+                            break
+                    save_leads(all_leads, campaign=campaign)
+                    reload()
                 st.divider()
-                st.markdown("**CRM**")
-                st.text(f"Status:       {status}")
-                st.text(f"Contacts:     {lead.get('Contact_Count', '0')}")
-                st.text(f"Last contact: {lead.get('Last_Contact_Date', '–') or '–'}")
-                st.text(f"Next action:  {lead.get('Next_Action_Type', '–')} on {lead.get('Next_Action_Date', '–') or '–'}")
+                _render_contact_log(lead)
 
-                price_default = os.getenv("PRICE_DEFAULT", "1490")
-                price_edit = st.text_input("Price (€)", value=lead.get("Price") or price_default, key=f"price_{lid}")
-                notes_edit = st.text_area("Notes", value=lead.get("Notes", ""), key=f"notes_{lid}", height=80)
-                if st.button("Save", key=f"save_notes_{lid}"):
-                    all_leads = load_leads()
-                    for l in all_leads:
-                        if l.get("ID") == lid:
-                            l["Notes"] = notes_edit
-                            l["Price"] = price_edit
-                            break
-                    save_leads(all_leads)
-                    st.success("Saved!")
-                    reload()
+            with right:
+                if lead.get("Draft_Stale") == "1":
+                    st.warning("These drafts are stale for the current campaign config.")
+                if lead.get("Research_Stale") == "1":
+                    st.warning("Research for this lead is stale for the current campaign config.")
+                _render_editable_draft_workspace(campaign, lead, key_prefix=f"all_leads_{lid}")
 
-                if st.button("🚫 Blacklist", key=f"bl_{lid}"):
-                    all_leads = load_leads()
-                    for l in all_leads:
-                        if l.get("ID") == lid:
-                            l["Status"] = "blacklist"
-                            l["Next_Action_Type"] = "none"
-                            break
-                    save_leads(all_leads)
-                    st.warning(f"{lid} blacklisted")
-                    reload()
+                if (lead.get("Website_Category") or lead.get("Research_Stale") == "1") and st.button("Generate Drafts", key=f"regen_{lid}"):
+                    if _generate_drafts([lid], st.container()):
+                        reload()
 
-            with c2:
-                st.markdown("**Message Drafts**")
-                email_draft = lead.get("Email_Draft", "")
-                if email_draft:
-                    st.text_area("Email", value=email_draft, height=200, disabled=True, key=f"all_email_{lid}")
-                wa_draft = lead.get("WhatsApp_Draft", "")
-                if wa_draft:
-                    st.text_area("WhatsApp", value=wa_draft, height=100, disabled=True, key=f"all_wa_{lid}")
-                phone_script = lead.get("Phone_Script", "")
-                if phone_script:
-                    st.text_area("Phone Script", value=phone_script, height=200, disabled=True, key=f"all_phone_{lid}")
 
-                if not email_draft and not wa_draft and not phone_script:
-                    if lead.get("Website_Category"):
-                        if st.button("🤖 Generate Drafts", key=f"gen_{lid}"):
-                            count = _generate_drafts([lid], st.container())
-                            if count:
-                                reload()
-                    else:
-                        st.info("Run research first (`python crm.py research`), then generate from Dashboard.")
+def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
+    st.title("Campaigns")
+    st.caption("Create, switch, edit, and run pipeline stages for saved niche campaigns.")
+
+    campaigns = list_campaigns()
+    summary_rows = [
+        {
+            "id": item["id"],
+            "label": item.get("label", item["id"]),
+            "keyword": item.get("keyword", ""),
+            "location": item.get("location", ""),
+            "config_version": item.get("config_version", 1),
+            "last_scraped_at": item.get("last_scraped_at", ""),
+            "last_analyzed_at": item.get("last_analyzed_at", ""),
+        }
+        for item in campaigns
+    ]
+    st.dataframe(summary_rows, width="stretch", hide_index=True)
+
+    st.divider()
+    create_left, create_right = st.columns([2, 3])
+    with create_left:
+        st.subheader("Create Campaign")
+        with st.form("create_campaign"):
+            keyword = st.text_input("Keyword", placeholder="Schluesseldienst")
+            location = st.text_input("Location", placeholder="Wien")
+            create_btn = st.form_submit_button("Create and Activate", type="primary")
+        if create_btn and keyword.strip() and location.strip():
+            create_campaign(keyword.strip(), location.strip(), activate=True)
+            reload()
+    with create_right:
+        st.subheader("Active Campaign")
+        st.markdown(f"**{campaign.get('label', campaign['id'])}**")
+        st.text(f"CSV: {resolve_csv_path(campaign)}")
+        st.text(f"ID prefix: {campaign.get('id_prefix', '')}")
+        st.text(f"Config version: {campaign.get('config_version', 1)}")
+
+    st.divider()
+    counts = _campaign_counts(leads)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Leads", len(leads))
+    c2.metric("Draft ready", counts.get("draft_ready", 0))
+    c3.metric("Approved", counts.get("approved_fresh", 0))
+    c4.metric("Draft stale", counts.get("draft_stale", 0))
+    c5.metric("Research stale", counts.get("research_stale", 0))
+
+    stage_cols = st.columns(5)
+    if stage_cols[0].button("Scrape", type="primary", width="stretch"):
+        from herold_scraper import scrape_to_csv
+
+        with st.spinner("Scraping Herold..."):
+            scrape_to_csv(
+                category=campaign["keyword"],
+                location=campaign["location"],
+                output=resolve_csv_path(campaign),
+            )
+            mark_campaign_stage_run(campaign["id"], "scraped")
+        reload()
+    if stage_cols[1].button("Migrate", width="stretch"):
+        from crm_store import migrate
+
+        with st.spinner("Migrating CSV..."):
+            if migrate():
+                mark_campaign_stage_run(campaign["id"], "migrated")
+        reload()
+    if stage_cols[2].button("Enrich", width="stretch"):
+        from crm_enrich import main as enrich_main
+
+        with st.spinner("Enriching contacts..."):
+            enrich_main()
+        reload()
+    if stage_cols[3].button("Research", width="stretch"):
+        from crm_research import main as research_main
+
+        with st.spinner("Running research..."):
+            research_main()
+        reload()
+    if stage_cols[4].button("Analyze", width="stretch"):
+        from crm_analyze import main as analyze_main
+
+        with st.spinner("Generating drafts..."):
+            analyze_main()
+        reload()
+
+    st.caption(
+        "Last runs: "
+        f"scrape={campaign.get('last_scraped_at') or '-'} | "
+        f"migrate={campaign.get('last_migrated_at') or '-'} | "
+        f"enrich={campaign.get('last_enriched_at') or '-'} | "
+        f"research={campaign.get('last_researched_at') or '-'} | "
+        f"analyze={campaign.get('last_analyzed_at') or '-'}"
+    )
+
+    st.divider()
+    st.subheader("Campaign Config")
+    with st.form("campaign_config"):
+        col1, col2 = st.columns(2)
+        label = col1.text_input("Label", value=campaign.get("label", ""))
+        rank_template = col2.text_input("Rank keyword template", value=campaign.get("rank_keyword_template", "{keyword} {plz}"))
+        keyword = col1.text_input("Keyword", value=campaign.get("keyword", ""))
+        location = col2.text_input("Location", value=campaign.get("location", ""))
+        service_singular = col1.text_input("Service singular", value=campaign.get("service_singular", ""))
+        service_plural = col2.text_input("Service plural", value=campaign.get("service_plural", ""))
+        price_default = col1.text_input("Default price", value=str(campaign.get("price_default", "500")))
+        price_monthly = col2.text_input("Monthly price", value=str(campaign.get("price_monthly", "25")))
+        turnaround_days = col1.number_input("Turnaround days", min_value=1, value=int(campaign.get("turnaround_days", 14)))
+        sender_name = col2.text_input("Sender name", value=campaign.get("sender_name", ""))
+        sender_company = col1.text_input("Sender company", value=campaign.get("sender_company", ""))
+        sender_website = col2.text_input("Sender website", value=campaign.get("sender_website", ""))
+        sender_phone = col1.text_input("Sender phone", value=campaign.get("sender_phone", ""))
+        sender_email = col2.text_input("Sender email", value=campaign.get("sender_email", ""))
+        offer_summary = st.text_area("Offer summary", value=campaign.get("offer_summary", ""), height=100)
+        example_intro = st.text_area("Example intro", value=campaign.get("example_intro", ""), height=80)
+        portfolio_urls_text = st.text_area(
+            "Portfolio URLs",
+            value="\n".join(campaign.get("portfolio_urls", [])),
+            height=120,
+        )
+        save_config = st.form_submit_button("Save Campaign Config", type="primary")
+
+    if save_config:
+        update_campaign(
+            campaign["id"],
+            {
+                "label": label.strip(),
+                "rank_keyword_template": rank_template.strip(),
+                "keyword": keyword.strip(),
+                "location": location.strip(),
+                "service_singular": service_singular.strip(),
+                "service_plural": service_plural.strip(),
+                "price_default": price_default.strip(),
+                "price_monthly": price_monthly.strip(),
+                "turnaround_days": int(turnaround_days),
+                "sender_name": sender_name.strip(),
+                "sender_company": sender_company.strip(),
+                "sender_website": sender_website.strip(),
+                "sender_phone": sender_phone.strip(),
+                "sender_email": sender_email.strip(),
+                "offer_summary": offer_summary.strip(),
+                "example_intro": example_intro.strip(),
+                "portfolio_urls": [line.strip() for line in portfolio_urls_text.splitlines() if line.strip()],
+            },
+        )
+        reload()
+
+    st.divider()
+    asset_left, asset_right = st.columns(2)
+    with asset_left:
+        st.subheader("Flyer")
+        flyer_path = Path(get_flyer_path(campaign))
+        if flyer_path.exists():
+            st.caption(str(flyer_path))
+            st.image(str(flyer_path), caption=flyer_path.name, width="stretch")
+        flyer_upload = st.file_uploader("Upload flyer", type=["png", "jpg", "jpeg"], key="flyer_upload")
+        if st.button("Save Flyer", key="save_flyer"):
+            if flyer_upload is not None:
+                _save_upload(flyer_upload, flyer_path)
+                bump_campaign_version(campaign["id"])
+                reload()
+            else:
+                st.warning("Choose a flyer file first.")
+
+    with asset_right:
+        st.subheader("Portfolio Images")
+        portfolio_dir = Path(get_portfolio_dir(campaign))
+        portfolio_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(portfolio_dir.glob("*"))
+        if existing:
+            cols = st.columns(min(3, len(existing)))
+            for idx, img in enumerate(existing[:3]):
+                cols[idx].image(str(img), caption=img.name, width="stretch")
+        uploads = st.file_uploader(
+            "Upload portfolio images",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="portfolio_uploads",
+        )
+        if st.button("Save Portfolio Images", key="save_portfolio"):
+            if uploads:
+                for upload in uploads:
+                    _save_upload(upload, portfolio_dir / upload.name)
+                bump_campaign_version(campaign["id"])
+                reload()
+            else:
+                st.warning("Choose one or more images first.")
+
+
+def _prepare_active_leads(campaign: dict) -> list[dict]:
+    leads = cached_leads(campaign["id"])
+    archive_key = f"archived_stale_{campaign['id']}"
+    if archive_key not in st.session_state:
+        updated, archived = check_and_archive_stale(load_leads(campaign=campaign))
+        if archived:
+            save_leads(updated, campaign=campaign)
+            leads = updated
+        st.session_state[archive_key] = True
+    return leads
+
+
+campaign = _active_campaign_switch()
+page = st.sidebar.radio(
+    "Navigation",
+    ["Campaigns", "Dashboard", "Review Queue", "Outreach", "Re-contact", "All Leads"],
+    label_visibility="collapsed",
+)
+
+active_leads = _prepare_active_leads(campaign)
+
+if page == "Campaigns":
+    _render_campaigns_page(campaign, active_leads)
+elif page == "Dashboard":
+    _render_dashboard(campaign, active_leads)
+elif page == "Review Queue":
+    _render_review_queue(campaign, active_leads)
+elif page == "Outreach":
+    _render_outreach(campaign, active_leads)
+elif page == "Re-contact":
+    _render_recontact(campaign, active_leads)
+else:
+    _render_all_leads(campaign, active_leads)

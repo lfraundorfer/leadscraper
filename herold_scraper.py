@@ -509,6 +509,120 @@ def _parse_page_range(s: str):
 # Main
 # ---------------------------------------------------------------------------
 
+def scrape_to_csv(
+    category: str,
+    location: str,
+    output: str = "",
+    pages: str = "",
+    page_pause: float = 4.0,
+    search_pause: float = 2.5,
+    no_search: bool = False,
+    visible: bool = False,
+    dump_html: str = "",
+    verbose: bool = False,
+) -> dict:
+    # Logging: route everything through tqdm so it doesn't break the progress bar.
+    # Only show warnings+ normally; verbose enables debug.
+    log_level = logging.DEBUG if verbose else logging.WARNING
+    handler = _TqdmHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logging.basicConfig(level=log_level, handlers=[handler], force=True)
+
+    if not HAS_PLAYWRIGHT:
+        raise RuntimeError("playwright not installed. Run: pip install playwright && playwright install chromium")
+
+    # Auto-generate output filename if not given
+    output = output or f"{_slugify(category)}_{_slugify(location)}.csv"
+
+    seen = load_existing_keys(output)
+    if seen:
+        tqdm.write(f"Resuming – {len(seen)} existing entries in '{output}' will be skipped.")
+
+    fetcher = HeroldFetcher(headless=not visible)
+    total_new = 0
+    total_pages = 1
+
+    try:
+        # ── Fetch page 1 to detect total page count ──────────────────────────
+        first_url = build_page_url(category, location, 1)
+        tqdm.write(f"Detecting pages for: {category} in {location} …")
+        first_html = fetcher.get(first_url, dump_dir=dump_html)
+        total_pages = detect_total_pages(first_html)
+
+        if pages:
+            page_start, page_end = _parse_page_range(pages)
+            page_end = min(page_end, total_pages)
+        else:
+            page_start, page_end = 1, total_pages
+
+        tqdm.write(f"Found {total_pages} pages total → scraping {page_start}–{page_end} → '{output}'")
+
+        pages = list(range(page_start, page_end + 1))
+
+        with tqdm(total=0, unit="entry", ncols=90,
+                  bar_format="p{desc}: {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+            for page_num in pages:
+                if page_num == 1 and first_html:
+                    html = first_html
+                    first_html = ""
+                else:
+                    html = ""
+                    url = build_page_url(category, location, page_num)
+                    for attempt in range(3):
+                        try:
+                            html = fetcher.get(url, dump_dir=dump_html)
+                            break
+                        except Exception as exc:
+                            wait = page_pause * (2 ** attempt)
+                            tqdm.write(f"WARN: page {page_num} attempt {attempt+1} failed ({exc}) – retrying in {wait:.0f}s")
+                            time.sleep(wait)
+
+                if not html:
+                    tqdm.write(f"ERROR: skipping page {page_num} – could not fetch")
+                    continue
+
+                url = build_page_url(category, location, page_num)
+                leads = parse_herold_page(html, url)
+                if not leads:
+                    tqdm.write(f"WARN: page {page_num} returned 0 listings")
+
+                new_leads = [l for l in leads if l.unternehmen and _normalize_key(l.unternehmen) not in seen]
+                pbar.reset(total=len(new_leads))
+                pbar.set_description(f"{page_num}/{page_end}")
+
+                for lead in new_leads:
+                    pbar.set_postfix_str(lead.unternehmen[:35], refresh=True)
+
+                    if not no_search:
+                        if not lead.website:
+                            lead.website = find_website(lead.unternehmen, search_pause)
+                        if not lead.firmenABC_link:
+                            lead.firmenABC_link = find_firmenabc(lead.unternehmen, search_pause)
+
+                    if lead.firmenABC_link and not lead.kontaktname:
+                        lead.kontaktname = fetch_firmenabc_contacts(lead.firmenABC_link, fetcher)
+                        time.sleep(search_pause)
+
+                    lead.google_maps_link = google_maps_link(lead.unternehmen, lead.adresse)
+
+                    if write_lead(lead, output, seen):
+                        total_new += 1
+                    pbar.update(1)
+
+                if page_num < page_end:
+                    time.sleep(page_pause)
+
+    finally:
+        fetcher.close()
+
+    tqdm.write(f"Done. {total_new} new entries written to '{output}'.")
+    return {
+        "output": output,
+        "new_entries": total_new,
+        "total_pages": total_pages,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scrape herold.at for any category + location → CSV",
@@ -529,102 +643,18 @@ def main():
     parser.add_argument("--dump-html",    default="",                help="Dir to dump raw HTML (debug)")
     parser.add_argument("--verbose",      action="store_true",       help="Verbose logging")
     args = parser.parse_args()
-
-    # Logging: route everything through tqdm so it doesn't break the progress bar.
-    # Only show warnings+ normally; verbose enables debug.
-    log_level = logging.DEBUG if args.verbose else logging.WARNING
-    handler = _TqdmHandler()
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logging.basicConfig(level=log_level, handlers=[handler], force=True)
-
-    if not HAS_PLAYWRIGHT:
-        tqdm.write("ERROR: playwright not installed.  pip install playwright && playwright install chromium")
-        return
-
-    # Auto-generate output filename if not given
-    output = args.output or f"{_slugify(args.category)}_{_slugify(args.location)}.csv"
-
-    seen = load_existing_keys(output)
-    if seen:
-        tqdm.write(f"Resuming – {len(seen)} existing entries in '{output}' will be skipped.")
-
-    fetcher = HeroldFetcher(headless=not args.visible)
-    total_new = 0
-
-    try:
-        # ── Fetch page 1 to detect total page count ──────────────────────────
-        first_url = build_page_url(args.category, args.location, 1)
-        tqdm.write(f"Detecting pages for: {args.category} in {args.location} …")
-        first_html = fetcher.get(first_url, dump_dir=args.dump_html)
-        total_pages = detect_total_pages(first_html)
-
-        if args.pages:
-            page_start, page_end = _parse_page_range(args.pages)
-            page_end = min(page_end, total_pages)
-        else:
-            page_start, page_end = 1, total_pages
-
-        tqdm.write(f"Found {total_pages} pages total → scraping {page_start}–{page_end} → '{output}'")
-
-        pages = list(range(page_start, page_end + 1))
-
-        with tqdm(total=0, unit="entry", ncols=90,
-                  bar_format="p{desc}: {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
-            for page_num in pages:
-                if page_num == 1 and first_html:
-                    html = first_html
-                    first_html = ""
-                else:
-                    html = ""
-                    url = build_page_url(args.category, args.location, page_num)
-                    for attempt in range(3):
-                        try:
-                            html = fetcher.get(url, dump_dir=args.dump_html)
-                            break
-                        except Exception as exc:
-                            wait = args.page_pause * (2 ** attempt)
-                            tqdm.write(f"WARN: page {page_num} attempt {attempt+1} failed ({exc}) – retrying in {wait:.0f}s")
-                            time.sleep(wait)
-
-                if not html:
-                    tqdm.write(f"ERROR: skipping page {page_num} – could not fetch")
-                    continue
-
-                url = build_page_url(args.category, args.location, page_num)
-                leads = parse_herold_page(html, url)
-                if not leads:
-                    tqdm.write(f"WARN: page {page_num} returned 0 listings")
-
-                new_leads = [l for l in leads if l.unternehmen and _normalize_key(l.unternehmen) not in seen]
-                pbar.reset(total=len(new_leads))
-                pbar.set_description(f"{page_num}/{page_end}")
-
-                for lead in new_leads:
-                    pbar.set_postfix_str(lead.unternehmen[:35], refresh=True)
-
-                    if not args.no_search:
-                        if not lead.website:
-                            lead.website = find_website(lead.unternehmen, args.search_pause)
-                        if not lead.firmenABC_link:
-                            lead.firmenABC_link = find_firmenabc(lead.unternehmen, args.search_pause)
-
-                    if lead.firmenABC_link and not lead.kontaktname:
-                        lead.kontaktname = fetch_firmenabc_contacts(lead.firmenABC_link, fetcher)
-                        time.sleep(args.search_pause)
-
-                    lead.google_maps_link = google_maps_link(lead.unternehmen, lead.adresse)
-
-                    if write_lead(lead, output, seen):
-                        total_new += 1
-                    pbar.update(1)
-
-                if page_num < page_end:
-                    time.sleep(args.page_pause)
-
-    finally:
-        fetcher.close()
-
-    tqdm.write(f"Done. {total_new} new entries written to '{output}'.")
+    scrape_to_csv(
+        category=args.category,
+        location=args.location,
+        output=args.output,
+        pages=args.pages,
+        page_pause=args.page_pause,
+        search_pause=args.search_pause,
+        no_search=args.no_search,
+        visible=args.visible,
+        dump_html=args.dump_html,
+        verbose=args.verbose,
+    )
 
 
 if __name__ == "__main__":
