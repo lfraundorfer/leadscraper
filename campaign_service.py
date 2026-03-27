@@ -331,14 +331,7 @@ def list_campaigns() -> list[dict[str, Any]]:
 
 def get_active_campaign() -> dict[str, Any]:
     if backend.is_postgres_backend():
-        active_id = backend.postgres_get_active_campaign_id()
-        campaigns = backend.postgres_list_campaigns()
-        if not campaigns:
-            raise KeyError("No campaigns available. Run `python crm.py bootstrap-postgres` first.")
-        if not active_id:
-            active_id = campaigns[0]["id"]
-            backend.postgres_set_active_campaign_id(active_id)
-        return backend.postgres_get_campaign(active_id)
+        return backend.postgres_get_active_campaign()
     registry = load_registry()
     active_id = registry.get("active_campaign_id") or LEGACY_CAMPAIGN_ID
     return get_campaign(active_id)

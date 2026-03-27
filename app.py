@@ -59,10 +59,8 @@ from crm_schedule import clear_scheduled_send, queue_scheduled_email, scheduled_
 from crm_tracker import check_and_archive_stale, log_contact, parse_contact_log
 
 
-ACTIVE_ON_LOAD = get_active_campaign()
-
 st.set_page_config(
-    page_title=f"{ACTIVE_ON_LOAD.get('label', 'CRM')} CRM",
+    page_title="Campaign CRM",
     page_icon="🧭",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -85,10 +83,37 @@ def reload() -> None:
     st.rerun()
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=300)
+def cached_campaigns() -> list[dict]:
+    return list_campaigns()
+
+
+@st.cache_data(ttl=300)
+def cached_campaign(campaign_id: str) -> dict:
+    return get_campaign(campaign_id)
+
+
+@st.cache_data(ttl=300)
+def cached_active_campaign() -> dict:
+    return get_active_campaign()
+
+
+@st.cache_data(ttl=300)
 def cached_leads(campaign_id: str) -> list[dict]:
-    campaign = get_campaign(campaign_id)
+    campaign = cached_campaign(campaign_id)
     return load_leads(campaign=campaign)
+
+
+@st.cache_data(ttl=300)
+def cached_campaign_metrics(campaign_id: str) -> dict[str, int]:
+    if backend.is_postgres_backend():
+        return backend.postgres_load_lead_metrics(campaign_id)
+
+    campaign = cached_campaign(campaign_id)
+    leads = load_leads(campaign=campaign)
+    counts = dict(_campaign_counts(leads))
+    counts["total_leads"] = len(leads)
+    return counts
 
 
 def _score_bar(score_str: str) -> str:
@@ -858,10 +883,10 @@ def _render_campaign_template_editor(campaign: dict) -> None:
 
 
 def _active_campaign_switch() -> dict:
-    campaigns = list_campaigns()
+    campaigns = cached_campaigns()
     campaign_ids = [campaign["id"] for campaign in campaigns]
     labels = {campaign["id"]: campaign.get("label", campaign["id"]) for campaign in campaigns}
-    active = get_active_campaign()
+    active = cached_active_campaign()
 
     st.sidebar.title("Campaign CRM")
     selected_id = st.sidebar.selectbox(
@@ -875,7 +900,7 @@ def _active_campaign_switch() -> dict:
         reload()
 
     st.sidebar.caption(f"ID: `{selected_id}`")
-    return get_active_campaign()
+    return cached_campaign(selected_id)
 
 
 def _render_dashboard(campaign: dict, leads: list[dict]) -> None:
@@ -1472,11 +1497,11 @@ def _render_all_leads(campaign: dict, leads: list[dict]) -> None:
                         reload()
 
 
-def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
+def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
     st.title("Campaigns")
     st.caption("Create, switch, edit, and run pipeline stages for saved niche campaigns.")
 
-    campaigns = list_campaigns()
+    campaigns = cached_campaigns()
     summary_rows = [
         {
             "id": item["id"],
@@ -1514,13 +1539,12 @@ def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
         st.text(f"Config version: {campaign.get('config_version', 1)}")
 
     st.divider()
-    counts = _campaign_counts(leads)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Leads", len(leads))
-    c2.metric("Draft ready", counts.get("draft_ready", 0))
-    c3.metric("Approved", counts.get("approved_fresh", 0))
-    c4.metric("Draft stale", counts.get("draft_stale", 0))
-    c5.metric("Research stale", counts.get("research_stale", 0))
+    c1.metric("Leads", metrics.get("total_leads", 0))
+    c2.metric("Draft ready", metrics.get("draft_ready", 0))
+    c3.metric("Approved", metrics.get("approved_fresh", 0))
+    c4.metric("Draft stale", metrics.get("draft_stale", 0))
+    c5.metric("Research stale", metrics.get("research_stale", 0))
 
     stage_cols = st.columns(5)
     if stage_cols[0].button("Scrape", type="primary", width="stretch"):
@@ -1612,9 +1636,10 @@ def _prepare_active_leads(campaign: dict) -> list[dict]:
     leads = cached_leads(campaign["id"])
     archive_key = f"archived_stale_{campaign['id']}"
     if archive_key not in st.session_state:
-        updated, archived = check_and_archive_stale(load_leads(campaign=campaign))
+        updated, archived = check_and_archive_stale([dict(lead) for lead in leads])
         if archived:
             save_leads(updated, campaign=campaign)
+            st.cache_data.clear()
             leads = updated
         st.session_state[archive_key] = True
     return leads
@@ -1627,11 +1652,12 @@ page = st.sidebar.radio(
     label_visibility="collapsed",
 )
 
-active_leads = _prepare_active_leads(campaign)
-
 if page == "Campaigns":
-    _render_campaigns_page(campaign, active_leads)
-elif page == "Dashboard":
+    _render_campaigns_page(campaign, cached_campaign_metrics(campaign["id"]))
+else:
+    active_leads = _prepare_active_leads(campaign)
+
+if page == "Dashboard":
     _render_dashboard(campaign, active_leads)
 elif page == "Review Queue":
     _render_review_queue(campaign, active_leads)

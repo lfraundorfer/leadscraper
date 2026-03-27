@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,9 @@ CAMPAIGNS_DIR = ROOT_DIR / "campaigns"
 REGISTRY_PATH = CAMPAIGNS_DIR / "registry.json"
 
 _POSTGRES_BOOTSTRAP_CHECKED = False
+_POSTGRES_SCHEMA_READY = False
+_POSTGRES_STATE_LOCK = threading.RLock()
+_POSTGRES_LOCAL = threading.local()
 
 CAMPAIGN_COLUMNS = [
     "id",
@@ -100,11 +104,46 @@ def _database_url() -> str:
     return url
 
 
+def _clear_thread_postgres_connection() -> None:
+    conn = getattr(_POSTGRES_LOCAL, "connection", None)
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
+    _POSTGRES_LOCAL.connection = None
+    _POSTGRES_LOCAL.database_url = ""
+
+
+def _thread_postgres_connection() -> Any:
+    database_url = _database_url()
+    conn = getattr(_POSTGRES_LOCAL, "connection", None)
+    current_url = getattr(_POSTGRES_LOCAL, "database_url", "")
+    if conn is not None and current_url == database_url and not getattr(conn, "closed", False):
+        return conn
+
+    _clear_thread_postgres_connection()
+    psycopg, dict_row, _ = _load_psycopg()
+    conn = psycopg.connect(database_url, row_factory=dict_row)
+    _POSTGRES_LOCAL.connection = conn
+    _POSTGRES_LOCAL.database_url = database_url
+    return conn
+
+
 @contextmanager
 def postgres_connection() -> Iterator[Any]:
-    psycopg, dict_row, _ = _load_psycopg()
-    with psycopg.connect(_database_url(), row_factory=dict_row) as conn:
+    conn = _thread_postgres_connection()
+    try:
         yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _clear_thread_postgres_connection()
+        raise
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -170,114 +209,124 @@ def _campaign_defaults(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def ensure_postgres_schema() -> None:
-    with postgres_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            create table if not exists app_meta (
-                key text primary key,
-                value_json jsonb not null default '{}'::jsonb,
-                updated_at timestamptz not null default now()
+    global _POSTGRES_SCHEMA_READY
+    if _POSTGRES_SCHEMA_READY:
+        return
+
+    with _POSTGRES_STATE_LOCK:
+        if _POSTGRES_SCHEMA_READY:
+            return
+        with postgres_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                create table if not exists app_meta (
+                    key text primary key,
+                    value_json jsonb not null default '{}'::jsonb,
+                    updated_at timestamptz not null default now()
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            create table if not exists campaigns (
-                id text primary key,
-                label text not null default '',
-                keyword text not null default '',
-                location text not null default '',
-                id_prefix text not null default '',
-                rank_keyword_template text not null default '{keyword} {plz}',
-                price_default text not null default '',
-                price_monthly text not null default '',
-                turnaround_days integer not null default 14,
-                sender_name text not null default '',
-                sender_company text not null default '',
-                sender_website text not null default '',
-                sender_phone text not null default '',
-                sender_email text not null default '',
-                offer_summary text not null default '',
-                example_intro text not null default '',
-                service_singular text not null default '',
-                service_plural text not null default '',
-                config_version integer not null default 1,
-                draft_config_version integer not null default 1,
-                research_config_version integer not null default 1,
-                last_scraped_at text not null default '',
-                last_migrated_at text not null default '',
-                last_enriched_at text not null default '',
-                last_researched_at text not null default '',
-                last_analyzed_at text not null default '',
-                csv_path text not null default '',
-                hooks_library_json jsonb not null default '{}'::jsonb,
-                template_overrides_json jsonb not null default '{}'::jsonb,
-                created_at timestamptz not null default now(),
-                updated_at timestamptz not null default now()
+            cur.execute(
+                """
+                create table if not exists campaigns (
+                    id text primary key,
+                    label text not null default '',
+                    keyword text not null default '',
+                    location text not null default '',
+                    id_prefix text not null default '',
+                    rank_keyword_template text not null default '{keyword} {plz}',
+                    price_default text not null default '',
+                    price_monthly text not null default '',
+                    turnaround_days integer not null default 14,
+                    sender_name text not null default '',
+                    sender_company text not null default '',
+                    sender_website text not null default '',
+                    sender_phone text not null default '',
+                    sender_email text not null default '',
+                    offer_summary text not null default '',
+                    example_intro text not null default '',
+                    service_singular text not null default '',
+                    service_plural text not null default '',
+                    config_version integer not null default 1,
+                    draft_config_version integer not null default 1,
+                    research_config_version integer not null default 1,
+                    last_scraped_at text not null default '',
+                    last_migrated_at text not null default '',
+                    last_enriched_at text not null default '',
+                    last_researched_at text not null default '',
+                    last_analyzed_at text not null default '',
+                    csv_path text not null default '',
+                    hooks_library_json jsonb not null default '{}'::jsonb,
+                    template_overrides_json jsonb not null default '{}'::jsonb,
+                    created_at timestamptz not null default now(),
+                    updated_at timestamptz not null default now()
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            create table if not exists leads (
-                campaign_id text not null references campaigns(id) on delete cascade,
-                lead_id text not null,
-                payload jsonb not null default '{}'::jsonb,
-                status text not null default 'new',
-                priority integer not null default 5,
-                next_action_date date,
-                scheduled_send_at timestamptz,
-                scheduled_send_channel text not null default '',
-                scheduled_send_status text not null default '',
-                scheduled_send_error text not null default '',
-                scheduled_send_attempts integer not null default 0,
-                approved_at timestamptz,
-                sent_at timestamptz,
-                smtp_message_id text not null default '',
-                created_at timestamptz not null default now(),
-                updated_at timestamptz not null default now(),
-                primary key (campaign_id, lead_id)
+            cur.execute(
+                """
+                create table if not exists leads (
+                    campaign_id text not null references campaigns(id) on delete cascade,
+                    lead_id text not null,
+                    payload jsonb not null default '{}'::jsonb,
+                    status text not null default 'new',
+                    priority integer not null default 5,
+                    next_action_date date,
+                    scheduled_send_at timestamptz,
+                    scheduled_send_channel text not null default '',
+                    scheduled_send_status text not null default '',
+                    scheduled_send_error text not null default '',
+                    scheduled_send_attempts integer not null default 0,
+                    approved_at timestamptz,
+                    sent_at timestamptz,
+                    smtp_message_id text not null default '',
+                    created_at timestamptz not null default now(),
+                    updated_at timestamptz not null default now(),
+                    primary key (campaign_id, lead_id)
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            create table if not exists contact_events (
-                id bigserial primary key,
-                campaign_id text not null references campaigns(id) on delete cascade,
-                lead_id text not null,
-                occurred_at timestamptz not null default now(),
-                channel text not null default '',
-                outcome text not null default '',
-                notes text not null default ''
+            cur.execute(
+                """
+                create table if not exists contact_events (
+                    id bigserial primary key,
+                    campaign_id text not null references campaigns(id) on delete cascade,
+                    lead_id text not null,
+                    occurred_at timestamptz not null default now(),
+                    channel text not null default '',
+                    outcome text not null default '',
+                    notes text not null default ''
+                )
+                """
             )
-            """
-        )
-        cur.execute(
-            """
-            create table if not exists scheduled_sends (
-                campaign_id text not null references campaigns(id) on delete cascade,
-                lead_id text not null,
-                channel text not null default 'email',
-                scheduled_at timestamptz not null,
-                status text not null default 'queued',
-                last_error text not null default '',
-                attempts integer not null default 0,
-                approved_at timestamptz,
-                sent_at timestamptz,
-                smtp_message_id text not null default '',
-                created_at timestamptz not null default now(),
-                updated_at timestamptz not null default now(),
-                primary key (campaign_id, lead_id, channel)
+            cur.execute(
+                """
+                create table if not exists scheduled_sends (
+                    campaign_id text not null references campaigns(id) on delete cascade,
+                    lead_id text not null,
+                    channel text not null default 'email',
+                    scheduled_at timestamptz not null,
+                    status text not null default 'queued',
+                    last_error text not null default '',
+                    attempts integer not null default 0,
+                    approved_at timestamptz,
+                    sent_at timestamptz,
+                    smtp_message_id text not null default '',
+                    created_at timestamptz not null default now(),
+                    updated_at timestamptz not null default now(),
+                    primary key (campaign_id, lead_id, channel)
+                )
+                """
             )
-            """
-        )
-        cur.execute("create index if not exists idx_leads_campaign_status on leads (campaign_id, status)")
-        cur.execute("create index if not exists idx_leads_campaign_priority on leads (campaign_id, priority)")
-        cur.execute("create index if not exists idx_leads_campaign_next_action_date on leads (campaign_id, next_action_date)")
-        cur.execute("create index if not exists idx_leads_scheduled_status_at on leads (scheduled_send_status, scheduled_send_at)")
-        cur.execute("create index if not exists idx_scheduled_sends_status_at on scheduled_sends (status, scheduled_at)")
-        cur.execute("create index if not exists idx_contact_events_campaign_lead on contact_events (campaign_id, lead_id, occurred_at desc)")
+            cur.execute("create index if not exists idx_leads_campaign_status on leads (campaign_id, status)")
+            cur.execute("create index if not exists idx_leads_campaign_priority on leads (campaign_id, priority)")
+            cur.execute("create index if not exists idx_leads_campaign_next_action_date on leads (campaign_id, next_action_date)")
+            cur.execute("create index if not exists idx_leads_scheduled_status_at on leads (scheduled_send_status, scheduled_send_at)")
+            cur.execute("create index if not exists idx_scheduled_sends_status_at on scheduled_sends (status, scheduled_at)")
+            cur.execute("create index if not exists idx_contact_events_campaign_lead on contact_events (campaign_id, lead_id, occurred_at desc)")
+            _POSTGRES_SCHEMA_READY = True
+
+
 def postgres_campaign_count() -> int:
     ensure_postgres_schema()
     with postgres_connection() as conn, conn.cursor() as cur:
@@ -291,9 +340,13 @@ def ensure_postgres_ready() -> None:
     ensure_postgres_schema()
     if _POSTGRES_BOOTSTRAP_CHECKED:
         return
-    _POSTGRES_BOOTSTRAP_CHECKED = True
-    if postgres_campaign_count() == 0:
-        bootstrap_postgres_from_files(force=False)
+
+    with _POSTGRES_STATE_LOCK:
+        if _POSTGRES_BOOTSTRAP_CHECKED:
+            return
+        if postgres_campaign_count() == 0:
+            bootstrap_postgres_from_files(force=False)
+        _POSTGRES_BOOTSTRAP_CHECKED = True
 
 
 def postgres_load_registry() -> dict[str, Any]:
@@ -357,6 +410,26 @@ def _campaign_row_to_config(row: dict[str, Any]) -> dict[str, Any]:
         }
     )
     return _campaign_defaults(config)
+
+
+def postgres_get_active_campaign() -> dict[str, Any]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select c.*
+            from campaigns as c
+            where c.id = coalesce(
+                (select value_json ->> 'value' from app_meta where key = 'active_campaign_id'),
+                (select id from campaigns order by id limit 1)
+            )
+            limit 1
+            """
+        )
+        row = cur.fetchone()
+        if not row:
+            raise KeyError("No campaigns available. Run `python crm.py bootstrap-postgres` first.")
+        return _campaign_row_to_config(row)
 
 
 def postgres_list_campaigns() -> list[dict[str, Any]]:
@@ -464,6 +537,36 @@ def postgres_load_leads(campaign_id: str) -> list[dict[str, Any]]:
         leads.append(payload)
     leads.sort(key=_lead_sort_key)
     return leads
+
+
+def postgres_load_lead_metrics(campaign_id: str) -> dict[str, int]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select
+                count(*) as total_leads,
+                count(*) filter (where status = 'draft_ready') as draft_ready,
+                count(*) filter (
+                    where status = 'approved'
+                      and coalesce(payload ->> 'Drafts_Approved', '0') = '1'
+                      and coalesce(payload ->> 'Draft_Stale', '0') <> '1'
+                ) as approved_fresh,
+                count(*) filter (where coalesce(payload ->> 'Draft_Stale', '0') = '1') as draft_stale,
+                count(*) filter (where coalesce(payload ->> 'Research_Stale', '0') = '1') as research_stale
+            from leads
+            where campaign_id = %s
+            """,
+            (campaign_id,),
+        )
+        row = cur.fetchone() or {}
+    return {
+        "total_leads": int(row.get("total_leads") or 0),
+        "draft_ready": int(row.get("draft_ready") or 0),
+        "approved_fresh": int(row.get("approved_fresh") or 0),
+        "draft_stale": int(row.get("draft_stale") or 0),
+        "research_stale": int(row.get("research_stale") or 0),
+    }
 
 
 def postgres_save_leads(campaign_id: str, leads: list[dict[str, Any]]) -> None:
