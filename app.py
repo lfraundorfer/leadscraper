@@ -4,6 +4,7 @@ app.py - Streamlit CRM frontend with saved multi-niche campaigns.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import urllib.parse
@@ -23,7 +24,9 @@ from campaign_service import (
     get_active_campaign,
     get_campaign,
     get_flyer_path,
+    get_hooks_library_path,
     get_portfolio_dir,
+    get_template_overrides_path,
     list_campaigns,
     mark_campaign_stage_run,
     resolve_csv_path,
@@ -41,7 +44,17 @@ from crm_store import (
     preferred_channel,
     save_leads,
 )
-from crm_templates import compose_email_draft, get_subject_options, parse_email_draft
+from crm_templates import (
+    compose_email_draft,
+    get_effective_hooks_library,
+    get_effective_special_subject_option,
+    get_effective_subject_templates,
+    get_effective_templates,
+    get_subject_options,
+    get_template_override_payload,
+    invalidate_campaign_copy_cache,
+    parse_email_draft,
+)
 from crm_tracker import check_and_archive_stale, log_contact, parse_contact_log
 
 
@@ -113,6 +126,48 @@ def _next_review_selection(queue_ids: list[str], current_id: str) -> str:
 
 def _channel_label(channel: str) -> str:
     return CHANNEL_LABELS.get(channel, channel)
+
+
+def _apply_subject_suggestion(key_prefix: str) -> None:
+    suggestion = (st.session_state.get(f"{key_prefix}_subject_pick") or "").strip()
+    if suggestion:
+        st.session_state[f"{key_prefix}_subject_text"] = suggestion
+
+
+def _render_subject_editor(campaign: dict, lead: dict, *, key_prefix: str, current_subject: str) -> str:
+    subject_options = get_subject_options(lead, current_subject=current_subject, campaign=campaign)
+    text_key = f"{key_prefix}_subject_text"
+    pick_key = f"{key_prefix}_subject_pick"
+
+    if text_key not in st.session_state:
+        st.session_state[text_key] = current_subject or (subject_options[0] if subject_options else "")
+    if pick_key not in st.session_state or st.session_state[pick_key] not in subject_options:
+        st.session_state[pick_key] = current_subject if current_subject in subject_options else (subject_options[0] if subject_options else "")
+
+    subject = st.text_input(
+        "Email subject",
+        key=text_key,
+        placeholder="Type any custom subject here",
+        help="You can type a completely custom subject or pull in one of the quick suggestions below.",
+    )
+    if subject_options:
+        st.selectbox(
+            "Quick subject suggestions",
+            options=subject_options,
+            key=pick_key,
+            on_change=_apply_subject_suggestion,
+            args=(key_prefix,),
+            help="Choosing one copies it into the subject field above, which you can still edit afterwards.",
+        )
+    return subject.strip()
+
+
+def _write_json_payload(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if payload:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif path.exists():
+        path.unlink()
 
 
 def _extract_urls(*texts: str) -> list[str]:
@@ -289,7 +344,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
         return
 
     current_subject, current_body = parse_email_draft(lead.get("Email_Draft", ""))
-    subject_options = get_subject_options(lead, current_subject=current_subject, campaign=campaign)
     planned = planned_channel(lead)
 
     selected_channel = st.selectbox(
@@ -299,12 +353,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
         format_func=_channel_label,
         key=f"{key_prefix}_planned_channel",
     )
-    selected_subject = st.selectbox(
-        "Email subject",
-        options=subject_options,
-        index=subject_options.index(current_subject) if current_subject in subject_options else 0,
-        key=f"{key_prefix}_subject",
-    )
+    selected_subject = _render_subject_editor(campaign, lead, key_prefix=key_prefix, current_subject=current_subject)
     email_body = st.text_area("Email body", value=current_body, height=240, key=f"{key_prefix}_email_body")
     wa_draft = st.text_area("WhatsApp draft", value=lead.get("WhatsApp_Draft", ""), height=120, key=f"{key_prefix}_wa")
     phone_script = st.text_area("Phone script", value=lead.get("Phone_Script", ""), height=220, key=f"{key_prefix}_phone")
@@ -442,6 +491,32 @@ def _persist_channel_choice(campaign: dict, lead_id: str, channel: str) -> None:
             row["Next_Action_Type"] = channel
         break
     save_leads(all_leads, campaign=campaign)
+
+
+def _is_bulk_email_ready(lead: dict) -> bool:
+    return (
+        planned_channel(lead) == "email"
+        and (lead.get("Email") or "").strip() != ""
+        and (lead.get("Email_Draft") or "").strip() != ""
+        and lead.get("Draft_Stale") != "1"
+    )
+
+
+def _init_outreach_state(campaign: dict) -> dict[str, str]:
+    key_map = {
+        "selection": _campaign_state_key(campaign, "outreach_bulk_selection"),
+        "note": _campaign_state_key(campaign, "outreach_bulk_note"),
+        "notice": _campaign_state_key(campaign, "outreach_bulk_notice"),
+    }
+    defaults = {
+        "selection": [],
+        "note": "",
+        "notice": None,
+    }
+    for name, key in key_map.items():
+        if key not in st.session_state:
+            st.session_state[key] = _copy_state_default(defaults[name])
+    return key_map
 
 
 def _init_all_leads_state(campaign: dict) -> dict[str, str]:
@@ -598,6 +673,141 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
     prog.progress(1.0)
     status_txt.caption(f"Finished {done} draft(s)")
     return done
+
+
+def _persist_campaign_copy_changes(
+    campaign: dict,
+    *,
+    hooks_payload: dict | None = None,
+    template_payload: dict | None = None,
+) -> None:
+    if hooks_payload is not None:
+        _write_json_payload(Path(get_hooks_library_path(campaign)), hooks_payload)
+    if template_payload is not None:
+        _write_json_payload(Path(get_template_overrides_path(campaign)), template_payload)
+    invalidate_campaign_copy_cache(campaign)
+    bump_campaign_version(campaign["id"])
+
+
+def _render_campaign_template_editor(campaign: dict) -> None:
+    st.divider()
+    st.subheader("Template Editor")
+    st.caption("Edit campaign-specific draft copy here. Saving changes marks existing drafts as stale so you can regenerate them with the new wording.")
+    st.caption(f"Hooks file: {get_hooks_library_path(campaign)}")
+    st.caption(f"Template overrides: {get_template_overrides_path(campaign)}")
+
+    placeholder_help = (
+        "Available placeholders: {{hook}}, {{salutation}}, {{contact}}, {{price}}, {{sender_name}}, "
+        "{{sender_company}}, {{sender_website}}, {{sender_phone}}, {{sender_email}}, {{rank_keyword}}, "
+        "{{rank_keyword_district}}, {{portfolio_block}}, {{portfolio_first}}, {{competitors_line}}, "
+        "{{competitors_short}}, {{subject_intro}}, {{subject_name}}."
+    )
+
+    subjects_tab, hooks_tab, templates_tab = st.tabs(["Subjects", "Hooks", "Templates"])
+
+    with subjects_tab:
+        effective_subjects = get_effective_subject_templates(campaign=campaign)
+        effective_special_subject = get_effective_special_subject_option(campaign=campaign)
+        with st.form(f"subject_editor_{campaign['id']}"):
+            special_subject = st.text_input(
+                "Pinned special subject",
+                value=effective_special_subject,
+                help="This stays at the top of the subject suggestion list. Leave it blank if you do not want a pinned option.",
+            )
+            subject_lines = st.text_area(
+                "Subject suggestions (one per line)",
+                value="\n".join(effective_subjects),
+                height=260,
+            )
+            st.caption("These are the shared subject suggestions shown in the draft editor.")
+            c1, c2 = st.columns(2)
+            save_subjects = c1.form_submit_button("Save Subject Settings", type="primary", width="stretch")
+            reset_subjects = c2.form_submit_button("Reset Subject Settings", width="stretch")
+
+        if save_subjects:
+            payload = get_template_override_payload(campaign=campaign)
+            payload["special_subject_option"] = special_subject.strip()
+            payload["subject_templates"] = [line.strip() for line in subject_lines.splitlines() if line.strip()]
+            _persist_campaign_copy_changes(campaign, template_payload=payload)
+            reload()
+
+        if reset_subjects:
+            payload = get_template_override_payload(campaign=campaign)
+            payload.pop("special_subject_option", None)
+            payload.pop("subject_templates", None)
+            _persist_campaign_copy_changes(campaign, template_payload=payload)
+            reload()
+
+    with hooks_tab:
+        effective_hooks = get_effective_hooks_library(campaign=campaign)
+        with st.form(f"hooks_editor_{campaign['id']}"):
+            st.caption("One hook per line. Hooks can also use the same placeholders as templates.")
+            st.caption(placeholder_help)
+            hook_inputs: dict[str, str] = {}
+            for category, items in effective_hooks.items():
+                with st.expander(category.replace("_", " ").title(), expanded=False):
+                    hook_inputs[category] = st.text_area(
+                        f"{category} hooks",
+                        value="\n".join(items),
+                        height=180,
+                    )
+            c1, c2 = st.columns(2)
+            save_hooks = c1.form_submit_button("Save Hook Library", type="primary", width="stretch")
+            reset_hooks = c2.form_submit_button("Reset All Hooks", width="stretch")
+
+        if save_hooks:
+            hooks_payload = {
+                category: [line.strip() for line in text.splitlines() if line.strip()]
+                for category, text in hook_inputs.items()
+                if [line.strip() for line in text.splitlines() if line.strip()]
+            }
+            _persist_campaign_copy_changes(campaign, hooks_payload=hooks_payload)
+            reload()
+
+        if reset_hooks:
+            _persist_campaign_copy_changes(campaign, hooks_payload={})
+            reload()
+
+    with templates_tab:
+        effective_templates = get_effective_templates(campaign=campaign)
+        template_keys = [key for key in effective_templates if key != "default"]
+        selected_template_key = st.selectbox(
+            "Template category",
+            options=template_keys,
+            format_func=lambda key: key.replace("_", " ").title(),
+            key=f"template_editor_pick_{campaign['id']}",
+        )
+        template = effective_templates[selected_template_key]
+        with st.form(f"template_editor_form_{campaign['id']}_{selected_template_key}"):
+            st.caption("Edit the full template text used for future draft generation.")
+            st.caption(placeholder_help)
+            email_template = st.text_area("Email template", value=template.get("email", ""), height=420)
+            whatsapp_template = st.text_area("WhatsApp template", value=template.get("whatsapp", ""), height=160)
+            phone_template = st.text_area("Phone script template", value=template.get("phone_script", ""), height=320)
+            c1, c2 = st.columns(2)
+            save_template = c1.form_submit_button("Save Template", type="primary", width="stretch")
+            reset_template = c2.form_submit_button("Reset This Template", width="stretch")
+
+        if save_template:
+            payload = get_template_override_payload(campaign=campaign)
+            templates_payload = payload.setdefault("templates", {})
+            templates_payload[selected_template_key] = {
+                "email": email_template,
+                "whatsapp": whatsapp_template,
+                "phone_script": phone_template,
+            }
+            _persist_campaign_copy_changes(campaign, template_payload=payload)
+            reload()
+
+        if reset_template:
+            payload = get_template_override_payload(campaign=campaign)
+            templates_payload = payload.get("templates")
+            if isinstance(templates_payload, dict):
+                templates_payload.pop(selected_template_key, None)
+                if not templates_payload:
+                    payload.pop("templates", None)
+            _persist_campaign_copy_changes(campaign, template_payload=payload)
+            reload()
 
 
 def _active_campaign_switch() -> dict:
@@ -790,7 +1000,6 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
             return
 
         current_subject, current_body = parse_email_draft(selected.get("Email_Draft", ""))
-        subject_options = get_subject_options(selected, current_subject=current_subject, campaign=campaign)
         selected_channel = st.radio(
             "Default starting channel",
             options=channel_options,
@@ -799,21 +1008,16 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
             help="This is just the default first touch. You can change it later in Outreach or All Leads.",
             horizontal=True,
         )
-
-        with st.form(key=f"approve_{lid}"):
-            selected_subject = st.selectbox(
-                "Email subject",
-                options=subject_options,
-                index=subject_options.index(current_subject) if current_subject in subject_options else 0,
-            )
-            email_body = st.text_area("Email body", value=current_body, height=260)
-            wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120)
-            phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240)
-            _render_draft_links(email_body, wa_draft, phone_script)
-            c1, c2, c3 = st.columns(3)
-            approve = c1.form_submit_button("Approve", type="primary", width="stretch")
-            skip = c2.form_submit_button("Skip", width="stretch")
-            blacklist = c3.form_submit_button("Blacklist", width="stretch")
+        review_key_prefix = f"review_{lid}"
+        selected_subject = _render_subject_editor(campaign, selected, key_prefix=review_key_prefix, current_subject=current_subject)
+        email_body = st.text_area("Email body", value=current_body, height=260, key=f"{review_key_prefix}_email_body")
+        wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120, key=f"{review_key_prefix}_wa")
+        phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240, key=f"{review_key_prefix}_phone")
+        _render_draft_links(email_body, wa_draft, phone_script)
+        c1, c2, c3 = st.columns(3)
+        approve = c1.button("Approve", type="primary", width="stretch", key=f"{review_key_prefix}_approve")
+        skip = c2.button("Skip", width="stretch", key=f"{review_key_prefix}_skip")
+        blacklist = c3.button("Blacklist", width="stretch", key=f"{review_key_prefix}_blacklist")
 
         if approve:
             all_leads = load_leads(campaign=campaign)
@@ -872,6 +1076,95 @@ def _render_outreach(campaign: dict, leads: list[dict]) -> None:
     if stale_count:
         st.warning(f"{stale_count} approved lead(s) have stale drafts. You can still edit or send them here.")
     st.caption("Outreach is for approved leads only. Use Re-contact for leads you already touched before.")
+
+    state_keys = _init_outreach_state(campaign)
+    notice = st.session_state.get(state_keys["notice"])
+    if notice:
+        sent_ids = notice.get("sent_ids", [])
+        failed_ids = notice.get("failed_ids", [])
+        if sent_ids and not failed_ids:
+            st.success(f"Bulk send complete: sent {len(sent_ids)} email(s).")
+        elif sent_ids:
+            st.warning(
+                f"Bulk send partially completed: sent {len(sent_ids)} email(s), "
+                f"failed {len(failed_ids)} ({', '.join(failed_ids)})."
+            )
+        else:
+            st.error(f"Bulk send failed for {len(failed_ids)} email(s): {', '.join(failed_ids)}")
+        st.session_state[state_keys["notice"]] = None
+
+    bulk_ready = [lead for lead in approved if _is_bulk_email_ready(lead)]
+    bulk_labels = {
+        lead["ID"]: (
+            f"{lead['ID']} - {lead.get('Unternehmen', '')[:40]} | "
+            f"{PRIORITY_COLOR.get(int(lead.get('Priority') or 5) if str(lead.get('Priority') or '').isdigit() else 5, '⚫')} "
+            f"P{lead.get('Priority') or '5'}"
+        )
+        for lead in bulk_ready
+        if lead.get("ID")
+    }
+    bulk_ids = list(bulk_labels)
+    selected_ids = [
+        lead_id
+        for lead_id in st.session_state.get(state_keys["selection"], [])
+        if lead_id in bulk_labels
+    ]
+    if selected_ids != st.session_state.get(state_keys["selection"], []):
+        st.session_state[state_keys["selection"]] = selected_ids
+
+    st.divider()
+    st.subheader("Bulk Email")
+    st.caption(
+        f"{len(bulk_ready)} approved lead(s) are ready for bulk email. "
+        f"{len(approved) - len(bulk_ready)} other approved lead(s) stay manual or need fixes first."
+    )
+    st.caption("Bulk send respects the planned channel, so only email-ready leads appear here.")
+    if not bulk_ids:
+        st.info("No approved leads are currently ready for bulk email. Individual outreach actions below still work.")
+
+    bulk_controls = st.columns(2)
+    if bulk_controls[0].button(f"Select All ({len(bulk_ids)})", key=_campaign_state_key(campaign, "outreach_select_all")):
+        st.session_state[state_keys["selection"]] = bulk_ids
+        reload()
+    if bulk_controls[1].button("Clear Selection", key=_campaign_state_key(campaign, "outreach_clear_selection")):
+        st.session_state[state_keys["selection"]] = []
+        reload()
+
+    st.multiselect(
+        "Select leads to send",
+        options=bulk_ids,
+        format_func=lambda lead_id: bulk_labels.get(lead_id, lead_id),
+        key=state_keys["selection"],
+        placeholder="Choose approved email leads",
+    )
+    st.text_input(
+        "Bulk action note",
+        key=state_keys["note"],
+        placeholder="Optional note added to every contact log entry",
+    )
+
+    send_selected = st.button(
+        f"Send Selected ({len(st.session_state.get(state_keys['selection'], []))})",
+        type="primary",
+        disabled=not st.session_state.get(state_keys["selection"]),
+        key=_campaign_state_key(campaign, "outreach_send_selected"),
+    )
+    if send_selected:
+        selected_ids = list(st.session_state.get(state_keys["selection"], []))
+        note = (st.session_state.get(state_keys["note"]) or "").strip()
+        sent_ids: list[str] = []
+        failed_ids: list[str] = []
+        with st.spinner(f"Sending {len(selected_ids)} email(s)..."):
+            for lead_id in selected_ids:
+                if send_email(lead_id, notes=note):
+                    sent_ids.append(lead_id)
+                else:
+                    failed_ids.append(lead_id)
+        st.session_state[state_keys["notice"]] = {"sent_ids": sent_ids, "failed_ids": failed_ids}
+        st.session_state[state_keys["selection"]] = failed_ids
+        if not failed_ids:
+            st.session_state[state_keys["note"]] = ""
+        reload()
 
     for lead in approved:
         lid = lead.get("ID", "?")
@@ -1248,6 +1541,8 @@ def _render_campaigns_page(campaign: dict, leads: list[dict]) -> None:
             },
         )
         reload()
+
+    _render_campaign_template_editor(campaign)
 
     st.divider()
     asset_left, asset_right = st.columns(2)

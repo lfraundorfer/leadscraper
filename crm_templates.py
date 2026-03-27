@@ -31,6 +31,7 @@ Available slots:
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -38,7 +39,9 @@ from pathlib import Path
 import re
 
 _LEGACY_HOOKS_LIBRARY_PATH = Path(__file__).parent / "hooks_library.json"
+_LEGACY_TEMPLATE_OVERRIDES_PATH = Path(__file__).parent / "template_overrides.json"
 _hooks_override_cache: dict[str, dict[str, list[str]]] = {}
+_template_override_cache: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Portfolio & sender config (read once at import time)
@@ -84,6 +87,17 @@ def _resolve_hooks_library_path(campaign: dict | None = None) -> Path:
     return _LEGACY_HOOKS_LIBRARY_PATH
 
 
+def _resolve_template_overrides_path(campaign: dict | None = None) -> Path:
+    active_campaign = _resolve_campaign(campaign)
+    if active_campaign is not None:
+        try:
+            from campaign_service import get_template_overrides_path
+            return Path(get_template_overrides_path(active_campaign))
+        except Exception:
+            pass
+    return _LEGACY_TEMPLATE_OVERRIDES_PATH
+
+
 def _load_hooks_override(campaign: dict | None = None) -> dict[str, list[str]]:
     path = _resolve_hooks_library_path(campaign)
     cache_key = str(path)
@@ -96,6 +110,61 @@ def _load_hooks_override(campaign: dict | None = None) -> dict[str, list[str]]:
         else:
             _hooks_override_cache[cache_key] = {}
     return _hooks_override_cache[cache_key]
+
+
+def _load_template_overrides(campaign: dict | None = None) -> dict:
+    path = _resolve_template_overrides_path(campaign)
+    cache_key = str(path)
+    if cache_key not in _template_override_cache:
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                _template_override_cache[cache_key] = payload if isinstance(payload, dict) else {}
+            except Exception:
+                _template_override_cache[cache_key] = {}
+        else:
+            _template_override_cache[cache_key] = {}
+    return _template_override_cache[cache_key]
+
+
+def invalidate_campaign_copy_cache(campaign: dict | None = None) -> None:
+    _hooks_override_cache.pop(str(_resolve_hooks_library_path(campaign)), None)
+    _template_override_cache.pop(str(_resolve_template_overrides_path(campaign)), None)
+
+
+def _clean_string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def get_effective_hooks_library(campaign: dict | None = None) -> dict[str, list[str]]:
+    hooks = {key: list(values) for key, values in HOOKS.items()}
+    override = _load_hooks_override(campaign=campaign)
+    for key, values in override.items():
+        cleaned = _clean_string_list(values)
+        if cleaned:
+            hooks[key] = cleaned
+    return hooks
+
+
+def get_template_override_payload(campaign: dict | None = None) -> dict:
+    return deepcopy(_load_template_overrides(campaign=campaign))
+
+
+def get_effective_subject_templates(campaign: dict | None = None) -> list[str]:
+    override = _load_template_overrides(campaign=campaign)
+    if "subject_templates" in override:
+        return _clean_string_list(override.get("subject_templates"))
+    return list(SUBJECT_TEMPLATES)
+
+
+def get_effective_special_subject_option(campaign: dict | None = None) -> str:
+    override = _load_template_overrides(campaign=campaign)
+    if "special_subject_option" in override:
+        value = override.get("special_subject_option")
+        return str(value).strip() if value is not None else ""
+    return SPECIAL_SUBJECT_OPTION
 
 
 def _campaign_value(campaign: dict | None, key: str, env_key: str = "", default: str = "") -> str:
@@ -245,6 +314,8 @@ def get_subject_options(
 ) -> list[str]:
     """Render the 20 shared subject lines for a lead and optionally preserve a custom current subject."""
     slots = build_slots(lead, hook, urgency, campaign=campaign)
+    subject_templates = get_effective_subject_templates(campaign=campaign)
+    special_subject_option = get_effective_special_subject_option(campaign=campaign)
     seen: set[str] = set()
     options: list[str] = []
 
@@ -254,11 +325,11 @@ def get_subject_options(
             seen.add(current)
             options.append(current)
 
-    if SPECIAL_SUBJECT_OPTION not in seen:
-        seen.add(SPECIAL_SUBJECT_OPTION)
-        options.append(SPECIAL_SUBJECT_OPTION)
+    if special_subject_option and special_subject_option not in seen:
+        seen.add(special_subject_option)
+        options.append(special_subject_option)
 
-    for template in SUBJECT_TEMPLATES:
+    for template in subject_templates:
         rendered = fill_template(template, slots).strip()
         if rendered and rendered not in seen:
             seen.add(rendered)
@@ -303,8 +374,10 @@ def _hook_repetition_score(candidate: str, template_key: str, lead: dict, campai
     """
     slots = build_slots(lead, hook="", urgency="", campaign=campaign)
     slots["subject"] = get_subject(lead, campaign=campaign)
+    candidate_filled = fill_template(candidate, slots)
 
-    tmpl = TEMPLATES.get(template_key, TEMPLATES["default"])
+    templates = get_effective_templates(campaign=campaign)
+    tmpl = templates.get(template_key, templates["default"])
     context = " ".join(
         [
             slots["subject"],
@@ -314,7 +387,7 @@ def _hook_repetition_score(candidate: str, template_key: str, lead: dict, campai
         ]
     )
 
-    cand_norm = _normalize_for_repetition(candidate)
+    cand_norm = _normalize_for_repetition(candidate_filled)
     ctx_norm = _normalize_for_repetition(context)
     if not cand_norm:
         return 999
@@ -880,8 +953,26 @@ CTA: "Auf welche Adresse schicke ich Ihnen die Beispiele?" """,
     },
 }
 
+DEFAULT_TEMPLATE_KEY = "kein_seo"
+
 # Fallback
-TEMPLATES["default"] = TEMPLATES["kein_seo"]
+TEMPLATES["default"] = TEMPLATES[DEFAULT_TEMPLATE_KEY]
+
+
+def get_effective_templates(campaign: dict | None = None) -> dict[str, dict[str, str]]:
+    templates = {key: dict(value) for key, value in TEMPLATES.items() if key != "default"}
+    override = _load_template_overrides(campaign=campaign)
+    override_templates = override.get("templates")
+    if isinstance(override_templates, dict):
+        for template_key, channels in override_templates.items():
+            if template_key not in templates or not isinstance(channels, dict):
+                continue
+            for channel in ("email", "whatsapp", "phone_script"):
+                value = channels.get(channel)
+                if isinstance(value, str):
+                    templates[template_key][channel] = value
+    templates["default"] = dict(templates.get(DEFAULT_TEMPLATE_KEY, {}))
+    return templates
 
 
 # ---------------------------------------------------------------------------
@@ -1146,10 +1237,13 @@ def render_drafts(
     pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
 
     key = template_key or pick_template_key(pain_categories, lead)
-    tmpl = TEMPLATES.get(key, TEMPLATES["default"])
+    templates = get_effective_templates(campaign=campaign)
+    tmpl = templates.get(key, templates["default"])
     if not (hook or "").strip():
         hook = choose_hook(key, lead, campaign=campaign)
     slots = build_slots(lead, hook, urgency, campaign=campaign)
+    if slots["hook"]:
+        slots["hook"] = fill_template(slots["hook"], slots)
 
     # Inject one shared subject line from the universal subject library
     slots["subject"] = get_subject(lead, hook=hook, urgency=urgency, campaign=campaign)
@@ -1183,7 +1277,8 @@ def rerender_saved_draft(lead: dict, campaign: dict | None = None) -> dict:
     pain_categories_raw = lead.get("Pain_Categories", "") or ""
     pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
     template_key = (lead.get("Template_Used") or "").strip()
-    if template_key not in TEMPLATES:
+    effective_templates = get_effective_templates(campaign=campaign)
+    if template_key not in effective_templates:
         template_key = pick_template_key(pain_categories, lead)
 
     hook = choose_hook(template_key, lead, campaign=campaign)

@@ -90,6 +90,7 @@ def _campaign_layout(campaign_id: str) -> dict[str, Path]:
         "flyer_path": campaign_dir / "assets" / "flyer.png",
         "portfolio_dir": campaign_dir / "portfolio",
         "hooks_library_path": campaign_dir / "hooks_library.json",
+        "template_overrides_path": campaign_dir / "template_overrides.json",
         "archive_dir": campaign_dir / "archive",
     }
 
@@ -432,3 +433,8 @@ def get_flyer_path(campaign: dict[str, Any]) -> str:
 def get_hooks_library_path(campaign: dict[str, Any]) -> str:
     default_path = _campaign_layout_for_config(campaign)["hooks_library_path"]
     return str(resolve_path(campaign.get("hooks_library_path") or default_path))
+
+
+def get_template_overrides_path(campaign: dict[str, Any]) -> str:
+    default_path = _campaign_layout_for_config(campaign)["template_overrides_path"]
+    return str(resolve_path(campaign.get("template_overrides_path") or default_path))
