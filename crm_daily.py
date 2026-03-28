@@ -15,6 +15,22 @@ PRIORITY_LABELS = {1: "P1 🔴", 2: "P2 🟠", 3: "P3 🟡", 4: "P4 🟢", 5: "P
 CHANNEL_EMOJI = {"email": "📧", "phone": "📞", "whatsapp": "💬", "none": "⛔"}
 
 
+def _safe_int(value: str, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _scaled_bar(count: int, *, max_count: int, width: int = 40) -> str:
+    if count <= 0 or max_count <= 0:
+        return ""
+    if count >= max_count:
+        return "█" * width
+    filled = max(1, round((count / max_count) * width))
+    return "█" * filled
+
+
 def show_daily(limit: int = 10) -> None:
     """Show today's action list — leads that need attention today."""
     campaign = get_active_campaign()
@@ -47,7 +63,7 @@ def show_daily(limit: int = 10) -> None:
         actionable.append(lead)
 
     # Sort by priority (asc), then next_action_date (asc)
-    actionable.sort(key=lambda l: (int(l.get("Priority") or 5), l.get("Next_Action_Date") or ""))
+    actionable.sort(key=lambda l: (_safe_int(l.get("Priority"), 5), l.get("Next_Action_Date") or ""))
 
     print(f"\n=== TODAY'S ACTIONS ({today}) | {campaign.get('label', campaign['id'])} ===\n")
 
@@ -65,7 +81,7 @@ def show_daily(limit: int = 10) -> None:
         channel = lead.get("Next_Action_Type", "?")
         ch_emoji = CHANNEL_EMOJI.get(channel, "?")
         pri = lead.get("Priority", "?")
-        pri_label = PRIORITY_LABELS.get(int(pri) if str(pri).isdigit() else 5, f"P{pri}")
+        pri_label = PRIORITY_LABELS.get(_safe_int(pri, 5), f"P{pri}")
         score = lead.get("Website_Score", "")
         score_str = f"{score}/10" if score else "no web"
         rating = lead.get("Google_Rating", "")
@@ -106,13 +122,14 @@ def show_stats() -> None:
     for l in leads:
         s = l.get("Website_Score", "")
         cat = l.get("Website_Category", "")
+        score_value = _safe_int(s, -1)
         if cat == "none" or s == "0":
             score_buckets["No website"] += 1
-        elif not s:
+        elif not s or score_value < 0:
             score_buckets["Not analyzed"] += 1
-        elif int(s) <= 3:
+        elif score_value <= 3:
             score_buckets["1-3 (bad)"] += 1
-        elif int(s) <= 6:
+        elif score_value <= 6:
             score_buckets["4-6 (avg)"] += 1
         else:
             score_buckets["7-10 (good)"] += 1
@@ -121,9 +138,10 @@ def show_stats() -> None:
     print(f"Total leads: {len(leads)}\n")
 
     print("Pipeline:")
+    max_status_count = max(status_counts.values(), default=0)
     for status in ["new", "draft_ready", "approved", "contacted", "replied", "meeting_scheduled", "won", "lost", "no_contact", "blacklist"]:
         n = status_counts.get(status, 0)
-        bar = "█" * n
+        bar = _scaled_bar(n, max_count=max_status_count)
         print(f"  {status:<20} {n:>4}  {bar}")
 
     print("\nPriority:")

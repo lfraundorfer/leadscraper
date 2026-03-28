@@ -21,7 +21,15 @@ from openai import OpenAI
 
 from campaign_service import format_rank_keyword, get_active_campaign, mark_campaign_stage_run
 from herold_scraper import HeroldFetcher
-from crm_store import WIEN_BEZIRK, available_channels, get_bezirk, is_mobile, load_leads, save_leads
+from crm_store import (
+    WIEN_BEZIRK,
+    available_channels,
+    get_bezirk,
+    is_mobile,
+    load_leads,
+    progress_save_interval,
+    save_leads_batch,
+)
 from crm_research import (
     categorize_website, fetch_and_clean_html,
     ALL_DIRECTORY_DOMAINS, RATE_LIMIT_SEC
@@ -116,7 +124,7 @@ def select_channel_and_priority(lead: dict, analysis: dict) -> tuple[str, str, i
 
 
 # ---------------------------------------------------------------------------
-# Claude: Website analysis
+# GPT: Website analysis
 # ---------------------------------------------------------------------------
 
 WEBSITE_ANALYSIS_PROMPT = """\
@@ -210,7 +218,7 @@ CATEGORY_DESCRIPTIONS: dict[str, str] = {
 }
 
 HOOK_PROMPT = """\
-Du bist ein erfahrener Verkaufstexter in Wien.
+Du bist ein erfahrener Verkaufstexter in {location}.
 Schreibe einen personalisierten, knackigen Hook fuer einen lokalen Betrieb in der Branche "{service_plural}".
 Antworte AUSSCHLIESSLICH als JSON – kein Markdown, kein Text davor/danach:
 
@@ -265,6 +273,7 @@ def generate_hook(lead: dict, analysis: dict, client: OpenAI, campaign: dict) ->
         )
 
     prompt = HOOK_PROMPT.format(
+        location=campaign.get("location", "Oesterreich"),
         company=lead.get("Unternehmen", ""),
         service_plural=campaign.get("service_plural", campaign.get("keyword", "Branche")),
         score=analysis.get("score", "?"),
@@ -296,7 +305,7 @@ def generate_hook(lead: dict, analysis: dict, client: OpenAI, campaign: dict) ->
 
 
 # ---------------------------------------------------------------------------
-# Claude: Message generation (full, legacy mode)
+# GPT: Message generation (full, legacy mode)
 # ---------------------------------------------------------------------------
 
 MESSAGES_PROMPT = """\
@@ -363,10 +372,11 @@ CTA: [Terminvorschlag mit 2 konkreten Optionen]"""
 
 
 def generate_messages(lead: dict, analysis: dict, client: OpenAI, campaign: dict) -> dict:
-    """Call Claude to generate email, WhatsApp, and phone script. Returns dict."""
+    """Call GPT to generate email, WhatsApp, and phone script. Returns dict."""
     contact = lead.get("Kontaktname", "").strip() or "Sehr geehrte Damen und Herren"
     adresse = lead.get("Adresse", "")
     plz, bezirk = get_bezirk(adresse)
+    location = campaign.get("location", "").strip() or "Oesterreich"
 
     pain_points_raw = analysis.get("pain_points", [])
     pain_points_str = " | ".join(pain_points_raw) if pain_points_raw else "Keine spezifischen Mängel identifiziert"
@@ -385,13 +395,13 @@ def generate_messages(lead: dict, analysis: dict, client: OpenAI, campaign: dict
     prompt = MESSAGES_PROMPT.format(
         sender_name=sender_name,
         sender_company=sender_company,
-        location=campaign.get("location", "Wien"),
+        location=location,
         service_plural=campaign.get("service_plural", campaign.get("keyword", "Branche")),
         company=lead.get("Unternehmen", ""),
         contact=contact,
         address=adresse,
-        plz=plz or "Wien",
-        bezirk=bezirk or "Wien",
+        plz=plz or location,
+        bezirk=bezirk or location,
         website=lead.get("Website", "keine Website"),
         score=analysis.get("score", "?"),
         pain_points=pain_points_str,
@@ -444,7 +454,7 @@ def generate_messages(lead: dict, analysis: dict, client: OpenAI, campaign: dict
 def main(force: bool = False, single_id: str = "", no_review: bool = False, limit: int = 0, gpt_hooks: bool = False) -> None:
     """
     CLI entry for `python crm.py analyze`.
-    Fetches website HTML, analyzes with Claude, generates messages.
+    Fetches website HTML, analyzes with GPT, generates messages.
     """
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
@@ -469,9 +479,12 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
         if limit:
             targets = targets[:limit]
 
-    print(f"Analyzing {len(targets)} lead(s) with Claude…")
+    print(f"Analyzing {len(targets)} lead(s) with GPT…")
     fetcher = HeroldFetcher(headless=True)
     done = 0
+    dirty = False
+    dirty_batch: list[dict] = []
+    save_every = progress_save_interval()
 
     try:
         for lead in targets:
@@ -492,8 +505,13 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
                 rerender_saved_draft(lead, campaign=campaign)
                 lead["Drafts_Approved"] = "0"
                 print(f"done (template: {lead.get('Template_Used', '?')})")
-                save_leads(leads, campaign=campaign)
                 done += 1
+                dirty = True
+                dirty_batch.append(dict(lead))
+                if done % save_every == 0:
+                    save_leads_batch(dirty_batch, campaign=campaign)
+                    dirty_batch = []
+                    dirty = False
                 continue
 
             # 1. Determine website category
@@ -561,14 +579,21 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
                     lead["Status"] = "draft_ready"
                 lead["Drafts_Approved"] = "0"
 
-            save_leads(leads, campaign=campaign)
             done += 1
+            dirty = True
+            dirty_batch.append(dict(lead))
+            if done % save_every == 0:
+                save_leads_batch(dirty_batch, campaign=campaign)
+                dirty_batch = []
+                dirty = False
 
-            # Brief pause between leads to be polite to Claude API
+            # Brief pause between leads to be polite to the API
             time.sleep(1)
 
     finally:
         fetcher.close()
+        if dirty:
+            save_leads_batch(dirty_batch, campaign=campaign)
 
     mark_campaign_stage_run(campaign["id"], "analyzed")
     print(f"\nDone. Analyzed {done} lead(s). Status set to {'approved' if no_review else 'draft_ready'}.")

@@ -375,6 +375,7 @@ def create_campaign(keyword: str, location: str, activate: bool = True) -> dict[
         except Exception:
             config = _default_campaign_config(keyword, location, campaign_id=campaign_id)
             backend.postgres_save_campaign(config)
+        config = ensure_campaign_copy_defaults(config)
         if activate:
             backend.postgres_set_active_campaign_id(campaign_id)
         return config
@@ -387,6 +388,7 @@ def create_campaign(keyword: str, location: str, activate: bool = True) -> dict[
     except Exception:
         config = _default_campaign_config(keyword, location, campaign_id=campaign_id)
         save_campaign_config(config)
+    config = ensure_campaign_copy_defaults(config)
 
     if activate:
         set_active_campaign(campaign_id)
@@ -464,3 +466,35 @@ def get_template_overrides_path(campaign: dict[str, Any]) -> str:
         return f"postgres://campaigns/{campaign.get('id', '')}/template-overrides"
     default_path = _campaign_layout_for_config(campaign)["template_overrides_path"]
     return str(resolve_path(campaign.get("template_overrides_path") or default_path))
+
+
+def ensure_campaign_copy_defaults(config: dict[str, Any], overwrite: bool = False) -> dict[str, Any]:
+    from crm_templates import build_default_campaign_copy_payloads, invalidate_campaign_copy_cache
+
+    hooks_payload, template_payload = build_default_campaign_copy_payloads(config)
+    changed = False
+
+    if backend.is_postgres_backend():
+        hooks_json = config.get("hooks_library_json")
+        template_json = config.get("template_overrides_json")
+        if overwrite or not isinstance(hooks_json, dict) or not hooks_json:
+            config["hooks_library_json"] = hooks_payload
+            changed = True
+        if overwrite or not isinstance(template_json, dict) or not template_json:
+            config["template_overrides_json"] = template_payload
+            changed = True
+        if changed:
+            config = save_campaign_config(config)
+    else:
+        hooks_path = Path(get_hooks_library_path(config))
+        template_path = Path(get_template_overrides_path(config))
+        if overwrite or not hooks_path.exists():
+            _write_json(hooks_path, hooks_payload)
+            changed = True
+        if overwrite or not template_path.exists():
+            _write_json(template_path, template_payload)
+            changed = True
+
+    if changed:
+        invalidate_campaign_copy_cache(config)
+    return config

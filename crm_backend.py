@@ -501,6 +501,65 @@ def _lead_sort_key(lead: dict[str, Any]) -> tuple[int, str]:
         return (1, lead_id)
 
 
+def _lead_upsert_params(campaign_id: str, lead: dict[str, Any], Jsonb: Any) -> tuple[Any, ...]:
+    scheduled_send_at = _parse_schedule_timestamp(lead.get("Scheduled_Send_At", ""))
+    approved_at = _parse_schedule_timestamp(lead.get("Approved_At", ""))
+    sent_at = _parse_schedule_timestamp(lead.get("Sent_At", ""))
+    next_action_date = None
+    next_action = (lead.get("Next_Action_Date") or "").strip()
+    if next_action:
+        try:
+            next_action_date = datetime.fromisoformat(f"{next_action}T00:00:00").date()
+        except ValueError:
+            next_action_date = None
+    return (
+        campaign_id,
+        lead["ID"],
+        Jsonb(lead),
+        lead.get("Status", "new"),
+        _safe_int(lead.get("Priority"), 5),
+        next_action_date,
+        scheduled_send_at,
+        lead.get("Scheduled_Send_Channel", ""),
+        lead.get("Scheduled_Send_Status", ""),
+        lead.get("Scheduled_Send_Error", ""),
+        _safe_int(lead.get("Scheduled_Send_Attempts"), 0),
+        approved_at,
+        sent_at,
+        lead.get("SMTP_Message_ID", ""),
+    )
+
+
+def _postgres_upsert_lead_row(cur: Any, campaign_id: str, lead: dict[str, Any], Jsonb: Any) -> None:
+    cur.execute(
+        """
+        insert into leads (
+            campaign_id, lead_id, payload, status, priority, next_action_date,
+            scheduled_send_at, scheduled_send_channel, scheduled_send_status,
+            scheduled_send_error, scheduled_send_attempts, approved_at, sent_at,
+            smtp_message_id, updated_at
+        )
+        values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+        on conflict (campaign_id, lead_id) do update set
+            payload = excluded.payload,
+            status = excluded.status,
+            priority = excluded.priority,
+            next_action_date = excluded.next_action_date,
+            scheduled_send_at = excluded.scheduled_send_at,
+            scheduled_send_channel = excluded.scheduled_send_channel,
+            scheduled_send_status = excluded.scheduled_send_status,
+            scheduled_send_error = excluded.scheduled_send_error,
+            scheduled_send_attempts = excluded.scheduled_send_attempts,
+            approved_at = excluded.approved_at,
+            sent_at = excluded.sent_at,
+            smtp_message_id = excluded.smtp_message_id,
+            updated_at = now()
+        """,
+        _lead_upsert_params(campaign_id, lead, Jsonb),
+    )
+    _sync_scheduled_send_row(cur, campaign_id, lead)
+
+
 def postgres_load_leads(campaign_id: str) -> list[dict[str, Any]]:
     ensure_postgres_ready()
     with postgres_connection() as conn, conn.cursor() as cur:
@@ -576,58 +635,7 @@ def postgres_save_leads(campaign_id: str, leads: list[dict[str, Any]]) -> None:
     lead_ids = [lead["ID"] for lead in normalized]
     with postgres_connection() as conn, conn.cursor() as cur:
         for lead in normalized:
-            scheduled_send_at = _parse_schedule_timestamp(lead.get("Scheduled_Send_At", ""))
-            approved_at = _parse_schedule_timestamp(lead.get("Approved_At", ""))
-            sent_at = _parse_schedule_timestamp(lead.get("Sent_At", ""))
-            next_action_date = None
-            next_action = (lead.get("Next_Action_Date") or "").strip()
-            if next_action:
-                try:
-                    next_action_date = datetime.fromisoformat(f"{next_action}T00:00:00").date()
-                except ValueError:
-                    next_action_date = None
-            cur.execute(
-                """
-                insert into leads (
-                    campaign_id, lead_id, payload, status, priority, next_action_date,
-                    scheduled_send_at, scheduled_send_channel, scheduled_send_status,
-                    scheduled_send_error, scheduled_send_attempts, approved_at, sent_at,
-                    smtp_message_id, updated_at
-                )
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                on conflict (campaign_id, lead_id) do update set
-                    payload = excluded.payload,
-                    status = excluded.status,
-                    priority = excluded.priority,
-                    next_action_date = excluded.next_action_date,
-                    scheduled_send_at = excluded.scheduled_send_at,
-                    scheduled_send_channel = excluded.scheduled_send_channel,
-                    scheduled_send_status = excluded.scheduled_send_status,
-                    scheduled_send_error = excluded.scheduled_send_error,
-                    scheduled_send_attempts = excluded.scheduled_send_attempts,
-                    approved_at = excluded.approved_at,
-                    sent_at = excluded.sent_at,
-                    smtp_message_id = excluded.smtp_message_id,
-                    updated_at = now()
-                """,
-                (
-                    campaign_id,
-                    lead["ID"],
-                    Jsonb(lead),
-                    lead.get("Status", "new"),
-                    _safe_int(lead.get("Priority"), 5),
-                    next_action_date,
-                    scheduled_send_at,
-                    lead.get("Scheduled_Send_Channel", ""),
-                    lead.get("Scheduled_Send_Status", ""),
-                    lead.get("Scheduled_Send_Error", ""),
-                    _safe_int(lead.get("Scheduled_Send_Attempts"), 0),
-                    approved_at,
-                    sent_at,
-                    lead.get("SMTP_Message_ID", ""),
-                ),
-            )
-            _sync_scheduled_send_row(cur, campaign_id, lead)
+            _postgres_upsert_lead_row(cur, campaign_id, lead, Jsonb)
         if lead_ids:
             cur.execute(
                 "delete from leads where campaign_id = %s and lead_id <> all(%s)",
@@ -640,6 +648,32 @@ def postgres_save_leads(campaign_id: str, leads: list[dict[str, Any]]) -> None:
         else:
             cur.execute("delete from leads where campaign_id = %s", (campaign_id,))
             cur.execute("delete from scheduled_sends where campaign_id = %s", (campaign_id,))
+
+
+def postgres_upsert_lead(campaign_id: str, lead: dict[str, Any]) -> None:
+    ensure_postgres_ready()
+    lead_id = str(lead.get("ID") or "").strip()
+    if not lead_id:
+        raise ValueError("Lead ID is required for postgres_upsert_lead().")
+    _, _, Jsonb = _load_psycopg()
+    normalized = _lead_payload_from_row(lead)
+    with postgres_connection() as conn, conn.cursor() as cur:
+        _postgres_upsert_lead_row(cur, campaign_id, normalized, Jsonb)
+
+
+def postgres_upsert_leads(campaign_id: str, leads: list[dict[str, Any]]) -> None:
+    ensure_postgres_ready()
+    _, _, Jsonb = _load_psycopg()
+    normalized = [
+        _lead_payload_from_row(lead)
+        for lead in leads
+        if str(lead.get("ID") or "").strip()
+    ]
+    if not normalized:
+        return
+    with postgres_connection() as conn, conn.cursor() as cur:
+        for lead in normalized:
+            _postgres_upsert_lead_row(cur, campaign_id, lead, Jsonb)
 
 
 def _sync_scheduled_send_row(cur: Any, campaign_id: str, lead: dict[str, Any]) -> None:

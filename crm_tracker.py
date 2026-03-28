@@ -9,7 +9,15 @@ import json
 from datetime import date, datetime, timedelta
 
 from crm_schedule import clear_scheduled_send
-from crm_store import default_preferred_channel, load_leads, save_leads, update_lead, TERMINAL_STATUSES
+from crm_store import (
+    TERMINAL_STATUSES,
+    default_preferred_channel,
+    get_lead_by_id,
+    load_leads,
+    save_lead,
+    save_leads,
+    update_lead,
+)
 
 # Follow-up delays in days after each contact attempt
 FOLLOWUP_DAYS = [3, 4, 7]  # Day 0→3, Day 3→7, Day 7→14 (then auto-archive)
@@ -89,8 +97,12 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "", 
       meeting       → Status = "meeting_scheduled"
       done / won / lost / blacklist → terminal states
     """
-    leads = load_leads(campaign=campaign)
-    lead = next((l for l in leads if l.get("ID", "").strip() == lead_id.strip()), None)
+    leads: list[dict] | None = None
+    if backend.is_postgres_backend():
+        lead = get_lead_by_id(lead_id, campaign=campaign)
+    else:
+        leads = load_leads(campaign=campaign)
+        lead = next((l for l in leads if l.get("ID", "").strip() == lead_id.strip()), None)
     if lead is None:
         print(f"Lead {lead_id} not found.")
         return
@@ -133,7 +145,10 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "", 
         sep = " | " if existing else ""
         lead["Notes"] = f"{existing}{sep}[{today_str}] {notes}"
 
-    save_leads(leads, campaign=campaign)
+    if backend.is_postgres_backend():
+        save_lead(lead, campaign=campaign)
+    else:
+        save_leads(leads or [], campaign=campaign)
     active_campaign = campaign
     if active_campaign is None:
         try:

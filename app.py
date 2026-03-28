@@ -39,9 +39,11 @@ from crm_store import (
     TERMINAL_STATUSES,
     available_channels,
     get_bezirk,
+    get_lead_by_id,
     load_leads,
     planned_channel,
     preferred_channel,
+    save_lead,
     save_leads,
 )
 from crm_templates import (
@@ -78,8 +80,38 @@ STATUS_EMOJI = {
 ALL_LEADS_PAGE_SIZE_OPTIONS = [10, 25, 50]
 
 
-def reload() -> None:
-    st.cache_data.clear()
+def _clear_cached_result(cache_func, *args) -> None:
+    if args:
+        cache_func.clear(*args)
+        return
+    cache_func.clear()
+
+
+def invalidate_lead_cache(campaign_id: str) -> None:
+    if campaign_id:
+        _clear_cached_result(cached_leads, campaign_id)
+        _clear_cached_result(cached_campaign_metrics, campaign_id)
+        return
+    _clear_cached_result(cached_leads)
+    _clear_cached_result(cached_campaign_metrics)
+
+
+def invalidate_campaign_cache(campaign_id: str = "") -> None:
+    _clear_cached_result(cached_campaigns)
+    _clear_cached_result(cached_active_campaign)
+    if campaign_id:
+        _clear_cached_result(cached_campaign, campaign_id)
+        invalidate_lead_cache(campaign_id)
+        return
+    _clear_cached_result(cached_campaign)
+    invalidate_lead_cache("")
+
+
+def reload(*, campaign_id: str = "", campaign_changed: bool = False) -> None:
+    if campaign_changed:
+        invalidate_campaign_cache(campaign_id)
+    elif campaign_id:
+        invalidate_lead_cache(campaign_id)
     st.rerun()
 
 
@@ -157,15 +189,23 @@ def _apply_subject_suggestion(key_prefix: str) -> None:
         st.session_state[f"{key_prefix}_subject_text"] = suggestion
 
 
-def _render_subject_editor(campaign: dict, lead: dict, *, key_prefix: str, current_subject: str) -> str:
+def _render_subject_editor(
+    campaign: dict,
+    lead: dict,
+    *,
+    key_prefix: str,
+    current_subject: str,
+    apply_suggestion_on_submit: bool = False,
+) -> str:
     subject_options = get_subject_options(lead, current_subject=current_subject, campaign=campaign)
     text_key = f"{key_prefix}_subject_text"
     pick_key = f"{key_prefix}_subject_pick"
+    initial_subject = current_subject or (subject_options[0] if subject_options else "")
 
     if text_key not in st.session_state:
-        st.session_state[text_key] = current_subject or (subject_options[0] if subject_options else "")
+        st.session_state[text_key] = initial_subject
     if pick_key not in st.session_state or st.session_state[pick_key] not in subject_options:
-        st.session_state[pick_key] = current_subject if current_subject in subject_options else (subject_options[0] if subject_options else "")
+        st.session_state[pick_key] = current_subject if current_subject in subject_options else initial_subject
 
     subject = st.text_input(
         "Email subject",
@@ -173,16 +213,34 @@ def _render_subject_editor(campaign: dict, lead: dict, *, key_prefix: str, curre
         placeholder="Type any custom subject here",
         help="You can type a completely custom subject or pull in one of the quick suggestions below.",
     )
+    selected_suggestion = ""
     if subject_options:
-        st.selectbox(
-            "Quick subject suggestions",
-            options=subject_options,
-            key=pick_key,
-            on_change=_apply_subject_suggestion,
-            args=(key_prefix,),
-            help="Choosing one copies it into the subject field above, which you can still edit afterwards.",
-        )
-    return subject.strip()
+        if apply_suggestion_on_submit:
+            selected_suggestion = st.selectbox(
+                "Quick subject suggestions",
+                options=subject_options,
+                key=pick_key,
+                help="Pick a suggestion and submit to use it, or edit the subject field directly.",
+            )
+        else:
+            st.selectbox(
+                "Quick subject suggestions",
+                options=subject_options,
+                key=pick_key,
+                on_change=_apply_subject_suggestion,
+                args=(key_prefix,),
+                help="Choosing one copies it into the subject field above, which you can still edit afterwards.",
+            )
+
+    resolved_subject = subject.strip()
+    if (
+        apply_suggestion_on_submit
+        and selected_suggestion
+        and selected_suggestion != resolved_subject
+        and resolved_subject == initial_subject.strip()
+    ):
+        resolved_subject = selected_suggestion.strip()
+    return resolved_subject
 
 
 def _extract_urls(*texts: str) -> list[str]:
@@ -304,26 +362,24 @@ def _set_manual_status(
 ) -> None:
     from crm_tracker import append_contact_log
 
-    all_leads = load_leads(campaign=campaign)
-    for row in all_leads:
-        if row.get("ID") != lead_id:
-            continue
-        row["Status"] = status
-        clear_scheduled_send(row)
-        if status in TERMINAL_STATUSES or status in {"replied", "meeting_scheduled", "no_contact"}:
-            row["Next_Action_Type"] = "none"
-            row["Next_Action_Date"] = ""
-        if channel:
-            row["Channel_Used"] = channel
-        append_contact_log(
-            row,
-            at=datetime.now().strftime("%Y-%m-%d %H:%M"),
-            channel=channel or (row.get("Channel_Used") or "").strip(),
-            outcome=status,
-            notes=notes or f"Marked as {status}",
-        )
-        break
-    save_leads(all_leads, campaign=campaign)
+    row = get_lead_by_id(lead_id, campaign=campaign)
+    if row is None:
+        return
+    row["Status"] = status
+    clear_scheduled_send(row)
+    if status in TERMINAL_STATUSES or status in {"replied", "meeting_scheduled", "no_contact"}:
+        row["Next_Action_Type"] = "none"
+        row["Next_Action_Date"] = ""
+    if channel:
+        row["Channel_Used"] = channel
+    append_contact_log(
+        row,
+        at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        channel=channel or (row.get("Channel_Used") or "").strip(),
+        outcome=status,
+        notes=notes or f"Marked as {status}",
+    )
+    save_lead(row, campaign=campaign)
 
 
 def _save_draft_edits(
@@ -337,33 +393,28 @@ def _save_draft_edits(
     selected_channel: str,
     schedule_choice: str = "",
 ) -> dict | None:
-    all_leads = load_leads(campaign=campaign)
-    updated: dict | None = None
-    for row in all_leads:
-        if row.get("ID") != lead_id:
-            continue
-        row["Email_Draft"] = compose_email_draft(subject, body)
-        row["WhatsApp_Draft"] = whatsapp.strip()
-        row["Phone_Script"] = phone_script.strip()
-        valid_channels = available_channels(row)
-        if selected_channel in valid_channels:
-            row["Preferred_Channel"] = selected_channel
-            if row.get("Status") not in TERMINAL_STATUSES:
-                row["Next_Action_Type"] = selected_channel
-        row["Drafts_Approved"] = "1"
-        row["Draft_Stale"] = "0"
-        row["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
-        if row.get("Status") in {"new", "draft_ready"}:
-            row["Status"] = "approved"
-        if schedule_choice in {"today", "tomorrow"} and "email" in available_channels(row):
-            queue_scheduled_email(row, schedule_choice)
-        elif schedule_choice == "clear":
-            clear_scheduled_send(row)
-        updated = dict(row)
-        break
-    if updated is not None:
-        save_leads(all_leads, campaign=campaign)
-    return updated
+    row = get_lead_by_id(lead_id, campaign=campaign)
+    if row is None:
+        return None
+    row["Email_Draft"] = compose_email_draft(subject, body)
+    row["WhatsApp_Draft"] = whatsapp.strip()
+    row["Phone_Script"] = phone_script.strip()
+    valid_channels = available_channels(row)
+    if selected_channel in valid_channels:
+        row["Preferred_Channel"] = selected_channel
+        if row.get("Status") not in TERMINAL_STATUSES:
+            row["Next_Action_Type"] = selected_channel
+    row["Drafts_Approved"] = "1"
+    row["Draft_Stale"] = "0"
+    row["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
+    if row.get("Status") in {"new", "draft_ready"}:
+        row["Status"] = "approved"
+    if schedule_choice in {"today", "tomorrow"} and "email" in available_channels(row):
+        queue_scheduled_email(row, schedule_choice)
+    elif schedule_choice == "clear":
+        clear_scheduled_send(row)
+    save_lead(row, campaign=campaign)
+    return dict(row)
 
 
 def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: str) -> None:
@@ -403,7 +454,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             selected_channel=selected_channel,
             schedule_choice="clear",
         )
-        reload()
+        reload(campaign_id=campaign["id"])
     log_col.caption("Saving here marks the draft approved/fresh without queueing an automatic send.")
 
     if "email" in channel_options:
@@ -419,7 +470,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 selected_channel=selected_channel,
                 schedule_choice="today",
             )
-            reload()
+            reload(campaign_id=campaign["id"])
         if queue_col2.button("Queue Send Tomorrow", key=f"{key_prefix}_queue_tomorrow"):
             _save_draft_edits(
                 campaign,
@@ -431,7 +482,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 selected_channel=selected_channel,
                 schedule_choice="tomorrow",
             )
-            reload()
+            reload(campaign_id=campaign["id"])
 
     if "email" in channel_options:
         st.markdown("**Email**")
@@ -450,7 +501,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             with st.spinner("Sending email..."):
                 ok = send_email(lid, notes=action_note, campaign=campaign)
             if ok:
-                reload()
+                reload(campaign_id=campaign["id"])
         if c2.button("Mark Email Sent", key=f"{key_prefix}_mark_email"):
             _save_draft_edits(
                 campaign,
@@ -463,7 +514,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 schedule_choice="clear",
             )
             log_contact(lid, "sent", notes=action_note, channel="email", campaign=campaign)
-            reload()
+            reload(campaign_id=campaign["id"])
 
     if "whatsapp" in channel_options:
         st.markdown("**WhatsApp**")
@@ -485,7 +536,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 schedule_choice="clear",
             )
             log_contact(lid, "sent", notes=action_note, channel="whatsapp", campaign=campaign)
-            reload()
+            reload(campaign_id=campaign["id"])
 
     if "phone" in channel_options:
         st.markdown("**Phone**")
@@ -501,7 +552,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 selected_channel=selected_channel,
             )
             log_contact(lid, "called", notes=action_note, channel="phone", campaign=campaign)
-            reload()
+            reload(campaign_id=campaign["id"])
         if c2.button("Voicemail", key=f"{key_prefix}_voicemail"):
             _save_draft_edits(
                 campaign,
@@ -513,7 +564,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 selected_channel=selected_channel,
             )
             log_contact(lid, "voicemail", notes=action_note, channel="phone", campaign=campaign)
-            reload()
+            reload(campaign_id=campaign["id"])
         if c3.button("No Answer", key=f"{key_prefix}_no_answer"):
             _save_draft_edits(
                 campaign,
@@ -525,7 +576,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 selected_channel=selected_channel,
             )
             log_contact(lid, "no_answer", notes=action_note, channel="phone", campaign=campaign)
-            reload()
+            reload(campaign_id=campaign["id"])
 
     st.markdown("**Status**")
     status_cols = st.columns(2)
@@ -540,19 +591,17 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             selected_channel=selected_channel,
         )
         _set_manual_status(campaign, lid, status="done", notes=action_note, channel=selected_channel)
-        reload()
+        reload(campaign_id=campaign["id"])
 
 
 def _persist_channel_choice(campaign: dict, lead_id: str, channel: str) -> None:
-    all_leads = load_leads(campaign=campaign)
-    for row in all_leads:
-        if row.get("ID") != lead_id:
-            continue
-        row["Preferred_Channel"] = channel
-        if row.get("Status") in {"new", "draft_ready", "approved", "contacted"}:
-            row["Next_Action_Type"] = channel
-        break
-    save_leads(all_leads, campaign=campaign)
+    row = get_lead_by_id(lead_id, campaign=campaign)
+    if row is None:
+        return
+    row["Preferred_Channel"] = channel
+    if row.get("Status") in {"new", "draft_ready", "approved", "contacted"}:
+        row["Next_Action_Type"] = channel
+    save_lead(row, campaign=campaign)
 
 
 def _is_bulk_email_ready(lead: dict) -> bool:
@@ -680,7 +729,7 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
                 status_txt.caption(f"Refreshing drafts for {lid} - {company}")
                 rerender_saved_draft(lead, campaign=campaign)
                 lead["Drafts_Approved"] = "0"
-                save_leads(all_leads, campaign=campaign)
+                save_lead(lead, campaign=campaign)
                 done += 1
                 continue
 
@@ -726,7 +775,7 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
             if lead.get("Status", "new") in {"new", "approved", "draft_ready"} or was_stale:
                 lead["Status"] = "draft_ready"
 
-            save_leads(all_leads, campaign=campaign)
+            save_lead(lead, campaign=campaign)
             done += 1
             time.sleep(1)
     finally:
@@ -803,14 +852,14 @@ def _render_campaign_template_editor(campaign: dict) -> None:
             payload["special_subject_option"] = special_subject.strip()
             payload["subject_templates"] = [line.strip() for line in subject_lines.splitlines() if line.strip()]
             _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload()
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
         if reset_subjects:
             payload = get_template_override_payload(campaign=campaign)
             payload.pop("special_subject_option", None)
             payload.pop("subject_templates", None)
             _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload()
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
     with hooks_tab:
         effective_hooks = get_effective_hooks_library(campaign=campaign)
@@ -836,11 +885,11 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 if [line.strip() for line in text.splitlines() if line.strip()]
             }
             _persist_campaign_copy_changes(campaign, hooks_payload=hooks_payload)
-            reload()
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
         if reset_hooks:
             _persist_campaign_copy_changes(campaign, hooks_payload={})
-            reload()
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
     with templates_tab:
         effective_templates = get_effective_templates(campaign=campaign)
@@ -871,7 +920,7 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 "phone_script": phone_template,
             }
             _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload()
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
         if reset_template:
             payload = get_template_override_payload(campaign=campaign)
@@ -881,7 +930,7 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 if not templates_payload:
                     payload.pop("templates", None)
             _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload()
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
 
 def _active_campaign_switch() -> dict:
@@ -899,7 +948,7 @@ def _active_campaign_switch() -> dict:
     )
     if selected_id != active["id"]:
         set_active_campaign(selected_id)
-        reload()
+        reload(campaign_id=selected_id, campaign_changed=True)
 
     st.sidebar.caption(f"ID: `{selected_id}`")
     return cached_campaign(selected_id)
@@ -933,7 +982,7 @@ def _render_dashboard(campaign: dict, leads: list[dict]) -> None:
         if st.button(f"Generate All Pending ({len(pending_drafts)})", type="primary", key="gen_all_pending"):
             container = st.container()
             if _generate_drafts([lead["ID"] for lead in pending_drafts], container):
-                reload()
+                reload(campaign_id=campaign["id"])
 
     today = date.today().isoformat()
     actionable = [
@@ -1067,52 +1116,58 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
             return
 
         current_subject, current_body = parse_email_draft(selected.get("Email_Draft", ""))
-        selected_channel = st.radio(
-            "Default starting channel",
-            options=channel_options,
-            index=channel_options.index(preferred_channel(selected)),
-            format_func=_channel_label,
-            help="This is just the default first touch. You can change it later in Outreach or All Leads.",
-            horizontal=True,
-        )
         review_key_prefix = f"review_{lid}"
-        selected_subject = _render_subject_editor(campaign, selected, key_prefix=review_key_prefix, current_subject=current_subject)
-        email_body = st.text_area("Email body", value=current_body, height=260, key=f"{review_key_prefix}_email_body")
-        wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120, key=f"{review_key_prefix}_wa")
-        phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240, key=f"{review_key_prefix}_phone")
-        _render_draft_links(email_body, wa_draft, phone_script)
-        st.caption(f"Queue status: {scheduled_send_label(selected)}")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        approve = c1.button("Approve", type="primary", width="stretch", key=f"{review_key_prefix}_approve")
-        queue_today = c2.button("Send Today", width="stretch", key=f"{review_key_prefix}_queue_today")
-        queue_tomorrow = c3.button("Send Tomorrow", width="stretch", key=f"{review_key_prefix}_queue_tomorrow")
-        skip = c4.button("Skip", width="stretch", key=f"{review_key_prefix}_skip")
-        blacklist = c5.button("Blacklist", width="stretch", key=f"{review_key_prefix}_blacklist")
+        with st.form(f"{review_key_prefix}_form"):
+            selected_channel = st.radio(
+                "Default starting channel",
+                options=channel_options,
+                index=channel_options.index(preferred_channel(selected)),
+                format_func=_channel_label,
+                help="This is just the default first touch. You can change it later in Outreach or All Leads.",
+                horizontal=True,
+                key=f"{review_key_prefix}_channel",
+            )
+            selected_subject = _render_subject_editor(
+                campaign,
+                selected,
+                key_prefix=review_key_prefix,
+                current_subject=current_subject,
+                apply_suggestion_on_submit=True,
+            )
+            email_body = st.text_area("Email body", value=current_body, height=260, key=f"{review_key_prefix}_email_body")
+            wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120, key=f"{review_key_prefix}_wa")
+            phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240, key=f"{review_key_prefix}_phone")
+            _render_draft_links(email_body, wa_draft, phone_script)
+            st.caption(f"Queue status: {scheduled_send_label(selected)}")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            approve = c1.form_submit_button("Approve", type="primary", width="stretch")
+            queue_today = c2.form_submit_button("Send Today", width="stretch")
+            queue_tomorrow = c3.form_submit_button("Send Tomorrow", width="stretch")
+            skip = c4.form_submit_button("Skip", width="stretch")
+            blacklist = c5.form_submit_button("Blacklist", width="stretch")
 
         if approve or queue_today or queue_tomorrow:
-            all_leads = load_leads(campaign=campaign)
-            for lead in all_leads:
-                if lead.get("ID") == lid:
-                    lead["Email_Draft"] = compose_email_draft(selected_subject, email_body)
-                    lead["WhatsApp_Draft"] = wa_draft
-                    lead["Phone_Script"] = phone_script
-                    lead["Preferred_Channel"] = selected_channel
-                    lead["Next_Action_Type"] = selected_channel
-                    lead["Status"] = "approved"
-                    lead["Drafts_Approved"] = "1"
-                    lead["Draft_Stale"] = "0"
-                    if queue_today and "email" in available_channels(lead):
-                        queue_scheduled_email(lead, "today")
-                    elif queue_tomorrow and "email" in available_channels(lead):
-                        queue_scheduled_email(lead, "tomorrow")
-                    else:
-                        clear_scheduled_send(lead)
-                    break
-            save_leads(all_leads, campaign=campaign)
+            lead = get_lead_by_id(lid, campaign=campaign)
+            if lead is not None:
+                lead["Email_Draft"] = compose_email_draft(selected_subject, email_body)
+                lead["WhatsApp_Draft"] = wa_draft
+                lead["Phone_Script"] = phone_script
+                lead["Preferred_Channel"] = selected_channel
+                lead["Next_Action_Type"] = selected_channel
+                lead["Status"] = "approved"
+                lead["Drafts_Approved"] = "1"
+                lead["Draft_Stale"] = "0"
+                if queue_today and "email" in available_channels(lead):
+                    queue_scheduled_email(lead, "today")
+                elif queue_tomorrow and "email" in available_channels(lead):
+                    queue_scheduled_email(lead, "tomorrow")
+                else:
+                    clear_scheduled_send(lead)
+                save_lead(lead, campaign=campaign)
             skipped_ids.discard(lid)
             st.session_state[skipped_key] = sorted(skipped_ids)
             st.session_state[selected_key] = _next_review_selection(queue_ids, lid)
-            reload()
+            reload(campaign_id=campaign["id"])
 
         if skip:
             skipped_ids.add(lid)
@@ -1121,18 +1176,16 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
             reload()
 
         if blacklist:
-            all_leads = load_leads(campaign=campaign)
-            for lead in all_leads:
-                if lead.get("ID") == lid:
-                    lead["Status"] = "blacklist"
-                    lead["Next_Action_Type"] = "none"
-                    clear_scheduled_send(lead)
-                    break
-            save_leads(all_leads, campaign=campaign)
+            lead = get_lead_by_id(lid, campaign=campaign)
+            if lead is not None:
+                lead["Status"] = "blacklist"
+                lead["Next_Action_Type"] = "none"
+                clear_scheduled_send(lead)
+                save_lead(lead, campaign=campaign)
             skipped_ids.discard(lid)
             st.session_state[skipped_key] = sorted(skipped_ids)
             st.session_state[selected_key] = _next_review_selection(queue_ids, lid)
-            reload()
+            reload(campaign_id=campaign["id"])
 
 
 def _render_outreach(campaign: dict, leads: list[dict]) -> None:
@@ -1259,7 +1312,7 @@ def _render_outreach(campaign: dict, leads: list[dict]) -> None:
         st.session_state[state_keys["selection"]] = failed_ids
         if not failed_ids:
             st.session_state[state_keys["note"]] = ""
-        reload()
+        reload(campaign_id=campaign["id"])
 
     for lead in approved:
         lid = lead.get("ID", "?")
@@ -1457,33 +1510,29 @@ def _render_all_leads(campaign: dict, leads: list[dict]) -> None:
                     st.caption("No usable outreach channel on this lead.")
                 notes_value = st.text_area("Notes", value=lead.get("Notes", ""), key=f"notes_{lid}", height=100)
                 if st.button("Save", key=f"save_{lid}"):
-                    all_leads = load_leads(campaign=campaign)
-                    for row in all_leads:
-                        if row.get("ID") == lid:
-                            previous_channel = row.get("Preferred_Channel", "")
-                            row["Price"] = price_value
-                            row["Preferred_Channel"] = selected_channel
-                            if selected_channel != "none" and row.get("Status") not in TERMINAL_STATUSES:
-                                row["Next_Action_Type"] = selected_channel
-                            if (
-                                selected_channel != previous_channel
-                                and (row.get("Scheduled_Send_Status") or "").strip() == "queued"
-                            ):
-                                clear_scheduled_send(row)
-                            row["Notes"] = notes_value
-                            break
-                    save_leads(all_leads, campaign=campaign)
-                    reload()
-                if st.button("Blacklist", key=f"blacklist_{lid}"):
-                    all_leads = load_leads(campaign=campaign)
-                    for row in all_leads:
-                        if row.get("ID") == lid:
-                            row["Status"] = "blacklist"
-                            row["Next_Action_Type"] = "none"
+                    row = get_lead_by_id(lid, campaign=campaign)
+                    if row is not None:
+                        previous_channel = row.get("Preferred_Channel", "")
+                        row["Price"] = price_value
+                        row["Preferred_Channel"] = selected_channel
+                        if selected_channel != "none" and row.get("Status") not in TERMINAL_STATUSES:
+                            row["Next_Action_Type"] = selected_channel
+                        if (
+                            selected_channel != previous_channel
+                            and (row.get("Scheduled_Send_Status") or "").strip() == "queued"
+                        ):
                             clear_scheduled_send(row)
-                            break
-                    save_leads(all_leads, campaign=campaign)
-                    reload()
+                        row["Notes"] = notes_value
+                        save_lead(row, campaign=campaign)
+                    reload(campaign_id=campaign["id"])
+                if st.button("Blacklist", key=f"blacklist_{lid}"):
+                    row = get_lead_by_id(lid, campaign=campaign)
+                    if row is not None:
+                        row["Status"] = "blacklist"
+                        row["Next_Action_Type"] = "none"
+                        clear_scheduled_send(row)
+                        save_lead(row, campaign=campaign)
+                    reload(campaign_id=campaign["id"])
                 st.divider()
                 _render_contact_log(lead)
 
@@ -1496,7 +1545,7 @@ def _render_all_leads(campaign: dict, leads: list[dict]) -> None:
 
                 if (lead.get("Website_Category") or lead.get("Research_Stale") == "1") and st.button("Generate Drafts", key=f"regen_{lid}"):
                     if _generate_drafts([lid], st.container()):
-                        reload()
+                        reload(campaign_id=campaign["id"])
 
 
 def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
@@ -1528,7 +1577,7 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
             create_btn = st.form_submit_button("Create and Activate", type="primary")
         if create_btn and keyword.strip() and location.strip():
             create_campaign(keyword.strip(), location.strip(), activate=True)
-            reload()
+            reload(campaign_changed=True)
     with create_right:
         st.subheader("Active Campaign")
         st.markdown(f"**{campaign.get('label', campaign['id'])}**")
@@ -1553,32 +1602,32 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
         with st.spinner("Scraping Herold..."):
             scrape_campaign(campaign)
             mark_campaign_stage_run(campaign["id"], "scraped")
-        reload()
+        reload(campaign_id=campaign["id"], campaign_changed=True)
     if stage_cols[1].button("Migrate", width="stretch"):
         from crm_store import migrate
 
         with st.spinner("Assigning lead IDs and CRM fields..."):
             if migrate():
                 mark_campaign_stage_run(campaign["id"], "migrated")
-        reload()
+        reload(campaign_id=campaign["id"], campaign_changed=True)
     if stage_cols[2].button("Enrich", width="stretch"):
         from crm_enrich import main as enrich_main
 
         with st.spinner("Enriching contacts..."):
             enrich_main()
-        reload()
+        reload(campaign_id=campaign["id"], campaign_changed=True)
     if stage_cols[3].button("Research", width="stretch"):
         from crm_research import main as research_main
 
         with st.spinner("Running research..."):
             research_main()
-        reload()
+        reload(campaign_id=campaign["id"], campaign_changed=True)
     if stage_cols[4].button("Analyze", width="stretch"):
         from crm_analyze import main as analyze_main
 
         with st.spinner("Generating drafts..."):
             analyze_main()
-        reload()
+        reload(campaign_id=campaign["id"], campaign_changed=True)
 
     st.caption(
         "Last runs: "
@@ -1629,7 +1678,7 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
                 "sender_email": sender_email.strip(),
             },
         )
-        reload()
+        reload(campaign_id=campaign["id"], campaign_changed=True)
 
     _render_campaign_template_editor(campaign)
 
@@ -1641,8 +1690,7 @@ def _prepare_active_leads(campaign: dict) -> list[dict]:
         updated, archived = check_and_archive_stale([dict(lead) for lead in leads])
         if archived:
             save_leads(updated, campaign=campaign)
-            st.cache_data.clear()
-            leads = updated
+            reload(campaign_id=campaign["id"])
         st.session_state[archive_key] = True
     return leads
 
@@ -1653,6 +1701,7 @@ page = st.sidebar.radio(
     ["Campaigns", "Dashboard", "Review Queue", "Outreach", "Re-contact", "All Leads"],
     label_visibility="collapsed",
 )
+active_leads: list[dict] = []
 
 if page == "Campaigns":
     _render_campaigns_page(campaign, cached_campaign_metrics(campaign["id"]))

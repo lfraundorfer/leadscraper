@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 
 from campaign_service import format_rank_keyword, get_active_campaign, mark_campaign_stage_run
 from herold_scraper import HeroldFetcher, DIRECTORY_DOMAINS
-from crm_store import load_leads, save_leads, get_bezirk
+from crm_store import get_bezirk, load_leads, progress_save_interval, save_leads_batch
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -355,6 +355,9 @@ def main(force: bool = False, single_id: str = "", from_id: str = "") -> None:
 
     fetcher = HeroldFetcher(headless=True)
     done = 0
+    dirty = False
+    dirty_batch: list[dict] = []
+    save_every = progress_save_interval()
 
     try:
         for lead in targets:
@@ -369,14 +372,21 @@ def main(force: bool = False, single_id: str = "", from_id: str = "") -> None:
                 if not k.startswith("_"):
                     lead[k] = v
 
-            save_leads(leads, campaign=campaign)
             done += 1
+            dirty = True
+            dirty_batch.append(dict(lead))
+            if done % save_every == 0:
+                save_leads_batch(dirty_batch, campaign=campaign)
+                dirty_batch = []
+                dirty = False
 
             score_info = f"cat={lead.get('Website_Category', '?')} | ★{lead.get('Google_Rating', '?')} | rank={lead.get('Google_Rank_Position', '?')}"
             print(score_info)
 
     finally:
         fetcher.close()
+        if dirty:
+            save_leads_batch(dirty_batch, campaign=campaign)
 
     mark_campaign_stage_run(campaign["id"], "researched")
     print(f"\nDone. Researched {done} lead(s).")

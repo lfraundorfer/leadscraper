@@ -150,6 +150,16 @@ def _resolve_csv_path(csv_path: str = "", campaign: Optional[dict] = None) -> st
     return resolve_active_csv_path()
 
 
+def progress_save_interval(default: int = 10) -> int:
+    raw = (os.getenv("CRM_SAVE_EVERY") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
 def _data_exists(row: dict, fields: list[str]) -> bool:
     return any((row.get(field) or "").strip() for field in fields)
 
@@ -312,6 +322,65 @@ def save_leads(leads: list[dict], csv_path: str = "", campaign: Optional[dict] =
     os.replace(tmp_path, path)
 
 
+def save_lead(lead: dict, csv_path: str = "", campaign: Optional[dict] = None) -> None:
+    """Persist a single lead row without rewriting the whole campaign in Postgres mode."""
+    lead_id = str(lead.get("ID") or "").strip()
+    if not lead_id:
+        raise ValueError("Lead ID is required for save_lead().")
+
+    if backend.is_postgres_backend() and not csv_path:
+        active_campaign = campaign or get_active_campaign()
+        row = {col: lead.get(col, "") for col in ALL_COLUMNS}
+        normalized = _apply_staleness_defaults(row, _draft_version(active_campaign), _research_version(active_campaign))
+        backend.postgres_upsert_lead(active_campaign["id"], normalized)
+        return
+
+    leads = load_leads(csv_path=csv_path, campaign=campaign)
+    replaced = False
+    for index, existing in enumerate(leads):
+        if str(existing.get("ID") or "").strip() != lead_id:
+            continue
+        leads[index] = dict(lead)
+        replaced = True
+        break
+    if not replaced:
+        leads.append(dict(lead))
+    save_leads(leads, csv_path=csv_path, campaign=campaign)
+
+
+def save_leads_batch(leads: list[dict], csv_path: str = "", campaign: Optional[dict] = None) -> None:
+    """Persist only the provided leads, leaving all other rows untouched."""
+    if backend.is_postgres_backend() and not csv_path:
+        active_campaign = campaign or get_active_campaign()
+        draft_version = _draft_version(active_campaign)
+        research_version = _research_version(active_campaign)
+        normalized = []
+        for lead in leads:
+            lead_id = str(lead.get("ID") or "").strip()
+            if not lead_id:
+                continue
+            row = {col: lead.get(col, "") for col in ALL_COLUMNS}
+            normalized.append(_apply_staleness_defaults(row, draft_version, research_version))
+        backend.postgres_upsert_leads(active_campaign["id"], normalized)
+        return
+
+    existing = load_leads(csv_path=csv_path, campaign=campaign)
+    by_id = {str(lead.get("ID") or "").strip(): dict(lead) for lead in leads if str(lead.get("ID") or "").strip()}
+    if not by_id:
+        return
+    replaced_ids = set()
+    for index, row in enumerate(existing):
+        lead_id = str(row.get("ID") or "").strip()
+        if lead_id not in by_id:
+            continue
+        existing[index] = by_id[lead_id]
+        replaced_ids.add(lead_id)
+    for lead_id, row in by_id.items():
+        if lead_id not in replaced_ids:
+            existing.append(row)
+    save_leads(existing, csv_path=csv_path, campaign=campaign)
+
+
 def get_lead_by_id(lead_id: str, campaign: Optional[dict] = None) -> Optional[dict]:
     """Find a single lead by its ID field in the active campaign."""
     if backend.is_postgres_backend():
@@ -320,7 +389,7 @@ def get_lead_by_id(lead_id: str, campaign: Optional[dict] = None) -> Optional[di
         if lead is not None:
             return _apply_staleness_defaults(lead, _draft_version(active_campaign), _research_version(active_campaign))
         return None
-    for lead in load_leads():
+    for lead in load_leads(campaign=campaign):
         if lead.get("ID", "").strip() == lead_id.strip():
             return lead
     return None
@@ -328,6 +397,15 @@ def get_lead_by_id(lead_id: str, campaign: Optional[dict] = None) -> Optional[di
 
 def update_lead(lead_id: str, updates: dict, campaign: Optional[dict] = None) -> bool:
     """Load all leads, update one row by ID, save atomically. Returns True if found."""
+    if backend.is_postgres_backend():
+        active_campaign = campaign or get_active_campaign()
+        lead = get_lead_by_id(lead_id, campaign=active_campaign)
+        if lead is None:
+            return False
+        lead.update(updates)
+        save_lead(lead, campaign=active_campaign)
+        return True
+
     leads = load_leads(campaign=campaign)
     found = False
     for lead in leads:

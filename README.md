@@ -80,6 +80,55 @@ python crm.py analyze
    - `Send Tomorrow`
 4. Scheduled emails are sent later by `python crm.py send-scheduled`.
 
+## Local Vs Hosted
+
+- `git push` syncs code, not lead data
+- lead data syncs through Supabase when `CRM_BACKEND=postgres`
+- after local `scrape`, `enrich`, `research`, or `analyze`, the hosted Streamlit app will show the new data after a refresh
+
+What "run locally" means:
+
+- run CLI commands on your laptop inside this repo
+- or run `streamlit run app.py` on your laptop and click the pipeline buttons in the local `localhost` app
+- if you click those buttons in the hosted Streamlit app, the work runs on Streamlit Cloud instead, which is not the recommended place for heavy scrape/research/analyze jobs
+
+Recommended split:
+
+- local machine: `scrape`, `enrich`, `research`, `analyze`
+- hosted Streamlit app: review, approve, queue, monitor
+- GitHub Actions: scheduled sending
+
+## Active Campaign Workflow
+
+Pipeline commands run against the current active campaign.
+
+Create and activate a new campaign explicitly:
+
+```bash
+python crm.py campaign-create Schluesseldienst Wien
+python crm.py scrape
+python crm.py enrich
+python crm.py research
+python crm.py analyze
+```
+
+Or let `scrape` create and activate it for you:
+
+```bash
+python crm.py scrape --keyword Schluesseldienst --location Wien
+python crm.py enrich
+python crm.py research
+python crm.py analyze
+```
+
+Notes:
+
+- the campaign is created immediately when you run `campaign-create` or `scrape --keyword ... --location ...`
+- it gets a campaign id like `schluesseldienst_wien`
+- once created, it is stored in Supabase right away in hosted mode and appears in Streamlit after a refresh
+- you can edit `Campaign Config` and `Template Editor` as soon as the campaign exists
+- if you change templates after drafts were already generated, run `python crm.py refresh-drafts` or rerun `python crm.py analyze`
+
 ## CLI Commands
 
 ```bash

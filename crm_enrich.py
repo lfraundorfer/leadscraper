@@ -11,7 +11,7 @@ from datetime import datetime
 
 from campaign_service import get_active_campaign, mark_campaign_stage_run
 from herold_scraper import HeroldFetcher, fetch_firmenabc_contacts
-from crm_store import load_leads, save_leads
+from crm_store import load_leads, progress_save_interval, save_leads_batch
 
 
 RATE_LIMIT_SEC = 2.0
@@ -38,7 +38,8 @@ def main(force: bool = False, single_id: str = "") -> None:
     """
     CLI entry point for `python crm.py enrich`.
     Enriches all leads missing Kontaktname (or a single lead if --id given).
-    Saves after each lead to survive interruption.
+    Periodically checkpoints progress to survive interruption without rewriting
+    the full dataset after every single lead.
     """
     campaign = get_active_campaign()
     leads = load_leads(campaign=campaign)
@@ -65,6 +66,10 @@ def main(force: bool = False, single_id: str = "") -> None:
     fetcher = HeroldFetcher(headless=True)
     enriched = 0
     skipped = 0
+    processed = 0
+    dirty = False
+    dirty_batch: list[dict] = []
+    save_every = progress_save_interval()
 
     try:
         for lead in targets:
@@ -88,12 +93,19 @@ def main(force: bool = False, single_id: str = "") -> None:
                 lead["Enriched_At"] = now  # mark as attempted so we don't retry
                 print(f"  {lid} {company[:40]} → (no name found)")
 
-            # Save after each lead (survives interruption)
-            save_leads(leads, campaign=campaign)
+            processed += 1
+            dirty = True
+            dirty_batch.append(dict(lead))
+            if processed % save_every == 0:
+                save_leads_batch(dirty_batch, campaign=campaign)
+                dirty_batch = []
+                dirty = False
             time.sleep(RATE_LIMIT_SEC)
 
     finally:
         fetcher.close()
+        if dirty:
+            save_leads_batch(dirty_batch, campaign=campaign)
 
     mark_campaign_stage_run(campaign["id"], "enriched")
     print(f"\nDone. Enriched: {enriched} | Skipped (already had name): {skipped}")

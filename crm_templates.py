@@ -287,6 +287,382 @@ SUBJECT_TEMPLATES: list[str] = [
 SPECIAL_SUBJECT_OPTION = "Ihre neue Website für nur 500 € Fixpreis"
 
 
+def _ensure_sentence(text: str) -> str:
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return ""
+    if cleaned[-1] in ".!?":
+        return cleaned
+    return cleaned + "."
+
+
+def _campaign_copy_seed_slots(campaign: dict | None = None) -> dict[str, str]:
+    active_campaign = _resolve_campaign(campaign)
+    keyword = _campaign_value(active_campaign, "keyword", default="Betrieb")
+    service_singular = _campaign_value(active_campaign, "service_singular", default=keyword or "Betrieb")
+    service_plural = _campaign_value(active_campaign, "service_plural", default=f"{service_singular}-Betriebe")
+    location = _campaign_value(active_campaign, "location", default="Ihrer Region")
+    offer_summary = _ensure_sentence(
+        _campaign_value(
+            active_campaign,
+            "offer_summary",
+            default=f"Wir entwickeln moderne, mobiloptimierte Websites für {service_plural} in {location}, mit klaren Kontaktwegen und besserer lokaler Sichtbarkeit.",
+        )
+    )
+    turnaround_days = str((active_campaign or {}).get("turnaround_days") or 14)
+    price = _campaign_value(active_campaign, "price_default", "PRICE_DEFAULT", "500")
+    return {
+        "location": location,
+        "service_singular": service_singular,
+        "service_plural": service_plural,
+        "offer_summary": offer_summary,
+        "turnaround_days": turnaround_days,
+        "starter_price": price,
+    }
+
+
+STARTER_SUBJECT_TEMPLATES: list[str] = [
+    "{{subject_intro}}kurze Frage zu Ihrer Website",
+    "{{subject_intro}}kurzer Blick auf {{rank_keyword}}",
+    "{{subject_intro}}eine kleine Idee für Ihren Webauftritt",
+    "{{subject_intro}}Ihre Website auf dem Handy",
+    "{{subject_intro}}Ihr Google-Auftritt in {{location}}",
+    "{{subject_intro}}Ihr Auftritt in der lokalen Suche",
+    "{{subject_intro}}ein kurzer Website-Check",
+    "{{subject_intro}}mehr Anfragen über Ihre Website",
+    "{{subject_intro}}Ihre Sichtbarkeit für {{rank_keyword}}",
+    "2 Ideen für Ihre Website",
+]
+
+STARTER_SPECIAL_SUBJECT_OPTION = "Ihre neue Website für nur {{starter_price}} € Fixpreis"
+
+
+STARTER_HOOK_LIBRARY: dict[str, list[str]] = {
+    "no_website": [
+        "Bei '{{rank_keyword}}' sieht man{{competitors_line}}. Ihr Unternehmen kommt dort für neue Kunden praktisch nicht vor.",
+        "Wer Sie noch nicht kennt, kann Sie online kaum wählen. Ohne Website endet die Suche oft beim sichtbareren Betrieb.",
+        "{{subject_name}}, Empfehlungen helfen nur, solange jemand Ihren Namen schon hat. Bei neuen Anfragen entscheidet meist der erste sichtbare Eindruck im Netz.",
+        "Wenn gerade jemand nach '{{rank_keyword}}' sucht, gewinnt meist der Betrieb, den man sofort findet.",
+    ],
+    "platzhalter": [
+        "Wer auf Ihre Website klickt, sieht derzeit keine fertige Präsenz, sondern eine Zwischenlösung. Für neue Kunden ist das oft schon das Ende der Suche.",
+        "Bei '{{rank_keyword}}' wäre der Klick auf Sie eigentlich die Chance auf den Auftrag. Eine Platzhalterseite verschenkt diesen Moment sofort wieder.",
+        "{{subject_name}}, eine Baustellenseite schafft nicht Vertrauen, sondern Zweifel. Gerade neue Interessenten springen in so einem Moment schnell weiter.",
+        "Ihre Website wird zwar gefunden, verkauft Ihren Betrieb gerade aber nicht. Das macht den Vorsprung für sichtbare Mitbewerber unnötig leicht.",
+    ],
+    "kein_mobil": [
+        "Viele lokale Suchen beginnen heute am Handy. Wenn Ihre Seite dort klein, langsam oder hakelig wirkt, ist der nächste Betrieb nur einen Tap entfernt.",
+        "Wer unterwegs '{{rank_keyword}}' sucht, will nicht zoomen oder suchen. Sobald die Seite Mühe macht, wird weitergeklickt.",
+        "{{subject_name}}, auf dem Smartphone entscheidet Tempo. Wenn Ihre Website dort nicht sofort funktioniert, gewinnt meist der Betrieb mit der einfacheren Nutzerführung.",
+        "Google schickt viele lokale Suchen zuerst aufs Smartphone. Dort sollte Ihr Auftritt der einfachste Schritt sein, nicht die Hürde davor.",
+    ],
+    "kein_kontakt": [
+        "Jemand besucht Ihre Website schon mit echtem Interesse und muss dann erst nach einer Nummer suchen. Genau an diesem Punkt brechen viele Anfragen ab.",
+        "Wer '{{rank_keyword}}' sucht und Sie findet, sollte in Sekunden bei Ihnen landen. Wenn dieser Weg fehlt, profitieren meist{{competitors_line}}.",
+        "{{subject_name}}, Ihre Website macht den ersten Schritt für Interessenten gerade schwerer als nötig. Ein fehlender Klick-zum-Anruf kostet online schneller als man denkt.",
+        "Neue Kunden entscheiden online selten zweimal. Wenn der Kontakt nicht glasklar ist, wird einfach das nächste Suchergebnis ausprobiert.",
+    ],
+    "veraltet": [
+        "Ihre Website wirkt älter als Ihr Unternehmen wahrscheinlich ist. Für neue Kunden fühlt sich das schnell nach Stillstand statt Verlässlichkeit an.",
+        "Bei '{{rank_keyword}}' reicht oft ein kurzer Blick, damit jemand weiterzieht. Ein veralteter Auftritt verliert diesen ersten Vergleich unnötig schnell.",
+        "{{subject_name}}, Ihre Arbeit kann top sein und die Website trotzdem Vertrauen kosten. Online sieht man leider zuerst die Verpackung.",
+        "Viele Kunden lesen nicht tief. Sie schauen kurz, spüren wenig Vertrauen und sind schon beim nächsten Anbieter.",
+    ],
+    "kein_seo": [
+        "Bei '{{rank_keyword}}' sitzen die Anfragen schon in Google. Wenn Ihr Unternehmen dort zu weit hinten auftaucht, gehen diese Kontakte an sichtbarere Betriebe.",
+        "Die Nachfrage ist da, nur landet sie gerade nicht bei Ihnen. Sichtbar sind zuerst{{competitors_line}}.",
+        "{{subject_name}}, lokal gefunden zu werden ist kein Bonus mehr. Für viele Neukunden ist es der Moment, in dem die Auswahl überhaupt erst beginnt.",
+        "Wenn jemand aktiv sucht, ist der Bedarf schon da. Ihr Unternehmen sollte in diesem Moment auftauchen, nicht erst später.",
+    ],
+    "bad_reviews": [
+        "Bevor jemand anruft, schaut er auf Sterne und Eindruck. Wenn dort Zweifel auftauchen, hilft die beste Leistung im Hintergrund erst einmal nicht.",
+        "Bei '{{rank_keyword}}' wird nicht nur nach Preis oder Leistung verglichen, sondern nach Vertrauen. Schwächere Bewertungen machen Sie dort unnötig angreifbar.",
+        "{{subject_name}}, Google filtert für neue Kunden oft schon vor dem ersten Gespräch aus. Genau deshalb kosten schwächere Rezensionen mehr, als man im Alltag merkt.",
+        "Negative oder durchwachsene Bewertungen wirken online viel lauter als im echten Leben. Viele Interessenten springen schon ab, bevor Sie überhaupt reagieren können.",
+    ],
+    "keine_bewertungen": [
+        "Wenn zwei Betriebe ähnlich wirken, gewinnt online meist der mit mehr sichtbarem Vertrauen. Genau dort fehlt Ihrem Unternehmen aktuell Rückhalt.",
+        "Bei '{{rank_keyword}}' schauen viele zuerst auf Sterne und Anzahl. Wenige Bewertungen lassen selbst gute Betriebe kleiner wirken, als sie sind.",
+        "{{subject_name}}, Ihre Arbeit kann längst überzeugend sein und online trotzdem zu wenig Beweis haben. Neue Interessenten sehen zuerst die leeren Stellen.",
+        "Viele Kunden lesen nicht zehn Texte, sondern vergleichen drei Profile. Dort fällt ein dünner Bewertungsstand sofort auf.",
+    ],
+    "not_ranked": [
+        "Bei '{{rank_keyword}}' findet die Entscheidung schon statt, nur ohne Ihr Unternehmen. Sichtbar sind dort aktuell{{competitors_line}}.",
+        "Wer Sie nicht sieht, kann Sie nicht anrufen. Genau das passiert gerade in der lokalen Suche.",
+        "{{subject_name}}, der Bedarf ist da, die Suchanfragen sind da, nur Ihr Unternehmen taucht in diesem Moment kaum auf.",
+        "Sichtbarkeit ist hier keine Eitelkeit, sondern Zugang zu kaufbereiten Anfragen. Genau dieser Zugang fehlt bei '{{rank_keyword}}' gerade.",
+    ],
+    "kein_design": [
+        "Ihre Website wirkt derzeit schwächer als die Qualität, die Ihr Unternehmen vermutlich tatsächlich liefert. Online entscheidet dieser Eindruck schneller, als einem lieb ist.",
+        "Wenn mehrere Betriebe ähnlich klingen, gewinnt oft der Auftritt, der sauberer und sicherer wirkt. Im direkten Vergleich profitieren davon eher{{competitors_line}}.",
+        "{{subject_name}}, zwischen guter Leistung und gutem Auftritt klafft bei Ihnen gerade eine Lücke. Neue Interessenten sehen zuerst diese Lücke.",
+        "Der erste Eindruck Ihrer Website fühlt sich gerade eher nach Provisorium als nach etabliertem Betrieb an. Das ist für neue Kunden ein unnötiger Stolperstein.",
+    ],
+    "kein_ssl": [
+        "Wenn der Browser schon vor dem Inhalt warnt, ist Vertrauen praktisch weg, bevor Ihre Website überhaupt eine Chance bekommt.",
+        "Der Hinweis 'Nicht sicher' wirkt bei neuen Besuchern härter, als man denkt. Viele schließen die Seite sofort wieder.",
+        "{{subject_name}}, ein Sicherheitswarnhinweis auf der Website schreckt schon im ersten Moment ab. Gerade Erstkontakte gehen dann schnell verloren.",
+        "Online-Sicherheit ist heute kein Extra mehr, sondern Grundvoraussetzung. Fehlt sie sichtbar, ziehen viele Besucher direkt weiter.",
+    ],
+}
+
+
+def _starter_email(problem_text: str) -> str:
+    return """\
+Betreff: {{subject}}
+
+{{salutation}}
+
+{{hook}}
+
+**Festpreis: €{{price}} einmalig.** {{offer_summary}}
+
+""" + problem_text + """
+
+Wenn das grundsätzlich relevant ist, antworte ich gern mit 2-3 konkreten Ideen für Ihren Betrieb.
+
+Mit freundlichen Grüßen,
+{{sender_name}}
+{{sender_company_signature}}
+{{sender_website}}{{sender_phone}}"""
+
+
+STARTER_TEMPLATE_BLUEPRINTS: dict[str, dict[str, str]] = {
+    "no_website": {
+        "email": _starter_email(
+            "Wenn jemand heute '{{rank_keyword}}' googelt, findet er{{competitors_line}} – aber nicht Ihr Unternehmen. Diese Kunden gehen zur Konkurrenz, ohne dass Sie überhaupt die Chance bekommen anzurufen."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – wir entwickeln für {{service_plural}} professionelle Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von {{turnaround_days}} Tagen um. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – wäre das grundsätzlich interessant?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, mein Name ist {{sender_name}}{{sender_company_phone}}. Ich weiß, Sie arbeiten gerade – darf ich Ihnen ganz kurz eine Frage stellen? Es dauert auch nur 30 Sekunden."
+
+HOOK: "{{hook}} – Und das bedeutet: Kunden die online nach '{{rank_keyword}}' suchen, finden Sie nicht und rufen jemand anderen an."
+
+FRAGE: "Mal eine kurze Frage: Wie kommen die meisten Ihrer Kunden zu Ihnen – eher über Google oder über Empfehlungen?"
+
+ANTWORT EMPFEHLUNGEN: "Das höre ich oft. Aber viele Betriebe verlieren jeden Tag potenzielle Neukunden, gerade weil sie online nicht zu finden sind. Und genau das Problem lösen wir."
+
+LÖSUNG: "{{offer_summary}} Das realisieren wir zum Festpreis von €{{price}} einmalig."
+
+EINWÄNDE:
+"Zu teuer" → "€{{price}} einmalig – das ist oft weniger als ein einziger verlorener Auftrag. Und wir liefern in {{turnaround_days}} Tagen."
+"Kein Interesse" → "Ich möchte Ihnen auch gar nichts am Telefon verkaufen. Ich würde Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken – Sie schauen sich das in Ruhe an, und wenn es nichts für Sie ist, ignorieren Sie es einfach."
+"Haben genug Kunden" → "Perfekt. Dann wäre eine Website gut, um das auch in Zukunft zu sichern – Empfehlungen können schwanken."
+"Keine Zeit" → "Das läuft komplett auf unserer Seite – wir brauchen von Ihnen nur ein kurzes Gespräch fürs Briefing."
+
+CTA: "Okay, dann verbleiben wir so: Ich schicke Ihnen 2-3 konkrete Ideen per E-Mail oder WhatsApp. Auf welche Adresse darf ich das senden?" """,
+    },
+    "kein_mobil": {
+        "email": _starter_email(
+            "Viele lokale Google-Suchen beginnen heute am Smartphone. Eine Website, die auf dem Handy nicht richtig funktioniert – zu kleine Schrift, Buttons nicht klickbar, unklare Nutzerführung – verliert diese Besucher in Sekunden."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – viele Kunden suchen am Handy. Wir entwickeln mobiloptimierte Websites zum Festpreis von €{{price}} einmalig und setzen sie innerhalb von {{turnaround_days}} Tagen um. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich Ihnen kurz eine Frage stellen? Dauert 30 Sekunden."
+
+HOOK: "{{hook}} – Und das ist ein Problem, weil viele Kunden heute am Handy nach '{{rank_keyword}}' suchen. Wenn die Website dort nicht sauber funktioniert, gehen die Leute einfach weiter."
+
+FRAGE: "Wie kommen bei Ihnen die meisten Kunden rein – eher über Google oder über Empfehlungen?"
+
+ANTWORT EMPFEHLUNGEN: "Das kenne ich. Aber gerade über das Handy verlieren viele Betriebe täglich Neukunden – die suchen schnell, finden die Website, es funktioniert nicht richtig, und sie rufen den Nächsten an."
+
+LÖSUNG: "{{offer_summary}} Mit mobiler Optimierung, klarer Nutzerführung und schnellen Kontaktwegen."
+
+EINWÄNDE:
+"Wir haben schon eine Website" → "Ja, ich habe sie gesehen – das Problem ist eher die mobile Darstellung. Genau die lässt sich verbessern."
+"Zu teuer" → "€{{price}} einmalig – der erste neue Kunde über die Website zahlt das oft schon."
+"Kein Interesse" → "Ich möchte Ihnen nichts am Telefon verkaufen. Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken? Sie schauen es sich in Ruhe an."
+"Keine Zeit" → "Das erledigen wir komplett – wir brauchen nur ein kurzes Briefing von Ihnen."
+
+CTA: "Dann schicke ich Ihnen 2-3 konkrete Ideen. Auf welche E-Mail-Adresse oder Handynummer darf ich das senden?" """,
+    },
+    "kein_kontakt": {
+        "email": _starter_email(
+            "Wenn jemand Ihre Website besucht und keinen einfachen Weg findet, Sie zu kontaktieren – kein Formular, kein Click-to-Call, kein WhatsApp-Button – verlässt er die Seite oft wieder und probiert den Nächsten."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – Kunden, die Ihre Website besuchen, finden keinen einfachen Kontaktweg. Wir lösen das mit einer professionellen Website mit klaren Kontaktwegen zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – darf ich?"
+
+HOOK: "{{hook}} – Das bedeutet: Wer Ihre Website findet, kann Sie nicht direkt kontaktieren. Kein Klick-zum-Anruf, kein Formular – viele gehen dann einfach weiter."
+
+FRAGE: "Kommen aktuell viele Anfragen über Ihre Website rein?"
+
+LÖSUNG: "{{offer_summary}} Mit Click-to-Call, Kontaktformular und auf Wunsch WhatsApp-Integration."
+
+PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von {{turnaround_days}} Tagen."
+
+EINWÄNDE:
+"Haben schon eine Website" → "Sehe ich – das Problem ist eher der fehlende Kontaktweg. Das lässt sich sauber nachrüsten."
+"Zu teuer" → "€{{price}} einmalig – das zahlt sich oft schon beim ersten zusätzlichen Auftrag aus."
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken? Schauen Sie es sich in Ruhe an."
+"Keine Zeit" → "Das läuft komplett bei uns – Sie brauchen nur einmal kurz Inputs geben."
+
+CTA: "Auf welche Adresse darf ich Ihnen die Ideen schicken?" """,
+    },
+    "kein_seo": {
+        "email": _starter_email(
+            "Wer heute nach '{{rank_keyword}}' sucht, sieht{{competitors_line}} – Ihr Unternehmen taucht dort nicht stark genug auf. Genau diese Anfragen gehen dann an sichtbarere Betriebe."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – bei '{{rank_keyword}}' findet man Sie nicht stark genug. Wir entwickeln SEO-optimierte Websites zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse an einem kurzen Gespräch?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
+
+HOOK: "{{hook}} – Ich habe '{{rank_keyword}}' gegoogelt – da erscheinen{{competitors_line}}, aber Sie nicht stark genug. Das sind täglich Kunden, die aktiv suchen und jemand anderen finden."
+
+FRAGE: "Kommen aktuell Anfragen über Google bei Ihnen an?"
+
+LÖSUNG: "{{offer_summary}} Mit lokaler Keyword-Ausrichtung, technischer Optimierung und sauberer Struktur, damit Sie bei '{{rank_keyword}}' besser gefunden werden."
+
+PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von {{turnaround_days}} Tagen."
+
+EINWÄNDE:
+"Haben schon eine Website" → "Sehe ich – das Problem liegt eher an der fehlenden SEO-Optimierung. Die Website ist da, aber Google zeigt sie nicht stark genug."
+"Zu teuer" → "€{{price}} einmalig – der erste Auftrag über Google zahlt das oft schon."
+"Kein Interesse" → "Dann schicke ich Ihnen einfach 2-3 konkrete Ideen per E-Mail. Schauen Sie sich das in Ruhe an."
+"Keine Zeit" → "Das läuft komplett bei uns. Wir brauchen nur ein kurzes Briefing."
+
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
+    },
+    "veraltet": {
+        "email": _starter_email(
+            "Der erste Eindruck entscheidet online in Sekunden. Ein veralteter Auftritt sendet oft die falsche Botschaft: Kunden fragen sich, ob der Betrieb noch aktiv ist – und wählen lieber den moderneren Mitbewerber."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – ein veralteter Webauftritt kostet täglich Kunden. Wir modernisieren Ihre Website zum Festpreis von €{{price}} einmalig und setzen das innerhalb von {{turnaround_days}} Tagen um. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
+
+HOOK: "{{hook}} – Eine veraltete Website kann potenzielle Kunden abschrecken, bevor sie überhaupt anrufen. Sie sehen das Design und denken: passt das noch?"
+
+FRAGE: "Kommen bei Ihnen aktuell genug Anfragen über das Internet?"
+
+LÖSUNG: "{{offer_summary}} So spiegelt Ihre Website die Qualität Ihres Betriebs wieder besser wider."
+
+PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von {{turnaround_days}} Tagen."
+
+EINWÄNDE:
+"Läuft so auch" → "Momentan vielleicht. Die Frage ist eher, wie viele Kunden abspringen, bevor sie anrufen."
+"Zu teuer" → "€{{price}} einmalig. Das zahlt sich oft schon beim ersten zusätzlichen Auftrag aus."
+"Kein Interesse" → "Ich schicke Ihnen einfach 2-3 konkrete Ideen per E-Mail – schauen Sie es sich in Ruhe an."
+"Keine Zeit" → "Das erledigen wir – von Ihnen brauchen wir nur ein kurzes Briefing."
+
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
+    },
+    "platzhalter": {
+        "email": _starter_email(
+            "Wer heute Ihre Website besucht, sieht eine Platzhalterseite – keine Leistungen, kein Kontakt, keine klare Information. Diese Besucher sind oft verloren, bevor sie überhaupt die Chance hatten, Sie anzurufen."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – Ihre Website zeigt gerade nur eine Platzhalterseite. Wir ersetzen sie durch eine vollständige Website zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – darf ich?"
+
+HOOK: "{{hook}} – Ich habe Ihre Website aufgerufen und gesehen, dass sie noch im Aufbau ist. Das bedeutet: Kunden, die Sie online finden, sehen zu wenig und gehen weiter."
+
+LÖSUNG: "{{offer_summary}} Und wir bringen das innerhalb von {{turnaround_days}} Tagen sauber online."
+
+PREIS: "Festpreis: €{{price}} einmalig. Die vollständige Website steht innerhalb von {{turnaround_days}} Tagen online."
+
+EINWÄNDE:
+"Bauen das selbst" → "Gut zu hören. Darf ich fragen, wann das fertig sein soll? Wir könnten das deutlich schneller liefern."
+"Zu teuer" → "€{{price}} einmalig – schnell umgesetzt, sofort online."
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken?"
+"Keine Zeit" → "Das erledigen wir komplett – wir brauchen nur kurze Inputs von Ihnen."
+
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
+    },
+    "bad_reviews": {
+        "email": _starter_email(
+            "Bevor ein neuer Kunde anruft, schaut er sich die Google-Bewertungen an. Schlechte oder auffällige Rezensionen kosten Vertrauen, noch bevor Sie überhaupt die Chance bekommen, persönlich zu überzeugen."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – schwächere Google-Bewertungen kosten Aufträge. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
+
+HOOK: "{{hook}} – Kunden schauen sich vor dem Anruf die Google-Bewertungen an. Schwächere Bewertungen reichen oft schon aus, damit sie den Nächsten anrufen."
+
+FRAGE: "Merken Sie, dass Kunden die Bewertungen ansprechen?"
+
+LÖSUNG: "{{offer_summary}} Eine professionelle Website baut Vertrauen auf, bevor Kunden überhaupt auf die Sterne schauen."
+
+PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von {{turnaround_days}} Tagen."
+
+EINWÄNDE:
+"Bewertungen stimmen nicht" → "Das glaube ich Ihnen. Eine gute Website zeigt, was wirklich hinter dem Betrieb steckt."
+"Zu teuer" → "€{{price}} einmalig – weniger als ein verlorener Auftrag."
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken?"
+
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
+    },
+    "not_ranked": {
+        "email": _starter_email(
+            "Wenn jemand heute '{{rank_keyword}}' googelt, erscheinen{{competitors_line}} ganz oben. Sie tauchen dort nicht stark genug auf – und genau diese Kunden suchen bereits aktiv nach einer Lösung."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – bei '{{rank_keyword}}' findet man Sie nicht, aber{{competitors_line}}. Wir lösen das mit einer SEO-optimierten Website zum Festpreis von €{{price}} einmalig. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Darf ich kurz?"
+
+HOOK: "{{hook}} – Ich habe '{{rank_keyword}}' gegoogelt – da erscheinen{{competitors_line}}, aber Sie nicht. Täglich verlieren Sie so Kunden, die aktiv suchen."
+
+FRAGE: "Kommen aktuell Anfragen über Google bei Ihnen an?"
+
+LÖSUNG: "{{offer_summary}} Mit lokaler Keyword-Ausrichtung, technischer Optimierung und sauberer Struktur, damit Sie bei '{{rank_keyword}}' besser gefunden werden."
+
+PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von {{turnaround_days}} Tagen."
+
+EINWÄNDE:
+"Haben schon eine Website" → "Sehe ich – das Problem liegt eher an der SEO. Die Website ist da, Google zeigt sie nur nicht stark genug."
+"Zu teuer" → "€{{price}} – der erste Auftrag über Google zahlt das oft schon."
+"Kein Interesse" → "Ich schicke Ihnen einfach 2-3 konkrete Ideen per E-Mail."
+"Keine Zeit" → "Läuft komplett bei uns – kurzes Briefing reicht."
+
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
+    },
+    "keine_bewertungen": {
+        "email": _starter_email(
+            "Kunden vergleichen Bewertungen, bevor sie anrufen. Ein Betrieb mit deutlich mehr sichtbarem Vertrauen gewinnt online oft gegen den mit wenigen Rezensionen – selbst wenn die Leistung ähnlich gut ist."
+        ),
+        "whatsapp": "{{salutation}} {{hook}} – mit wenigen Google-Bewertungen verlieren Betriebe täglich Kunden an Mitbewerber. Eine professionelle Website stärkt Vertrauen und lässt sich zum Festpreis von €{{price}} einmalig umsetzen. Wenn Sie möchten, schicke ich Ihnen dazu kurz 2-3 Ideen – Interesse?",
+        "phone_script": """\
+OPENING: "Spreche ich mit {{contact}}? – Guten Tag, {{sender_name}}{{sender_company_phone}}. Kurze Frage – 30 Sekunden?"
+
+HOOK: "{{hook}} – Kunden vergleichen Bewertungen, bevor sie anrufen. Wenige Rezensionen reichen oft schon, damit sie den Nächsten wählen."
+
+FRAGE: "Kommen aktuell Anfragen über Google bei Ihnen an?"
+
+LÖSUNG: "{{offer_summary}} Mit Referenzen, klaren Leistungen und persönlicher Vorstellung – so entsteht Vertrauen, bevor jemand nur die Bewertungen vergleicht."
+
+PREIS: "Festpreis: €{{price}} einmalig. Umsetzung innerhalb von {{turnaround_days}} Tagen."
+
+EINWÄNDE:
+"Haben genug Kunden" → "Gut. Aber Empfehlungen schwanken – über Google kommen Neukunden deutlich konstanter."
+"Zu teuer" → "€{{price}} einmalig – das zahlt sich oft schon beim ersten Neukunden aus."
+"Kein Interesse" → "Darf ich Ihnen einfach 2-3 konkrete Ideen per E-Mail schicken?"
+
+CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
+    },
+}
+
+
+def build_default_campaign_copy_payloads(campaign: dict | None = None) -> tuple[dict[str, list[str]], dict]:
+    seed_slots = _campaign_copy_seed_slots(campaign)
+    hooks_payload = {
+        category: [fill_template(item, seed_slots) for item in items]
+        for category, items in STARTER_HOOK_LIBRARY.items()
+    }
+    template_payload = {
+        "special_subject_option": fill_template(STARTER_SPECIAL_SUBJECT_OPTION, seed_slots),
+        "subject_templates": [fill_template(item, seed_slots) for item in STARTER_SUBJECT_TEMPLATES],
+        "templates": {
+            template_key: {
+                channel: fill_template(value, seed_slots)
+                for channel, value in channels.items()
+            }
+            for template_key, channels in STARTER_TEMPLATE_BLUEPRINTS.items()
+        },
+    }
+    return hooks_payload, template_payload
+
+
 def get_hook(category: str, lead_id: str = "", campaign: dict | None = None) -> str:
     """Pick a hook deterministically by lead ID (same lead always gets same hook).
     Checks the active campaign hooks_library.json first, falls back to built-in HOOKS.

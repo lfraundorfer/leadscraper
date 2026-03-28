@@ -31,10 +31,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set
 from urllib.parse import quote_plus
 
-import requests
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from tqdm import tqdm
 
 try:
@@ -135,6 +132,25 @@ class Lead:
     firmenABC_link: str = ""
 
 
+@dataclass
+class _RateLimiter:
+    """Throttle outbound lookups without forcing an initial sleep."""
+
+    last_call_started_at: float = 0.0
+
+    def wait(self, pause_seconds: float) -> None:
+        if pause_seconds <= 0:
+            self.last_call_started_at = time.monotonic()
+            return
+
+        now = time.monotonic()
+        if self.last_call_started_at:
+            remaining = pause_seconds - (now - self.last_call_started_at)
+            if remaining > 0:
+                time.sleep(remaining)
+        self.last_call_started_at = time.monotonic()
+
+
 # ---------------------------------------------------------------------------
 # Playwright page fetcher
 # ---------------------------------------------------------------------------
@@ -175,6 +191,10 @@ class HeroldFetcher:
         return html
 
     def close(self):
+        try:
+            self._ctx.close()
+        except Exception:
+            pass
         try:
             self._browser.close()
             self._pw.stop()
@@ -264,7 +284,7 @@ def _extract_card(card, page_url: str) -> Lead:
         lead.adresse = _clean(" ".join(p for p in parts if p))
     if not lead.adresse:
         text = card.get_text(" ", strip=True)
-        m = re.search(r"\b1\d{3}\s+Wien\b[^,;<]{0,60}", text)
+        m = re.search(r"\b\d{4}\s+[A-ZÄÖÜ][^,;<]{0,60}", text)
         if m:
             lead.adresse = _clean(m.group(0))
 
@@ -365,15 +385,17 @@ def fetch_firmenabc_contacts(url: str, fetcher: "HeroldFetcher") -> str:
         person_div = children[i + 1]
 
         # Linked persons (GmbH): <a href="/person/..."><span class="break-words">Herr ...</span></a>
+        found_linked = False
         for a in person_div.find_all("a", href=re.compile(r"/person/")):
             span = a.find("span", class_=re.compile(r"break-words"))
             name = _clean(span.get_text(strip=True) if span else a.get("title", ""))
             if name and name not in seen:
                 names.append(name)
                 seen.add(name)
+                found_linked = True
 
         # Unlinked persons (e.U.): plain <span class="block break-words ...">Herr ...</span>
-        if not any(names):
+        if not found_linked:
             for span in person_div.find_all("span", class_=re.compile(r"block")):
                 name = _clean(span.get_text(strip=True))
                 if name and name not in seen and re.search(r"\b(Herr|Frau)\b", name):
@@ -391,17 +413,32 @@ def _is_directory(url: str) -> bool:
     return any(d in url.lower() for d in DIRECTORY_DOMAINS)
 
 
-def find_website(company: str, pause: float) -> str:
+def find_website(
+    company: str,
+    pause: float,
+    *,
+    category: str = "",
+    location: str = "",
+    rate_limiter: _RateLimiter | None = None,
+) -> str:
     """DuckDuckGo search for company's own website. Returns URL or ''."""
     if not HAS_DDG:
         logging.warning("duckduckgo-search not installed – skipping website search")
         return ""
 
-    query = f'"{company}" Wien Installateur'
+    query_parts = [f'"{company}"']
+    if location.strip():
+        query_parts.append(location.strip())
+    if category.strip():
+        query_parts.append(category.strip())
+    query = " ".join(query_parts)
     attempt = 0
     while attempt < 3:
         try:
-            time.sleep(pause * (2 ** attempt))
+            if rate_limiter is not None:
+                rate_limiter.wait(pause * (2 ** attempt))
+            elif attempt:
+                time.sleep(pause * (2 ** attempt))
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=8))
             for r in results:
@@ -416,13 +453,23 @@ def find_website(company: str, pause: float) -> str:
     return ""
 
 
-def find_firmenabc(company: str, pause: float) -> str:
+def find_firmenabc(
+    company: str,
+    pause: float,
+    *,
+    location: str = "",
+    rate_limiter: _RateLimiter | None = None,
+) -> str:
     """Find firmenabc.at listing URL for this company."""
     if not HAS_DDG:
         return ""
-    query = f'site:firmenabc.at {company}'
+    query_parts = ["site:firmenabc.at", f'"{company}"']
+    if location.strip():
+        query_parts.append(location.strip())
+    query = " ".join(query_parts)
     try:
-        time.sleep(pause)
+        if rate_limiter is not None:
+            rate_limiter.wait(pause)
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
         for r in results:
@@ -434,8 +481,9 @@ def find_firmenabc(company: str, pause: float) -> str:
     return ""
 
 
-def google_maps_link(company: str, address: str = "") -> str:
-    q = f"{company} {address}".strip() if address else f"{company} Wien"
+def google_maps_link(company: str, address: str = "", location: str = "") -> str:
+    fallback = location.strip()
+    q = f"{company} {address}".strip() if address else f"{company} {fallback}".strip() or company
     return f"https://www.google.com/maps/search/?api=1&query={quote_plus(q)}"
 
 
@@ -463,31 +511,44 @@ def load_existing_keys(csv_path: str) -> Set[str]:
     return keys
 
 
-def write_lead(lead: Lead, csv_path: str, seen: Set[str]) -> bool:
-    """Write a single lead immediately. Returns True if written, False if duplicate/skipped."""
-    key = _normalize_key(lead.unternehmen)
-    if not key or key in seen:
-        return False
+def write_leads(leads: list[Lead], csv_path: str, seen: Set[str]) -> int:
+    """Append a batch of newly processed leads to disk in one pass."""
+    rows: list[dict[str, str]] = []
+    new_keys: set[str] = set()
+
+    for lead in leads:
+        key = _normalize_key(lead.unternehmen)
+        if not key or key in seen or key in new_keys:
+            continue
+        new_keys.add(key)
+        rows.append(
+            {
+                "Unternehmen": lead.unternehmen,
+                "Website": lead.website or "X",
+                "TelNr": lead.tel_nr,
+                "Email": lead.email,
+                "Kontaktname": lead.kontaktname,
+                "Kontaktdatum": lead.kontaktdatum,
+                "Source": lead.source,
+                "Notes": lead.notes,
+                "Adresse": lead.adresse,
+                "Google_Maps_Link": lead.google_maps_link,
+                "FirmenABC_Link": lead.firmenABC_link,
+            }
+        )
+
+    if not rows:
+        return 0
+
     is_new_file = not os.path.exists(csv_path)
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, delimiter=";", extrasaction="ignore")
         if is_new_file:
             writer.writeheader()
-        writer.writerow({
-            "Unternehmen":      lead.unternehmen,
-            "Website":          lead.website or "X",
-            "TelNr":            lead.tel_nr,
-            "Email":            lead.email,
-            "Kontaktname":      lead.kontaktname,
-            "Kontaktdatum":     lead.kontaktdatum,
-            "Source":           lead.source,
-            "Notes":            lead.notes,
-            "Adresse":          lead.adresse,
-            "Google_Maps_Link": lead.google_maps_link,
-            "FirmenABC_Link":   lead.firmenABC_link,
-        })
-    seen.add(key)
-    return True
+        writer.writerows(rows)
+
+    seen.update(new_keys)
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -499,10 +560,14 @@ def _clean(s: str) -> str:
 
 
 def _parse_page_range(s: str):
-    parts = s.split("-")
+    text = (s or "").strip()
+    parts = [part.strip() for part in text.split("-", 1)]
     if len(parts) == 2:
-        return int(parts[0]), int(parts[1])
-    return int(parts[0]), int(parts[0])
+        start = max(1, int(parts[0]))
+        end = max(start, int(parts[1]))
+        return start, end
+    page = max(1, int(parts[0]))
+    return page, page
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +604,7 @@ def scrape_to_csv(
         tqdm.write(f"Resuming – {len(seen)} existing entries in '{output}' will be skipped.")
 
     fetcher = HeroldFetcher(headless=not visible)
+    search_rate_limiter = _RateLimiter() if not no_search else None
     total_new = 0
     total_pages = 1
 
@@ -560,7 +626,7 @@ def scrape_to_csv(
         pages = list(range(page_start, page_end + 1))
 
         with tqdm(total=0, unit="entry", ncols=90,
-                  bar_format="p{desc}: {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
+                  bar_format="{desc}: {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}") as pbar:
             for page_num in pages:
                 if page_num == 1 and first_html:
                     html = first_html
@@ -586,28 +652,49 @@ def scrape_to_csv(
                 if not leads:
                     tqdm.write(f"WARN: page {page_num} returned 0 listings")
 
-                new_leads = [l for l in leads if l.unternehmen and _normalize_key(l.unternehmen) not in seen]
+                page_seen: set[str] = set()
+                new_leads: list[Lead] = []
+                for lead in leads:
+                    key = _normalize_key(lead.unternehmen)
+                    if not lead.unternehmen or key in seen or key in page_seen:
+                        continue
+                    page_seen.add(key)
+                    new_leads.append(lead)
                 pbar.reset(total=len(new_leads))
                 pbar.set_description(f"{page_num}/{page_end}")
+                processed_leads: list[Lead] = []
 
                 for lead in new_leads:
                     pbar.set_postfix_str(lead.unternehmen[:35], refresh=True)
 
                     if not no_search:
                         if not lead.website:
-                            lead.website = find_website(lead.unternehmen, search_pause)
+                            lead.website = find_website(
+                                lead.unternehmen,
+                                search_pause,
+                                category=category,
+                                location=location,
+                                rate_limiter=search_rate_limiter,
+                            )
                         if not lead.firmenABC_link:
-                            lead.firmenABC_link = find_firmenabc(lead.unternehmen, search_pause)
+                            lead.firmenABC_link = find_firmenabc(
+                                lead.unternehmen,
+                                search_pause,
+                                location=location,
+                                rate_limiter=search_rate_limiter,
+                            )
 
                     if lead.firmenABC_link and not lead.kontaktname:
+                        if search_rate_limiter is not None:
+                            search_rate_limiter.wait(search_pause)
                         lead.kontaktname = fetch_firmenabc_contacts(lead.firmenABC_link, fetcher)
-                        time.sleep(search_pause)
 
-                    lead.google_maps_link = google_maps_link(lead.unternehmen, lead.adresse)
+                    lead.google_maps_link = google_maps_link(lead.unternehmen, lead.adresse, location=location)
 
-                    if write_lead(lead, output, seen):
-                        total_new += 1
+                    processed_leads.append(lead)
                     pbar.update(1)
+
+                total_new += write_leads(processed_leads, output, seen)
 
                 if page_num < page_end:
                     time.sleep(page_pause)
