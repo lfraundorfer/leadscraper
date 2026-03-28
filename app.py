@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import urllib.parse
 from copy import deepcopy
 from collections import Counter
@@ -91,9 +92,11 @@ def invalidate_lead_cache(campaign_id: str) -> None:
     if campaign_id:
         _clear_cached_result(cached_leads, campaign_id)
         _clear_cached_result(cached_campaign_metrics, campaign_id)
+        _clear_cached_result(cached_dashboard_snapshot, campaign_id)
         return
     _clear_cached_result(cached_leads)
     _clear_cached_result(cached_campaign_metrics)
+    _clear_cached_result(cached_dashboard_snapshot)
 
 
 def invalidate_campaign_cache(campaign_id: str = "") -> None:
@@ -148,6 +151,56 @@ def cached_campaign_metrics(campaign_id: str) -> dict[str, int]:
     counts = dict(_campaign_counts(leads))
     counts["total_leads"] = len(leads)
     return counts
+
+
+@st.cache_data(ttl=300)
+def cached_dashboard_snapshot(campaign_id: str) -> dict:
+    if backend.is_postgres_backend():
+        snapshot_loader = getattr(backend, "postgres_load_dashboard_snapshot", None)
+        if callable(snapshot_loader):
+            return snapshot_loader(campaign_id, date.today().isoformat())
+
+    campaign = cached_campaign(campaign_id)
+    leads = load_leads(campaign=campaign)
+    today = date.today().isoformat()
+    return {
+        "status_counts": dict(_campaign_counts(leads)),
+        "pending_drafts": [
+            {"ID": lead.get("ID", ""), "Unternehmen": lead.get("Unternehmen", "")}
+            for lead in leads
+            if lead.get("Website_Category")
+            and (not lead.get("Analyzed_At") or lead.get("Draft_Stale") == "1")
+            and lead.get("Status") not in TERMINAL_STATUSES
+        ],
+        "actionable": [
+            {
+                "ID": lead.get("ID", ""),
+                "Unternehmen": lead.get("Unternehmen", ""),
+                "Priority": lead.get("Priority", "5"),
+                "Next_Action_Date": lead.get("Next_Action_Date", ""),
+                "Next_Action_Type": lead.get("Next_Action_Type", "none"),
+            }
+            for lead in leads
+            if lead.get("Status") not in TERMINAL_STATUSES
+            and lead.get("Status") != "no_contact"
+            and (lead.get("Scheduled_Send_Status") or "").strip() != "queued"
+            and lead.get("Next_Action_Type", "none") not in ("none", "")
+            and (not lead.get("Next_Action_Date") or lead.get("Next_Action_Date") <= today)
+        ],
+    }
+
+
+@st.cache_data(ttl=300)
+def app_commit_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
 
 
 def _score_bar(score_str: str) -> str:
@@ -951,49 +1004,41 @@ def _active_campaign_switch() -> dict:
         reload(campaign_id=selected_id, campaign_changed=True)
 
     st.sidebar.caption(f"ID: `{selected_id}`")
+    commit_sha = app_commit_sha()
+    if commit_sha:
+        st.sidebar.caption(f"App commit: `{commit_sha}`")
     return cached_campaign(selected_id)
 
 
-def _render_dashboard(campaign: dict, leads: list[dict]) -> None:
+def _render_dashboard(campaign: dict, dashboard_snapshot: dict, metrics: dict[str, int]) -> None:
     st.title("Dashboard")
     st.caption(f"Active campaign: {campaign.get('label', campaign['id'])}")
 
-    if not leads:
+    total_leads = int(metrics.get("total_leads", 0))
+    if not total_leads:
         st.warning("No leads found yet. Start on the Campaigns page and run Scrape.")
         return
 
-    counts = _campaign_counts(leads)
+    counts = dict(dashboard_snapshot.get("status_counts") or {})
+    pending_drafts = list(dashboard_snapshot.get("pending_drafts") or [])
+    actionable = list(dashboard_snapshot.get("actionable") or [])
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total Leads", len(leads))
+    col1.metric("Total Leads", total_leads)
     col2.metric("Draft Ready", counts.get("draft_ready", 0))
-    col3.metric("Approved", counts.get("approved_fresh", 0))
-    col4.metric("Drafts Stale", counts.get("draft_stale", 0))
-    col5.metric("Research Stale", counts.get("research_stale", 0))
+    col3.metric("Approved", metrics.get("approved_fresh", 0))
+    col4.metric("Drafts Stale", metrics.get("draft_stale", 0))
+    col5.metric("Research Stale", metrics.get("research_stale", 0))
 
-    pending_drafts = [
-        lead for lead in leads
-        if lead.get("Website_Category") and (not lead.get("Analyzed_At") or lead.get("Draft_Stale") == "1")
-        and lead.get("Status") not in TERMINAL_STATUSES
-    ]
     if pending_drafts:
         st.divider()
         st.subheader(f"Generate Drafts ({len(pending_drafts)})")
         st.caption("Includes never-analyzed leads and drafts made stale by campaign changes.")
         if st.button(f"Generate All Pending ({len(pending_drafts)})", type="primary", key="gen_all_pending"):
             container = st.container()
-            if _generate_drafts([lead["ID"] for lead in pending_drafts], container):
+            if _generate_drafts([lead["ID"] for lead in pending_drafts if lead.get("ID")], container):
                 reload(campaign_id=campaign["id"])
 
     today = date.today().isoformat()
-    actionable = [
-        lead for lead in leads
-        if lead.get("Status") not in TERMINAL_STATUSES
-        and lead.get("Status") != "no_contact"
-        and (lead.get("Scheduled_Send_Status") or "").strip() != "queued"
-        and lead.get("Next_Action_Type", "none") not in ("none", "")
-        and (not lead.get("Next_Action_Date") or lead.get("Next_Action_Date") <= today)
-    ]
-    actionable.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Next_Action_Date") or ""))
 
     st.divider()
     st.subheader(f"Today's Actions ({today})")
@@ -1702,14 +1747,17 @@ page = st.sidebar.radio(
     label_visibility="collapsed",
 )
 active_leads: list[dict] = []
+dashboard_snapshot: dict = {}
 
 if page == "Campaigns":
     _render_campaigns_page(campaign, cached_campaign_metrics(campaign["id"]))
+elif page == "Dashboard":
+    dashboard_snapshot = cached_dashboard_snapshot(campaign["id"])
 else:
     active_leads = _prepare_active_leads(campaign)
 
 if page == "Dashboard":
-    _render_dashboard(campaign, active_leads)
+    _render_dashboard(campaign, dashboard_snapshot, cached_campaign_metrics(campaign["id"]))
 elif page == "Review Queue":
     _render_review_queue(campaign, active_leads)
 elif page == "Outreach":

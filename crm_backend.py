@@ -628,6 +628,82 @@ def postgres_load_lead_metrics(campaign_id: str) -> dict[str, int]:
     }
 
 
+def postgres_load_dashboard_snapshot(campaign_id: str, today_iso: str) -> dict[str, Any]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select status, count(*) as count
+            from leads
+            where campaign_id = %s
+            group by status
+            """,
+            (campaign_id,),
+        )
+        status_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            select lead_id, coalesce(payload ->> 'Unternehmen', '') as company
+            from leads
+            where campaign_id = %s
+              and coalesce(payload ->> 'Website_Category', '') <> ''
+              and (
+                    coalesce(payload ->> 'Analyzed_At', '') = ''
+                    or coalesce(payload ->> 'Draft_Stale', '0') = '1'
+                  )
+              and status not in ('done', 'won', 'lost', 'blacklist')
+            order by priority asc, lead_id asc
+            """,
+            (campaign_id,),
+        )
+        pending_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            select lead_id,
+                   coalesce(payload ->> 'Unternehmen', '') as company,
+                   priority,
+                   next_action_date,
+                   coalesce(payload ->> 'Next_Action_Type', '') as next_action_type
+            from leads
+            where campaign_id = %s
+              and status not in ('done', 'won', 'lost', 'blacklist')
+              and status <> 'no_contact'
+              and coalesce(scheduled_send_status, '') <> 'queued'
+              and coalesce(payload ->> 'Next_Action_Type', '') not in ('none', '')
+              and (next_action_date is null or next_action_date <= %s)
+            order by priority asc, next_action_date asc nulls first, lead_id asc
+            """,
+            (campaign_id, today_iso),
+        )
+        actionable_rows = cur.fetchall()
+
+    status_counts = {str(row.get("status") or "new"): int(row.get("count") or 0) for row in status_rows}
+    actionable = [
+        {
+            "ID": row.get("lead_id") or "",
+            "Unternehmen": row.get("company") or "",
+            "Priority": str(row.get("priority") or 5),
+            "Next_Action_Date": row.get("next_action_date").isoformat() if row.get("next_action_date") else "",
+            "Next_Action_Type": row.get("next_action_type") or "",
+        }
+        for row in actionable_rows
+    ]
+    pending_drafts = [
+        {
+            "ID": row.get("lead_id") or "",
+            "Unternehmen": row.get("company") or "",
+        }
+        for row in pending_rows
+    ]
+    return {
+        "status_counts": status_counts,
+        "pending_drafts": pending_drafts,
+        "actionable": actionable,
+    }
+
+
 def postgres_save_leads(campaign_id: str, leads: list[dict[str, Any]]) -> None:
     ensure_postgres_ready()
     _, _, Jsonb = _load_psycopg()
