@@ -11,7 +11,7 @@ import subprocess
 import urllib.parse
 from copy import deepcopy
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -59,7 +59,7 @@ from crm_templates import (
     parse_email_draft,
 )
 from crm_schedule import clear_scheduled_send, queue_scheduled_email, scheduled_send_label
-from crm_tracker import check_and_archive_stale, log_contact, parse_contact_log
+from crm_tracker import ARCHIVE_AFTER_DAYS, check_and_archive_stale, log_contact, parse_contact_log
 
 
 st.set_page_config(
@@ -79,6 +79,7 @@ STATUS_EMOJI = {
     "won": "🏆", "lost": "❌", "done": "🏁", "no_contact": "👻", "blacklist": "🚫",
 }
 ALL_LEADS_PAGE_SIZE_OPTIONS = [10, 25, 50]
+REVIEW_QUEUE_PAGE_SIZE = 100
 
 
 def _clear_cached_result(cache_func, *args) -> None:
@@ -91,12 +92,20 @@ def _clear_cached_result(cache_func, *args) -> None:
 def invalidate_lead_cache(campaign_id: str) -> None:
     if campaign_id:
         _clear_cached_result(cached_leads, campaign_id)
+        _clear_cached_result(cached_lead)
         _clear_cached_result(cached_campaign_metrics, campaign_id)
         _clear_cached_result(cached_dashboard_snapshot, campaign_id)
+        _clear_cached_result(cached_review_queue)
+        _clear_cached_result(cached_outreach_leads, campaign_id)
+        _clear_cached_result(cached_recontact_leads, campaign_id)
         return
     _clear_cached_result(cached_leads)
+    _clear_cached_result(cached_lead)
     _clear_cached_result(cached_campaign_metrics)
     _clear_cached_result(cached_dashboard_snapshot)
+    _clear_cached_result(cached_review_queue)
+    _clear_cached_result(cached_outreach_leads)
+    _clear_cached_result(cached_recontact_leads)
 
 
 def invalidate_campaign_cache(campaign_id: str = "") -> None:
@@ -137,6 +146,12 @@ def cached_active_campaign() -> dict:
 def cached_leads(campaign_id: str) -> list[dict]:
     campaign = cached_campaign(campaign_id)
     return load_leads(campaign=campaign)
+
+
+@st.cache_data(ttl=300)
+def cached_lead(campaign_id: str, lead_id: str) -> dict | None:
+    campaign = cached_campaign(campaign_id)
+    return get_lead_by_id(lead_id, campaign=campaign)
 
 
 @st.cache_data(ttl=300)
@@ -188,6 +203,73 @@ def cached_dashboard_snapshot(campaign_id: str) -> dict:
             and (not lead.get("Next_Action_Date") or lead.get("Next_Action_Date") <= today)
         ],
     }
+
+
+@st.cache_data(ttl=300)
+def cached_review_queue(campaign_id: str, page: int, page_size: int) -> dict:
+    if backend.is_postgres_backend():
+        queue_loader = getattr(backend, "postgres_load_review_queue_summary", None)
+        if callable(queue_loader):
+            offset = max(0, (page - 1) * page_size)
+            rows = queue_loader(campaign_id, limit=page_size + 1, offset=offset)
+            return {
+                "items": rows[:page_size],
+                "has_more": len(rows) > page_size,
+            }
+
+    queue = [
+        {
+            "ID": lead.get("ID", ""),
+            "Unternehmen": lead.get("Unternehmen", ""),
+            "Priority": lead.get("Priority", "5"),
+            "Analyzed_At": lead.get("Analyzed_At", ""),
+            "Research_Stale": lead.get("Research_Stale", "0"),
+        }
+        for lead in cached_leads(campaign_id)
+        if lead.get("Status") == "draft_ready" and lead.get("Draft_Stale") != "1"
+    ]
+    queue.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Analyzed_At") or "", lead.get("ID") or ""))
+    offset = max(0, (page - 1) * page_size)
+    page_rows = queue[offset:offset + page_size + 1]
+    return {
+        "items": page_rows[:page_size],
+        "has_more": len(page_rows) > page_size,
+    }
+
+
+@st.cache_data(ttl=300)
+def cached_outreach_leads(campaign_id: str) -> list[dict]:
+    if backend.is_postgres_backend():
+        lead_loader = getattr(backend, "postgres_load_outreach_leads", None)
+        if callable(lead_loader):
+            return lead_loader(campaign_id)
+
+    leads = cached_leads(campaign_id)
+    approved = [
+        lead for lead in leads
+        if lead.get("Status") == "approved"
+        and lead.get("Drafts_Approved") == "1"
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+    ]
+    approved.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Unternehmen") or ""))
+    return approved
+
+
+@st.cache_data(ttl=300)
+def cached_recontact_leads(campaign_id: str) -> list[dict]:
+    if backend.is_postgres_backend():
+        lead_loader = getattr(backend, "postgres_load_recontact_leads", None)
+        if callable(lead_loader):
+            return lead_loader(campaign_id)
+
+    leads = cached_leads(campaign_id)
+    return [
+        lead for lead in leads
+        if lead.get("Status") not in TERMINAL_STATUSES
+        and _has_contact_history(lead)
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+        and lead.get("Status") != "approved"
+    ]
 
 
 @st.cache_data(ttl=300)
@@ -1066,10 +1148,18 @@ def _render_dashboard(campaign: dict, dashboard_snapshot: dict, metrics: dict[st
         col.metric(f"{icon} {status.replace('_', ' ').title()}", counts.get(status, 0))
 
 
-def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
+def _render_review_queue(campaign: dict) -> None:
     st.title("Review Queue")
-    queue = [lead for lead in leads if lead.get("Status") == "draft_ready" and lead.get("Draft_Stale") != "1"]
-    queue.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Analyzed_At") or ""))
+    page_key = _campaign_state_key(campaign, "review_queue_page")
+    current_page = max(1, int(st.session_state.get(page_key, 1) or 1))
+    queue_page = cached_review_queue(campaign["id"], current_page, REVIEW_QUEUE_PAGE_SIZE)
+    queue = list(queue_page.get("items") or [])
+    has_more = bool(queue_page.get("has_more"))
+
+    if not queue and current_page > 1:
+        st.session_state[page_key] = current_page - 1
+        reload()
+        return
 
     if not queue:
         st.success("No drafts waiting for review.")
@@ -1077,7 +1167,7 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
 
     stale_research = sum(1 for lead in queue if lead.get("Research_Stale") == "1")
     if stale_research:
-        st.warning(f"{stale_research} lead(s) in this queue still use stale research data.")
+        st.warning(f"{stale_research} lead(s) on this page still use stale research data.")
 
     skipped_key = _campaign_state_key(campaign, "review_queue_skipped")
     selected_key = _campaign_state_key(campaign, "review_queue_selected")
@@ -1088,8 +1178,17 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
     skipped_ids = set(st.session_state.get(skipped_key, []))
     visible_queue = [lead for lead in queue if lead.get("ID") not in skipped_ids]
 
+    nav_prev, nav_info, nav_next = st.columns([1, 2, 1])
+    if nav_prev.button("Prev Page", key=f"review_prev_{campaign['id']}", disabled=current_page <= 1):
+        st.session_state[page_key] = current_page - 1
+        reload()
+    nav_info.info(f"Review page {current_page} | showing up to {REVIEW_QUEUE_PAGE_SIZE} draft(s)")
+    if nav_next.button("Next Page", key=f"review_next_{campaign['id']}", disabled=not has_more):
+        st.session_state[page_key] = current_page + 1
+        reload()
+
     info_col, action_col = st.columns([4, 1])
-    info_col.info(f"{len(queue)} draft(s) waiting for review")
+    info_col.info(f"{len(queue)} draft(s) ready on this page")
     if skipped_ids and action_col.button("Restore Skipped", key=f"restore_skipped_{campaign['id']}"):
         st.session_state[skipped_key] = []
         st.session_state[selected_key] = queue[0].get("ID", "")
@@ -1117,7 +1216,10 @@ def _render_review_queue(campaign: dict, leads: list[dict]) -> None:
     )
     if selected_id != st.session_state.get(selected_key):
         st.session_state[selected_key] = selected_id
-    selected = next(lead for lead in visible_queue if lead.get("ID") == selected_id)
+    selected = cached_lead(campaign["id"], selected_id)
+    if selected is None:
+        st.error("The selected lead could not be loaded.")
+        return
     lid = selected.get("ID", "?")
     company = selected.get("Unternehmen", "")
     website = selected.get("Website", "")
@@ -1728,16 +1830,22 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
     _render_campaign_template_editor(campaign)
 
 
-def _prepare_active_leads(campaign: dict) -> list[dict]:
-    leads = cached_leads(campaign["id"])
+def _ensure_stale_contacts_archived(campaign: dict) -> None:
     archive_key = f"archived_stale_{campaign['id']}"
     if archive_key not in st.session_state:
-        updated, archived = check_and_archive_stale([dict(lead) for lead in leads])
-        if archived:
-            save_leads(updated, campaign=campaign)
-            reload(campaign_id=campaign["id"])
+        if backend.is_postgres_backend():
+            archive_loader = getattr(backend, "postgres_archive_stale_contacted_leads", None)
+            cutoff = (date.today() - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat()
+            archived = archive_loader(campaign["id"], cutoff) if callable(archive_loader) else 0
+            if archived:
+                reload(campaign_id=campaign["id"])
+        else:
+            leads = cached_leads(campaign["id"])
+            updated, archived = check_and_archive_stale([dict(lead) for lead in leads])
+            if archived:
+                save_leads(updated, campaign=campaign)
+                reload(campaign_id=campaign["id"])
         st.session_state[archive_key] = True
-    return leads
 
 
 campaign = _active_campaign_switch()
@@ -1746,7 +1854,6 @@ page = st.sidebar.radio(
     ["Campaigns", "Dashboard", "Review Queue", "Outreach", "Re-contact", "All Leads"],
     label_visibility="collapsed",
 )
-active_leads: list[dict] = []
 dashboard_snapshot: dict = {}
 
 if page == "Campaigns":
@@ -1754,15 +1861,15 @@ if page == "Campaigns":
 elif page == "Dashboard":
     dashboard_snapshot = cached_dashboard_snapshot(campaign["id"])
 else:
-    active_leads = _prepare_active_leads(campaign)
+    _ensure_stale_contacts_archived(campaign)
 
 if page == "Dashboard":
     _render_dashboard(campaign, dashboard_snapshot, cached_campaign_metrics(campaign["id"]))
 elif page == "Review Queue":
-    _render_review_queue(campaign, active_leads)
+    _render_review_queue(campaign)
 elif page == "Outreach":
-    _render_outreach(campaign, active_leads)
+    _render_outreach(campaign, cached_outreach_leads(campaign["id"]))
 elif page == "Re-contact":
-    _render_recontact(campaign, active_leads)
+    _render_recontact(campaign, cached_recontact_leads(campaign["id"]))
 else:
-    _render_all_leads(campaign, active_leads)
+    _render_all_leads(campaign, cached_leads(campaign["id"]))

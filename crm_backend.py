@@ -560,42 +560,140 @@ def _postgres_upsert_lead_row(cur: Any, campaign_id: str, lead: dict[str, Any], 
     _sync_scheduled_send_row(cur, campaign_id, lead)
 
 
-def postgres_load_leads(campaign_id: str) -> list[dict[str, Any]]:
+def _lead_row_to_payload(row: dict[str, Any], *, include_campaign_id: bool = False) -> dict[str, Any]:
+    payload = dict(row.get("payload") or {})
+    for column in ALL_COLUMNS:
+        payload.setdefault(column, "")
+    payload["ID"] = row.get("lead_id") or payload.get("ID", "")
+    payload["Status"] = row.get("status") or payload.get("Status", "new")
+    priority = row.get("priority")
+    payload["Priority"] = str(priority if priority is not None else payload.get("Priority", "5"))
+    payload["Next_Action_Date"] = (
+        row.get("next_action_date").isoformat()
+        if row.get("next_action_date")
+        else payload.get("Next_Action_Date", "")
+    )
+    payload["Scheduled_Send_At"] = (
+        row.get("scheduled_send_at").isoformat()
+        if row.get("scheduled_send_at")
+        else payload.get("Scheduled_Send_At", "")
+    )
+    payload["Scheduled_Send_Channel"] = row.get("scheduled_send_channel") or payload.get("Scheduled_Send_Channel", "")
+    payload["Scheduled_Send_Status"] = row.get("scheduled_send_status") or payload.get("Scheduled_Send_Status", "")
+    payload["Scheduled_Send_Error"] = row.get("scheduled_send_error") or payload.get("Scheduled_Send_Error", "")
+    payload["Scheduled_Send_Attempts"] = str(
+        row.get("scheduled_send_attempts") or payload.get("Scheduled_Send_Attempts") or "0"
+    )
+    payload["Approved_At"] = row.get("approved_at").isoformat() if row.get("approved_at") else payload.get("Approved_At", "")
+    payload["Sent_At"] = row.get("sent_at").isoformat() if row.get("sent_at") else payload.get("Sent_At", "")
+    payload["SMTP_Message_ID"] = row.get("smtp_message_id") or payload.get("SMTP_Message_ID", "")
+    if include_campaign_id:
+        payload["Campaign_ID"] = row.get("campaign_id") or ""
+    return payload
+
+
+def _postgres_load_full_lead_rows(campaign_id: str, where_sql: str = "", params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     ensure_postgres_ready()
+    query = """
+        select lead_id, payload, status, priority, next_action_date, scheduled_send_at,
+               scheduled_send_channel, scheduled_send_status, scheduled_send_error,
+               scheduled_send_attempts, approved_at, sent_at, smtp_message_id
+        from leads
+        where campaign_id = %s
+    """
+    if where_sql:
+        query += f"\n          and {where_sql}"
+    query += "\n        order by lead_id"
     with postgres_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            select lead_id, payload, status, priority, next_action_date, scheduled_send_at,
-                   scheduled_send_channel, scheduled_send_status, scheduled_send_error,
-                   scheduled_send_attempts, approved_at, sent_at, smtp_message_id
-            from leads
-            where campaign_id = %s
-            order by lead_id
-            """,
-            (campaign_id,),
-        )
-        rows = cur.fetchall()
-    leads: list[dict[str, Any]] = []
-    for row in rows:
-        payload = dict(row.get("payload") or {})
-        for column in ALL_COLUMNS:
-            payload.setdefault(column, "")
-        payload["ID"] = row.get("lead_id") or payload.get("ID", "")
-        payload["Status"] = row.get("status") or payload.get("Status", "new")
-        priority = row.get("priority")
-        payload["Priority"] = str(priority if priority is not None else payload.get("Priority", "5"))
-        payload["Next_Action_Date"] = row.get("next_action_date").isoformat() if row.get("next_action_date") else payload.get("Next_Action_Date", "")
-        payload["Scheduled_Send_At"] = row.get("scheduled_send_at").isoformat() if row.get("scheduled_send_at") else payload.get("Scheduled_Send_At", "")
-        payload["Scheduled_Send_Channel"] = row.get("scheduled_send_channel") or payload.get("Scheduled_Send_Channel", "")
-        payload["Scheduled_Send_Status"] = row.get("scheduled_send_status") or payload.get("Scheduled_Send_Status", "")
-        payload["Scheduled_Send_Error"] = row.get("scheduled_send_error") or payload.get("Scheduled_Send_Error", "")
-        payload["Scheduled_Send_Attempts"] = str(row.get("scheduled_send_attempts") or payload.get("Scheduled_Send_Attempts") or "0")
-        payload["Approved_At"] = row.get("approved_at").isoformat() if row.get("approved_at") else payload.get("Approved_At", "")
-        payload["Sent_At"] = row.get("sent_at").isoformat() if row.get("sent_at") else payload.get("Sent_At", "")
-        payload["SMTP_Message_ID"] = row.get("smtp_message_id") or payload.get("SMTP_Message_ID", "")
-        leads.append(payload)
+        cur.execute(query, (campaign_id, *params))
+        return cur.fetchall()
+
+
+def postgres_load_leads(campaign_id: str) -> list[dict[str, Any]]:
+    rows = _postgres_load_full_lead_rows(campaign_id)
+    leads = [_lead_row_to_payload(row) for row in rows]
     leads.sort(key=_lead_sort_key)
     return leads
+
+
+def postgres_load_review_queue_summary(
+    campaign_id: str,
+    *,
+    limit: int = 0,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    ensure_postgres_ready()
+    query = """
+        select lead_id,
+               coalesce(payload ->> 'Unternehmen', '') as company,
+               priority,
+               coalesce(payload ->> 'Analyzed_At', '') as analyzed_at,
+               coalesce(payload ->> 'Research_Stale', '0') as research_stale
+        from leads
+        where campaign_id = %s
+          and status = 'draft_ready'
+          and coalesce(payload ->> 'Draft_Stale', '0') <> '1'
+        order by priority asc, analyzed_at asc, lead_id asc
+    """
+    params: list[Any] = [campaign_id]
+    if limit > 0:
+        query += "\n        limit %s"
+        params.append(limit)
+    if offset > 0:
+        query += "\n        offset %s"
+        params.append(offset)
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+    return [
+        {
+            "ID": row.get("lead_id") or "",
+            "Unternehmen": row.get("company") or "",
+            "Priority": str(row.get("priority") or 5),
+            "Analyzed_At": row.get("analyzed_at") or "",
+            "Research_Stale": row.get("research_stale") or "0",
+        }
+        for row in rows
+    ]
+
+
+def postgres_load_outreach_leads(campaign_id: str) -> list[dict[str, Any]]:
+    rows = _postgres_load_full_lead_rows(
+        campaign_id,
+        where_sql="""
+            status = 'approved'
+            and coalesce(payload ->> 'Drafts_Approved', '0') = '1'
+            and (
+                coalesce(payload ->> 'Email_Draft', '') <> ''
+                or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
+                or coalesce(payload ->> 'Phone_Script', '') <> ''
+            )
+        """,
+    )
+    leads = [_lead_row_to_payload(row) for row in rows]
+    leads.sort(key=lambda lead: (_safe_int(lead.get("Priority"), 5), lead.get("Unternehmen") or "", lead.get("ID") or ""))
+    return leads
+
+
+def postgres_load_recontact_leads(campaign_id: str) -> list[dict[str, Any]]:
+    rows = _postgres_load_full_lead_rows(
+        campaign_id,
+        where_sql="""
+            status not in ('won', 'lost', 'done', 'blacklist', 'approved')
+            and (
+                coalesce(payload ->> 'Kontaktdatum', '') <> ''
+                or coalesce(payload ->> 'Last_Contact_Date', '') <> ''
+                or coalesce(payload ->> 'Contact_Log', '') <> ''
+                or coalesce(payload ->> 'Contact_Count', '0') <> '0'
+            )
+            and (
+                coalesce(payload ->> 'Email_Draft', '') <> ''
+                or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
+                or coalesce(payload ->> 'Phone_Script', '') <> ''
+            )
+        """,
+    )
+    return [_lead_row_to_payload(row) for row in rows]
 
 
 def postgres_load_lead_metrics(campaign_id: str) -> dict[str, int]:
@@ -813,23 +911,44 @@ def postgres_get_lead_by_id(lead_id: str, campaign_id: str = "") -> dict[str, An
         row = cur.fetchone()
     if not row:
         return None
-    payload = dict(row.get("payload") or {})
-    payload["ID"] = row.get("lead_id") or payload.get("ID", "")
-    payload["Campaign_ID"] = row.get("campaign_id") or ""
-    payload["Status"] = row.get("status") or payload.get("Status", "new")
-    payload["Priority"] = str(row.get("priority") or payload.get("Priority") or "5")
-    payload["Next_Action_Date"] = row.get("next_action_date").isoformat() if row.get("next_action_date") else payload.get("Next_Action_Date", "")
-    payload["Scheduled_Send_At"] = row.get("scheduled_send_at").isoformat() if row.get("scheduled_send_at") else payload.get("Scheduled_Send_At", "")
-    payload["Scheduled_Send_Channel"] = row.get("scheduled_send_channel") or payload.get("Scheduled_Send_Channel", "")
-    payload["Scheduled_Send_Status"] = row.get("scheduled_send_status") or payload.get("Scheduled_Send_Status", "")
-    payload["Scheduled_Send_Error"] = row.get("scheduled_send_error") or payload.get("Scheduled_Send_Error", "")
-    payload["Scheduled_Send_Attempts"] = str(row.get("scheduled_send_attempts") or payload.get("Scheduled_Send_Attempts") or "0")
-    payload["Approved_At"] = row.get("approved_at").isoformat() if row.get("approved_at") else payload.get("Approved_At", "")
-    payload["Sent_At"] = row.get("sent_at").isoformat() if row.get("sent_at") else payload.get("Sent_At", "")
-    payload["SMTP_Message_ID"] = row.get("smtp_message_id") or payload.get("SMTP_Message_ID", "")
-    for column in ALL_COLUMNS:
-        payload.setdefault(column, "")
-    return payload
+    return _lead_row_to_payload(row, include_campaign_id=True)
+
+
+def postgres_archive_stale_contacted_leads(campaign_id: str, cutoff_date_iso: str) -> int:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            with archived as (
+                update leads
+                set status = 'no_contact',
+                    next_action_date = null,
+                    payload = jsonb_set(
+                        jsonb_set(
+                            jsonb_set(payload, '{Status}', to_jsonb('no_contact'::text), true),
+                            '{Next_Action_Type}',
+                            to_jsonb('none'::text),
+                            true
+                        ),
+                        '{Next_Action_Date}',
+                        to_jsonb(''::text),
+                        true
+                    ),
+                    updated_at = now()
+                where campaign_id = %s
+                  and status = 'contacted'
+                  and coalesce(payload ->> 'Contact_Count', '0') ~ '^[0-9]+$'
+                  and (payload ->> 'Contact_Count')::integer >= 3
+                  and coalesce(payload ->> 'Last_Contact_Date', '') ~ '^\\d{4}-\\d{2}-\\d{2}$'
+                  and (payload ->> 'Last_Contact_Date')::date <= %s::date
+                returning 1
+            )
+            select count(*) as count from archived
+            """,
+            (campaign_id, cutoff_date_iso),
+        )
+        row = cur.fetchone() or {}
+    return int(row.get("count") or 0)
 
 
 def postgres_record_contact_event(
