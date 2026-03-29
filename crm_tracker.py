@@ -14,9 +14,7 @@ from crm_store import (
     default_preferred_channel,
     get_lead_by_id,
     load_leads,
-    save_lead,
     save_leads,
-    update_lead,
 )
 
 # Follow-up delays in days after each contact attempt
@@ -87,6 +85,51 @@ def append_contact_log(lead: dict, *, at: str, channel: str, outcome: str, notes
     lead["Contact_Log"] = format_contact_log(entries)
 
 
+def apply_contact_outcome(
+    lead: dict,
+    outcome: str,
+    *,
+    notes: str = "",
+    channel: str = "",
+    now: datetime | None = None,
+) -> dict[str, str]:
+    current_time = now or datetime.now()
+    today_str = current_time.date().isoformat()
+    timestamp = current_time.strftime("%Y-%m-%d %H:%M")
+    new_status = OUTCOME_STATUS.get(outcome, "contacted")
+
+    used_channel = channel or OUTCOME_CHANNEL.get(outcome, lead.get("Channel_Used", ""))
+    if outcome in ("sent", "called", "voicemail", "no_answer"):
+        count = int(lead.get("Contact_Count") or 0) + 1
+        lead["Contact_Count"] = str(count)
+        if not lead.get("Kontaktdatum"):
+            lead["Kontaktdatum"] = today_str
+        next_date, next_type = _calculate_next_action(lead, count, current_channel=used_channel)
+        lead["Next_Action_Date"] = next_date
+        lead["Next_Action_Type"] = next_type
+    else:
+        lead["Next_Action_Type"] = "none"
+        lead["Next_Action_Date"] = ""
+
+    lead["Status"] = new_status
+    lead["Last_Contact_Date"] = today_str
+    lead["Channel_Used"] = used_channel
+    clear_scheduled_send(lead)
+    append_contact_log(lead, at=timestamp, channel=used_channel, outcome=outcome, notes=notes)
+
+    if notes:
+        existing = lead.get("Notes", "")
+        sep = " | " if existing else ""
+        lead["Notes"] = f"{existing}{sep}[{today_str}] {notes}"
+
+    return {
+        "occurred_at": timestamp,
+        "channel": used_channel,
+        "outcome": outcome,
+        "notes": notes,
+    }
+
+
 def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "", campaign: dict | None = None) -> None:
     """
     Log a contact attempt and update the lead state accordingly.
@@ -107,65 +150,24 @@ def log_contact(lead_id: str, outcome: str, notes: str = "", channel: str = "", 
         print(f"Lead {lead_id} not found.")
         return
 
-    now = datetime.now()
-    today_str = now.date().isoformat()
-    timestamp = now.strftime("%Y-%m-%d %H:%M")
-    new_status = OUTCOME_STATUS.get(outcome, "contacted")
-
-    # Infer channel if not provided
-    used_channel = channel or OUTCOME_CHANNEL.get(outcome, lead.get("Channel_Used", ""))
-
-    # Increment contact count for outreach attempts
-    if outcome in ("sent", "called", "voicemail", "no_answer"):
-        count = int(lead.get("Contact_Count") or 0) + 1
-        lead["Contact_Count"] = str(count)
-
-        # Set Kontaktdatum on first contact
-        if not lead.get("Kontaktdatum"):
-            lead["Kontaktdatum"] = today_str
-
-        # Schedule next follow-up
-        next_date, next_type = _calculate_next_action(lead, count, current_channel=used_channel)
-        lead["Next_Action_Date"] = next_date
-        lead["Next_Action_Type"] = next_type
-    else:
-        # Terminal or replied — no more automatic scheduling
-        lead["Next_Action_Type"] = "none"
-        lead["Next_Action_Date"] = ""
-
-    lead["Status"] = new_status
-    lead["Last_Contact_Date"] = today_str
-    lead["Channel_Used"] = used_channel
-    clear_scheduled_send(lead)
-    append_contact_log(lead, at=timestamp, channel=used_channel, outcome=outcome, notes=notes)
-
-    # Append notes
-    if notes:
-        existing = lead.get("Notes", "")
-        sep = " | " if existing else ""
-        lead["Notes"] = f"{existing}{sep}[{today_str}] {notes}"
+    event = apply_contact_outcome(lead, outcome, notes=notes, channel=channel)
 
     if backend.is_postgres_backend():
-        save_lead(lead, campaign=campaign)
+        active_campaign = campaign
+        if active_campaign is None:
+            try:
+                from campaign_service import get_active_campaign
+                active_campaign = get_active_campaign()
+            except Exception:
+                active_campaign = None
+        if active_campaign is not None:
+            backend.postgres_persist_outreach_lead(active_campaign.get("id", ""), lead, contact_event=event)
     else:
         save_leads(leads or [], campaign=campaign)
-    active_campaign = campaign
-    if active_campaign is None:
-        try:
-            from campaign_service import get_active_campaign
-            active_campaign = get_active_campaign()
-        except Exception:
-            active_campaign = None
-    if backend.is_postgres_backend() and active_campaign is not None:
-        backend.postgres_record_contact_event(
-            active_campaign.get("id", ""),
-            lead_id,
-            occurred_at=timestamp,
-            channel=used_channel,
-            outcome=outcome,
-            notes=notes,
-        )
-    print(f"Logged: {lead_id} → {new_status} | next: {lead.get('Next_Action_Type', '-')} on {lead.get('Next_Action_Date', '-')}")
+    print(
+        f"Logged: {lead_id} → {lead.get('Status', '-')}"
+        f" | next: {lead.get('Next_Action_Type', '-')} on {lead.get('Next_Action_Date', '-')}"
+    )
 
 
 def _calculate_next_action(lead: dict, contact_count: int, current_channel: str = "") -> tuple[str, str]:

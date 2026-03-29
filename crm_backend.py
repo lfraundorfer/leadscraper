@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import atexit
 import threading
 from contextlib import contextmanager
 from datetime import datetime
@@ -24,7 +25,11 @@ REGISTRY_PATH = CAMPAIGNS_DIR / "registry.json"
 _POSTGRES_BOOTSTRAP_CHECKED = False
 _POSTGRES_SCHEMA_READY = False
 _POSTGRES_STATE_LOCK = threading.RLock()
-_POSTGRES_LOCAL = threading.local()
+_POSTGRES_POOL_COND = threading.Condition(_POSTGRES_STATE_LOCK)
+_POSTGRES_POOL: list[Any] = []
+_POSTGRES_POOL_SIZE = 0
+_POSTGRES_POOL_URL = ""
+POSTGRES_SCHEMA_VERSION = 1
 
 CAMPAIGN_COLUMNS = [
     "id",
@@ -85,6 +90,23 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _app_meta_value(row: dict[str, Any] | None) -> Any:
+    if not row:
+        return None
+    value = row.get("value_json")
+    if isinstance(value, dict):
+        return value.get("value")
+    return value
+
+
+def _app_meta_int(row: dict[str, Any] | None, default: int = 0) -> int:
+    value = _app_meta_value(row)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _load_psycopg():
     try:
         import psycopg
@@ -104,46 +126,113 @@ def _database_url() -> str:
     return url
 
 
-def _clear_thread_postgres_connection() -> None:
-    conn = getattr(_POSTGRES_LOCAL, "connection", None)
-    if conn is None:
-        return
+def _postgres_pool_max_size() -> int:
+    raw = (os.getenv("CRM_POSTGRES_POOL_SIZE") or "").strip()
+    if not raw:
+        return 3
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
+
+
+def _close_postgres_connection(conn: Any) -> None:
     try:
         conn.close()
     except Exception:
         pass
-    _POSTGRES_LOCAL.connection = None
-    _POSTGRES_LOCAL.database_url = ""
 
 
-def _thread_postgres_connection() -> Any:
+def _reset_postgres_pool_locked() -> None:
+    global _POSTGRES_POOL_SIZE, _POSTGRES_POOL_URL
+    while _POSTGRES_POOL:
+        _close_postgres_connection(_POSTGRES_POOL.pop())
+    _POSTGRES_POOL_SIZE = 0
+    _POSTGRES_POOL_URL = ""
+
+
+def _acquire_postgres_connection() -> tuple[Any, str]:
+    global _POSTGRES_POOL_SIZE, _POSTGRES_POOL_URL
+
     database_url = _database_url()
-    conn = getattr(_POSTGRES_LOCAL, "connection", None)
-    current_url = getattr(_POSTGRES_LOCAL, "database_url", "")
-    if conn is not None and current_url == database_url and not getattr(conn, "closed", False):
-        return conn
-
-    _clear_thread_postgres_connection()
     psycopg, dict_row, _ = _load_psycopg()
-    conn = psycopg.connect(database_url, row_factory=dict_row)
-    _POSTGRES_LOCAL.connection = conn
-    _POSTGRES_LOCAL.database_url = database_url
-    return conn
+    with _POSTGRES_POOL_COND:
+        if _POSTGRES_POOL_URL and _POSTGRES_POOL_URL != database_url:
+            _reset_postgres_pool_locked()
+        _POSTGRES_POOL_URL = database_url
+
+        while True:
+            while _POSTGRES_POOL:
+                conn = _POSTGRES_POOL.pop()
+                if getattr(conn, "closed", False):
+                    _POSTGRES_POOL_SIZE = max(0, _POSTGRES_POOL_SIZE - 1)
+                    continue
+                return conn, database_url
+
+            if _POSTGRES_POOL_SIZE < _postgres_pool_max_size():
+                _POSTGRES_POOL_SIZE += 1
+                break
+
+            _POSTGRES_POOL_COND.wait(timeout=5.0)
+
+    try:
+        conn = psycopg.connect(database_url, row_factory=dict_row)
+    except Exception:
+        with _POSTGRES_POOL_COND:
+            _POSTGRES_POOL_SIZE = max(0, _POSTGRES_POOL_SIZE - 1)
+            _POSTGRES_POOL_COND.notify()
+        raise
+    return conn, database_url
+
+
+def _release_postgres_connection(conn: Any, database_url: str, *, discard: bool = False) -> None:
+    global _POSTGRES_POOL_SIZE
+
+    if discard or getattr(conn, "closed", False):
+        _close_postgres_connection(conn)
+        with _POSTGRES_POOL_COND:
+            _POSTGRES_POOL_SIZE = max(0, _POSTGRES_POOL_SIZE - 1)
+            _POSTGRES_POOL_COND.notify()
+        return
+
+    with _POSTGRES_POOL_COND:
+        if _POSTGRES_POOL_URL != database_url or len(_POSTGRES_POOL) >= _postgres_pool_max_size():
+            _POSTGRES_POOL_SIZE = max(0, _POSTGRES_POOL_SIZE - 1)
+            _POSTGRES_POOL_COND.notify()
+            should_close = True
+        else:
+            _POSTGRES_POOL.append(conn)
+            _POSTGRES_POOL_COND.notify()
+            should_close = False
+
+    if should_close:
+        _close_postgres_connection(conn)
+
+
+def _reset_postgres_pool() -> None:
+    with _POSTGRES_POOL_COND:
+        _reset_postgres_pool_locked()
+
+
+atexit.register(_reset_postgres_pool)
 
 
 @contextmanager
 def postgres_connection() -> Iterator[Any]:
-    conn = _thread_postgres_connection()
+    conn, database_url = _acquire_postgres_connection()
+    discard = False
     try:
         yield conn
         conn.commit()
     except Exception:
+        discard = True
         try:
             conn.rollback()
         except Exception:
-            pass
-        _clear_thread_postgres_connection()
+            discard = True
         raise
+    finally:
+        _release_postgres_connection(conn, database_url, discard=discard)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -208,6 +297,19 @@ def _campaign_defaults(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _upsert_app_meta_value(cur: Any, key: str, value: Any, Jsonb: Any) -> None:
+    cur.execute(
+        """
+        insert into app_meta (key, value_json, updated_at)
+        values (%s, %s, now())
+        on conflict (key) do update
+        set value_json = excluded.value_json,
+            updated_at = now()
+        """,
+        (key, Jsonb({"value": value})),
+    )
+
+
 def ensure_postgres_schema() -> None:
     global _POSTGRES_SCHEMA_READY
     if _POSTGRES_SCHEMA_READY:
@@ -216,6 +318,7 @@ def ensure_postgres_schema() -> None:
     with _POSTGRES_STATE_LOCK:
         if _POSTGRES_SCHEMA_READY:
             return
+        _, _, Jsonb = _load_psycopg()
         with postgres_connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -226,104 +329,108 @@ def ensure_postgres_schema() -> None:
                 )
                 """
             )
-            cur.execute(
-                """
-                create table if not exists campaigns (
-                    id text primary key,
-                    label text not null default '',
-                    keyword text not null default '',
-                    location text not null default '',
-                    id_prefix text not null default '',
-                    rank_keyword_template text not null default '{keyword} {plz}',
-                    price_default text not null default '',
-                    price_monthly text not null default '',
-                    turnaround_days integer not null default 14,
-                    sender_name text not null default '',
-                    sender_company text not null default '',
-                    sender_website text not null default '',
-                    sender_phone text not null default '',
-                    sender_email text not null default '',
-                    offer_summary text not null default '',
-                    example_intro text not null default '',
-                    service_singular text not null default '',
-                    service_plural text not null default '',
-                    config_version integer not null default 1,
-                    draft_config_version integer not null default 1,
-                    research_config_version integer not null default 1,
-                    last_scraped_at text not null default '',
-                    last_migrated_at text not null default '',
-                    last_enriched_at text not null default '',
-                    last_researched_at text not null default '',
-                    last_analyzed_at text not null default '',
-                    csv_path text not null default '',
-                    hooks_library_json jsonb not null default '{}'::jsonb,
-                    template_overrides_json jsonb not null default '{}'::jsonb,
-                    created_at timestamptz not null default now(),
-                    updated_at timestamptz not null default now()
+            cur.execute("select value_json from app_meta where key = 'schema_version'")
+            current_version = _app_meta_int(cur.fetchone())
+            if current_version < POSTGRES_SCHEMA_VERSION:
+                cur.execute(
+                    """
+                    create table if not exists campaigns (
+                        id text primary key,
+                        label text not null default '',
+                        keyword text not null default '',
+                        location text not null default '',
+                        id_prefix text not null default '',
+                        rank_keyword_template text not null default '{keyword} {plz}',
+                        price_default text not null default '',
+                        price_monthly text not null default '',
+                        turnaround_days integer not null default 14,
+                        sender_name text not null default '',
+                        sender_company text not null default '',
+                        sender_website text not null default '',
+                        sender_phone text not null default '',
+                        sender_email text not null default '',
+                        offer_summary text not null default '',
+                        example_intro text not null default '',
+                        service_singular text not null default '',
+                        service_plural text not null default '',
+                        config_version integer not null default 1,
+                        draft_config_version integer not null default 1,
+                        research_config_version integer not null default 1,
+                        last_scraped_at text not null default '',
+                        last_migrated_at text not null default '',
+                        last_enriched_at text not null default '',
+                        last_researched_at text not null default '',
+                        last_analyzed_at text not null default '',
+                        csv_path text not null default '',
+                        hooks_library_json jsonb not null default '{}'::jsonb,
+                        template_overrides_json jsonb not null default '{}'::jsonb,
+                        created_at timestamptz not null default now(),
+                        updated_at timestamptz not null default now()
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                create table if not exists leads (
-                    campaign_id text not null references campaigns(id) on delete cascade,
-                    lead_id text not null,
-                    payload jsonb not null default '{}'::jsonb,
-                    status text not null default 'new',
-                    priority integer not null default 5,
-                    next_action_date date,
-                    scheduled_send_at timestamptz,
-                    scheduled_send_channel text not null default '',
-                    scheduled_send_status text not null default '',
-                    scheduled_send_error text not null default '',
-                    scheduled_send_attempts integer not null default 0,
-                    approved_at timestamptz,
-                    sent_at timestamptz,
-                    smtp_message_id text not null default '',
-                    created_at timestamptz not null default now(),
-                    updated_at timestamptz not null default now(),
-                    primary key (campaign_id, lead_id)
+                cur.execute(
+                    """
+                    create table if not exists leads (
+                        campaign_id text not null references campaigns(id) on delete cascade,
+                        lead_id text not null,
+                        payload jsonb not null default '{}'::jsonb,
+                        status text not null default 'new',
+                        priority integer not null default 5,
+                        next_action_date date,
+                        scheduled_send_at timestamptz,
+                        scheduled_send_channel text not null default '',
+                        scheduled_send_status text not null default '',
+                        scheduled_send_error text not null default '',
+                        scheduled_send_attempts integer not null default 0,
+                        approved_at timestamptz,
+                        sent_at timestamptz,
+                        smtp_message_id text not null default '',
+                        created_at timestamptz not null default now(),
+                        updated_at timestamptz not null default now(),
+                        primary key (campaign_id, lead_id)
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                create table if not exists contact_events (
-                    id bigserial primary key,
-                    campaign_id text not null references campaigns(id) on delete cascade,
-                    lead_id text not null,
-                    occurred_at timestamptz not null default now(),
-                    channel text not null default '',
-                    outcome text not null default '',
-                    notes text not null default ''
+                cur.execute(
+                    """
+                    create table if not exists contact_events (
+                        id bigserial primary key,
+                        campaign_id text not null references campaigns(id) on delete cascade,
+                        lead_id text not null,
+                        occurred_at timestamptz not null default now(),
+                        channel text not null default '',
+                        outcome text not null default '',
+                        notes text not null default ''
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                create table if not exists scheduled_sends (
-                    campaign_id text not null references campaigns(id) on delete cascade,
-                    lead_id text not null,
-                    channel text not null default 'email',
-                    scheduled_at timestamptz not null,
-                    status text not null default 'queued',
-                    last_error text not null default '',
-                    attempts integer not null default 0,
-                    approved_at timestamptz,
-                    sent_at timestamptz,
-                    smtp_message_id text not null default '',
-                    created_at timestamptz not null default now(),
-                    updated_at timestamptz not null default now(),
-                    primary key (campaign_id, lead_id, channel)
+                cur.execute(
+                    """
+                    create table if not exists scheduled_sends (
+                        campaign_id text not null references campaigns(id) on delete cascade,
+                        lead_id text not null,
+                        channel text not null default 'email',
+                        scheduled_at timestamptz not null,
+                        status text not null default 'queued',
+                        last_error text not null default '',
+                        attempts integer not null default 0,
+                        approved_at timestamptz,
+                        sent_at timestamptz,
+                        smtp_message_id text not null default '',
+                        created_at timestamptz not null default now(),
+                        updated_at timestamptz not null default now(),
+                        primary key (campaign_id, lead_id, channel)
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute("create index if not exists idx_leads_campaign_status on leads (campaign_id, status)")
-            cur.execute("create index if not exists idx_leads_campaign_priority on leads (campaign_id, priority)")
-            cur.execute("create index if not exists idx_leads_campaign_next_action_date on leads (campaign_id, next_action_date)")
-            cur.execute("create index if not exists idx_leads_scheduled_status_at on leads (scheduled_send_status, scheduled_send_at)")
-            cur.execute("create index if not exists idx_scheduled_sends_status_at on scheduled_sends (status, scheduled_at)")
-            cur.execute("create index if not exists idx_contact_events_campaign_lead on contact_events (campaign_id, lead_id, occurred_at desc)")
+                cur.execute("create index if not exists idx_leads_campaign_status on leads (campaign_id, status)")
+                cur.execute("create index if not exists idx_leads_campaign_priority on leads (campaign_id, priority)")
+                cur.execute("create index if not exists idx_leads_campaign_next_action_date on leads (campaign_id, next_action_date)")
+                cur.execute("create index if not exists idx_leads_scheduled_status_at on leads (scheduled_send_status, scheduled_send_at)")
+                cur.execute("create index if not exists idx_scheduled_sends_status_at on scheduled_sends (status, scheduled_at)")
+                cur.execute("create index if not exists idx_contact_events_campaign_lead on contact_events (campaign_id, lead_id, occurred_at desc)")
+                _upsert_app_meta_value(cur, "schema_version", POSTGRES_SCHEMA_VERSION, Jsonb)
             _POSTGRES_SCHEMA_READY = True
 
 
@@ -372,31 +479,14 @@ def postgres_get_active_campaign_id() -> str:
     ensure_postgres_schema()
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute("select value_json from app_meta where key = 'active_campaign_id'")
-        row = cur.fetchone()
-        if not row:
-            return ""
-        value = row.get("value_json")
-        if isinstance(value, dict):
-            return str(value.get("value") or "").strip()
-        if isinstance(value, str):
-            return value.strip()
-        return str(value or "").strip()
+        return str(_app_meta_value(cur.fetchone()) or "").strip()
 
 
 def postgres_set_active_campaign_id(campaign_id: str) -> None:
     ensure_postgres_ready()
     _, _, Jsonb = _load_psycopg()
     with postgres_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into app_meta (key, value_json, updated_at)
-            values ('active_campaign_id', %s, now())
-            on conflict (key) do update
-            set value_json = excluded.value_json,
-                updated_at = now()
-            """,
-            (Jsonb({"value": campaign_id}),),
-        )
+        _upsert_app_meta_value(cur, "active_campaign_id", campaign_id, Jsonb)
 
 
 def _campaign_row_to_config(row: dict[str, Any]) -> dict[str, Any]:
@@ -675,6 +765,278 @@ def postgres_load_outreach_leads(campaign_id: str) -> list[dict[str, Any]]:
     return leads
 
 
+def postgres_load_outreach_summary(
+    campaign_id: str,
+    *,
+    search: str = "",
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, Any]:
+    ensure_postgres_ready()
+    search_text = (search or "").strip().lower()
+    page = max(1, int(page or 1))
+    page_size = max(1, int(page_size or 100))
+    offset = (page - 1) * page_size
+    where_sql = """
+        from leads
+        where campaign_id = %s
+          and status = 'approved'
+          and coalesce(payload ->> 'Drafts_Approved', '0') = '1'
+          and (
+                coalesce(payload ->> 'Email_Draft', '') <> ''
+                or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
+                or coalesce(payload ->> 'Phone_Script', '') <> ''
+              )
+    """
+    params: list[Any] = [campaign_id]
+    if search_text:
+        like_value = f"%{search_text}%"
+        where_sql += """
+          and (
+                lower(lead_id) like %s
+                or lower(coalesce(payload ->> 'Unternehmen', '')) like %s
+              )
+        """
+        params.extend([like_value, like_value])
+
+    query = f"""
+        select lead_id,
+               coalesce(payload ->> 'Unternehmen', '') as company,
+               status,
+               priority,
+               coalesce(payload ->> 'Draft_Stale', '0') as draft_stale,
+               coalesce(payload ->> 'Email', '') as email,
+               coalesce(payload ->> 'TelNr', '') as phone,
+               coalesce(payload ->> 'Preferred_Channel', '') as preferred_channel,
+               coalesce(payload ->> 'Next_Action_Type', '') as next_action_type,
+               coalesce(payload ->> 'Channel_Used', '') as channel_used,
+               coalesce(payload ->> 'Email_Draft', '') <> '' as has_email_draft,
+               scheduled_send_at,
+               scheduled_send_status,
+               scheduled_send_error,
+               sent_at
+        {where_sql}
+        order by priority asc, lead_id asc
+        limit %s
+        offset %s
+    """
+    count_query = f"select count(*) as count {where_sql}"
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(count_query, tuple(params))
+        count_row = cur.fetchone() or {}
+        cur.execute(query, tuple([*params, page_size, offset]))
+        rows = cur.fetchall()
+    items = [
+        {
+            "ID": row.get("lead_id") or "",
+            "Unternehmen": row.get("company") or "",
+            "Status": row.get("status") or "approved",
+            "Priority": str(row.get("priority") or 5),
+            "Draft_Stale": row.get("draft_stale") or "0",
+            "Email": row.get("email") or "",
+            "TelNr": row.get("phone") or "",
+            "Preferred_Channel": row.get("preferred_channel") or "",
+            "Next_Action_Type": row.get("next_action_type") or "",
+            "Channel_Used": row.get("channel_used") or "",
+            "Has_Email_Draft": bool(row.get("has_email_draft")),
+            "Scheduled_Send_At": row.get("scheduled_send_at").isoformat() if row.get("scheduled_send_at") else "",
+            "Scheduled_Send_Status": row.get("scheduled_send_status") or "",
+            "Scheduled_Send_Error": row.get("scheduled_send_error") or "",
+            "Sent_At": row.get("sent_at").isoformat() if row.get("sent_at") else "",
+        }
+        for row in rows
+    ]
+    return {
+        "items": items,
+        "total_count": int(count_row.get("count") or 0),
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+def postgres_load_outreach_counts(campaign_id: str, today_iso: str) -> dict[str, int]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            with approved as (
+                select scheduled_send_at, scheduled_send_status, scheduled_send_error
+                from leads
+                where campaign_id = %s
+                  and status = 'approved'
+                  and coalesce(payload ->> 'Drafts_Approved', '0') = '1'
+                  and (
+                        coalesce(payload ->> 'Email_Draft', '') <> ''
+                        or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
+                        or coalesce(payload ->> 'Phone_Script', '') <> ''
+                      )
+            )
+            select
+                count(*) as approved_total,
+                count(*) filter (
+                    where scheduled_send_status = 'queued'
+                      and scheduled_send_at is not null
+                      and timezone('Europe/Vienna', scheduled_send_at)::date = %s::date
+                ) as queued_today,
+                count(*) filter (
+                    where scheduled_send_status = 'queued'
+                      and (
+                            scheduled_send_at is null
+                            or timezone('Europe/Vienna', scheduled_send_at)::date <> %s::date
+                          )
+                ) as queued_later,
+                count(*) filter (where coalesce(scheduled_send_error, '') <> '') as send_errors,
+                (
+                    select count(*)
+                    from leads
+                    where campaign_id = %s
+                      and sent_at is not null
+                      and timezone('Europe/Vienna', sent_at)::date = %s::date
+                ) as sent_today
+            from approved
+            """,
+            (campaign_id, today_iso, today_iso, campaign_id, today_iso),
+        )
+        row = cur.fetchone() or {}
+    return {
+        "approved_total": int(row.get("approved_total") or 0),
+        "queued_today": int(row.get("queued_today") or 0),
+        "queued_later": int(row.get("queued_later") or 0),
+        "send_errors": int(row.get("send_errors") or 0),
+        "sent_today": int(row.get("sent_today") or 0),
+    }
+
+
+def postgres_load_all_leads_summary(
+    campaign_id: str,
+    *,
+    search: str = "",
+    statuses: list[str] | None = None,
+    channels: list[str] | None = None,
+    priorities: list[str] | None = None,
+    stale: str = "All",
+    page: int = 1,
+    page_size: int = 25,
+) -> dict[str, Any]:
+    ensure_postgres_ready()
+    search_text = (search or "").strip().lower()
+    page = max(1, int(page or 1))
+    page_size = max(1, int(page_size or 25))
+    offset = (page - 1) * page_size
+
+    tel_clean_sql = "regexp_replace(coalesce(payload ->> 'TelNr', ''), '[^0-9+]', '', 'g')"
+    has_email_sql = "coalesce(payload ->> 'Email', '') <> ''"
+    has_phone_sql = "coalesce(payload ->> 'TelNr', '') <> ''"
+    has_whatsapp_sql = f"({tel_clean_sql} like '+436%%' or {tel_clean_sql} like '06%%')"
+    planned_channel_sql = f"""
+        case
+            when coalesce(payload ->> 'Next_Action_Type', '') = 'email' and {has_email_sql} then 'email'
+            when coalesce(payload ->> 'Next_Action_Type', '') = 'whatsapp' and {has_whatsapp_sql} then 'whatsapp'
+            when coalesce(payload ->> 'Next_Action_Type', '') = 'phone' and {has_phone_sql} then 'phone'
+            when coalesce(payload ->> 'Preferred_Channel', '') = 'email' and {has_email_sql} then 'email'
+            when coalesce(payload ->> 'Preferred_Channel', '') = 'whatsapp' and {has_whatsapp_sql} then 'whatsapp'
+            when coalesce(payload ->> 'Preferred_Channel', '') = 'phone' and {has_phone_sql} then 'phone'
+            when coalesce(payload ->> 'Channel_Used', '') = 'email' and {has_email_sql} then 'email'
+            when coalesce(payload ->> 'Channel_Used', '') = 'whatsapp' and {has_whatsapp_sql} then 'whatsapp'
+            when coalesce(payload ->> 'Channel_Used', '') = 'phone' and {has_phone_sql} then 'phone'
+            when {has_email_sql} then 'email'
+            when {has_whatsapp_sql} then 'whatsapp'
+            when {has_phone_sql} then 'phone'
+            else 'none'
+        end
+    """
+
+    where_clauses = ["campaign_id = %s"]
+    params: list[Any] = [campaign_id]
+
+    if search_text:
+        like_value = f"%{search_text}%"
+        where_clauses.append(
+            """
+            (
+                lower(lead_id) like %s
+                or lower(coalesce(payload ->> 'Unternehmen', '')) like %s
+                or lower(coalesce(payload ->> 'Adresse', '')) like %s
+                or lower(coalesce(payload ->> 'Kontaktname', '')) like %s
+                or lower(coalesce(payload ->> 'Email', '')) like %s
+            )
+            """
+        )
+        params.extend([like_value, like_value, like_value, like_value, like_value])
+
+    status_values = [value for value in (statuses or []) if value]
+    if status_values:
+        where_clauses.append("status = any(%s)")
+        params.append(status_values)
+
+    channel_values = [value for value in (channels or []) if value in {"email", "whatsapp", "phone", "none"}]
+    if channel_values:
+        where_clauses.append(f"({planned_channel_sql}) = any(%s)")
+        params.append(channel_values)
+
+    priority_values = sorted({_safe_int(value, 0) for value in (priorities or []) if str(value).isdigit()})
+    if priority_values:
+        where_clauses.append("priority = any(%s)")
+        params.append(priority_values)
+
+    if stale == "Draft stale":
+        where_clauses.append("coalesce(payload ->> 'Draft_Stale', '0') = '1'")
+    elif stale == "Research stale":
+        where_clauses.append("coalesce(payload ->> 'Research_Stale', '0') = '1'")
+    elif stale == "Fresh only":
+        where_clauses.append("coalesce(payload ->> 'Draft_Stale', '0') <> '1'")
+        where_clauses.append("coalesce(payload ->> 'Research_Stale', '0') <> '1'")
+
+    where_sql = " and ".join(where_clauses)
+    count_query = f"select count(*) as count from leads where {where_sql}"
+    query = f"""
+        select lead_id,
+               coalesce(payload ->> 'Unternehmen', '') as company,
+               status,
+               priority,
+               coalesce(payload ->> 'Draft_Stale', '0') as draft_stale,
+               coalesce(payload ->> 'Research_Stale', '0') as research_stale,
+               coalesce(payload ->> 'Email', '') as email,
+               coalesce(payload ->> 'TelNr', '') as phone,
+               coalesce(payload ->> 'Kontaktname', '') as contact_name,
+               coalesce(payload ->> 'Adresse', '') as address,
+               {planned_channel_sql} as planned_channel
+        from leads
+        where {where_sql}
+        order by priority asc, company asc, lead_id asc
+        limit %s
+        offset %s
+    """
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(count_query, tuple(params))
+        count_row = cur.fetchone() or {}
+        cur.execute(query, tuple([*params, page_size, offset]))
+        rows = cur.fetchall()
+
+    items = [
+        {
+            "ID": row.get("lead_id") or "",
+            "Unternehmen": row.get("company") or "",
+            "Status": row.get("status") or "new",
+            "Priority": str(row.get("priority") or 5),
+            "Draft_Stale": row.get("draft_stale") or "0",
+            "Research_Stale": row.get("research_stale") or "0",
+            "Email": row.get("email") or "",
+            "TelNr": row.get("phone") or "",
+            "Kontaktname": row.get("contact_name") or "",
+            "Adresse": row.get("address") or "",
+            "Planned_Channel": row.get("planned_channel") or "none",
+        }
+        for row in rows
+    ]
+    return {
+        "items": items,
+        "total_count": int(count_row.get("count") or 0),
+        "page": page,
+        "page_size": page_size,
+    }
+
+
 def postgres_load_recontact_leads(campaign_id: str) -> list[dict[str, Any]]:
     rows = _postgres_load_full_lead_rows(
         campaign_id,
@@ -892,6 +1254,35 @@ def _sync_scheduled_send_row(cur: Any, campaign_id: str, lead: dict[str, Any]) -
         )
 
 
+def _contact_event_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now()
+    parsed = _parse_schedule_timestamp(text.replace(" ", "T")) if " " in text else _parse_schedule_timestamp(text)
+    return parsed or datetime.now()
+
+
+def _insert_contact_event_row(
+    cur: Any,
+    campaign_id: str,
+    lead_id: str,
+    *,
+    occurred_at: Any,
+    channel: str,
+    outcome: str,
+    notes: str = "",
+) -> None:
+    cur.execute(
+        """
+        insert into contact_events (campaign_id, lead_id, occurred_at, channel, outcome, notes)
+        values (%s, %s, %s, %s, %s, %s)
+        """,
+        (campaign_id, lead_id, _contact_event_timestamp(occurred_at), channel, outcome, notes.strip()),
+    )
+
+
 def postgres_get_lead_by_id(lead_id: str, campaign_id: str = "") -> dict[str, Any] | None:
     ensure_postgres_ready()
     query = """
@@ -912,6 +1303,32 @@ def postgres_get_lead_by_id(lead_id: str, campaign_id: str = "") -> dict[str, An
     if not row:
         return None
     return _lead_row_to_payload(row, include_campaign_id=True)
+
+
+def postgres_persist_outreach_lead(
+    campaign_id: str,
+    lead: dict[str, Any],
+    *,
+    contact_event: dict[str, Any] | None = None,
+) -> None:
+    ensure_postgres_ready()
+    lead_id = str(lead.get("ID") or "").strip()
+    if not lead_id:
+        raise ValueError("Lead ID is required for postgres_persist_outreach_lead().")
+    _, _, Jsonb = _load_psycopg()
+    normalized = _lead_payload_from_row(lead)
+    with postgres_connection() as conn, conn.cursor() as cur:
+        _postgres_upsert_lead_row(cur, campaign_id, normalized, Jsonb)
+        if contact_event:
+            _insert_contact_event_row(
+                cur,
+                campaign_id,
+                lead_id,
+                occurred_at=contact_event.get("occurred_at") or datetime.now(),
+                channel=str(contact_event.get("channel") or "").strip(),
+                outcome=str(contact_event.get("outcome") or "").strip(),
+                notes=str(contact_event.get("notes") or ""),
+            )
 
 
 def postgres_archive_stale_contacted_leads(campaign_id: str, cutoff_date_iso: str) -> int:
@@ -961,16 +1378,15 @@ def postgres_record_contact_event(
     notes: str = "",
 ) -> None:
     ensure_postgres_ready()
-    timestamp = _parse_schedule_timestamp(occurred_at.replace(" ", "T")) if " " in occurred_at else _parse_schedule_timestamp(occurred_at)
-    if timestamp is None:
-        timestamp = datetime.now()
     with postgres_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into contact_events (campaign_id, lead_id, occurred_at, channel, outcome, notes)
-            values (%s, %s, %s, %s, %s, %s)
-            """,
-            (campaign_id, lead_id, timestamp, channel, outcome, notes.strip()),
+        _insert_contact_event_row(
+            cur,
+            campaign_id,
+            lead_id,
+            occurred_at=occurred_at,
+            channel=channel,
+            outcome=outcome,
+            notes=notes,
         )
 
 

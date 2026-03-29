@@ -14,9 +14,10 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid
 
+import crm_backend as backend
 from campaign_service import get_active_campaign
-from crm_store import get_lead_by_id, TERMINAL_STATUSES, update_lead
-from crm_tracker import log_contact
+from crm_store import TERMINAL_STATUSES, get_lead_by_id, save_lead
+from crm_tracker import apply_contact_outcome
 
 
 def format_phone_e164(phone: str) -> str:
@@ -82,13 +83,19 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def send_email_result(lead_id: str, dry_run: bool = False, notes: str = "", campaign: dict | None = None) -> dict[str, str | bool]:
+def send_email_result(
+    lead_id: str,
+    dry_run: bool = False,
+    notes: str = "",
+    campaign: dict | None = None,
+    lead: dict | None = None,
+) -> dict[str, str | bool]:
     """
     Build and send the generated email for a lead.
     On success, logs the contact attempt.
     Returns a dict with `ok`, `message_id`, and `error`.
     """
-    lead = get_lead_by_id(lead_id, campaign=campaign)
+    lead = dict(lead) if lead is not None else get_lead_by_id(lead_id, campaign=campaign)
     if lead is None:
         print(f"Lead {lead_id} not found.")
         return {"ok": False, "message_id": "", "error": "lead_not_found"}
@@ -195,20 +202,28 @@ def send_email_result(lead_id: str, dry_run: bool = False, notes: str = "", camp
                 server.login(smtp_user, smtp_pass)
                 server.send_message(msg)
         print(f"Email sent to {to_addr} ({lead.get('Unternehmen', '')})")
-        updates = {
-            "Sent_At": datetime.now().astimezone().isoformat(),
-            "SMTP_Message_ID": str(msg.get("Message-ID") or ""),
-            "Scheduled_Send_Error": "",
-        }
+        sent_at = datetime.now().astimezone()
+        event = apply_contact_outcome(lead, "sent", notes=notes, channel="email", now=sent_at)
+        lead["Sent_At"] = sent_at.isoformat()
+        lead["SMTP_Message_ID"] = str(msg.get("Message-ID") or "")
+        lead["Scheduled_Send_Error"] = ""
         if (lead.get("Scheduled_Send_Channel") or "").strip() == "email":
-            updates["Scheduled_Send_Status"] = "sent"
-        update_lead(lead_id, updates, campaign=active_campaign)
-        log_contact(lead_id, "sent", notes=notes, channel="email", campaign=active_campaign)
+            lead["Scheduled_Send_Status"] = "sent"
+        if backend.is_postgres_backend():
+            backend.postgres_persist_outreach_lead(active_campaign["id"], lead, contact_event=event)
+        else:
+            save_lead(lead, campaign=active_campaign)
         return {"ok": True, "message_id": str(msg.get("Message-ID") or ""), "error": ""}
     except Exception as e:
         print(f"Failed to send email for {lead_id}: {e}")
         return {"ok": False, "message_id": "", "error": str(e)}
 
 
-def send_email(lead_id: str, dry_run: bool = False, notes: str = "", campaign: dict | None = None) -> bool:
-    return bool(send_email_result(lead_id, dry_run=dry_run, notes=notes, campaign=campaign).get("ok"))
+def send_email(
+    lead_id: str,
+    dry_run: bool = False,
+    notes: str = "",
+    campaign: dict | None = None,
+    lead: dict | None = None,
+) -> bool:
+    return bool(send_email_result(lead_id, dry_run=dry_run, notes=notes, campaign=campaign, lead=lead).get("ok"))
