@@ -29,7 +29,6 @@ from crm_store import (
     load_leads,
     progress_save_interval,
     save_leads_batch,
-    set_stored_draft_stale,
 )
 from crm_research import (
     categorize_website, fetch_and_clean_html,
@@ -48,6 +47,15 @@ from crm_templates import (
 # ---------------------------------------------------------------------------
 
 MODEL = "gpt-4o-mini"
+
+
+try:
+    from crm_store import set_stored_draft_stale
+except ImportError:
+    def set_stored_draft_stale(lead: dict, is_stale: bool) -> None:
+        flag = "1" if is_stale else "0"
+        lead["Draft_Stale"] = flag
+        lead["_Stored_Draft_Stale"] = flag
 
 
 def build_no_website_analysis(campaign: dict) -> dict:

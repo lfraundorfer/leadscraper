@@ -59,6 +59,17 @@ _PROTECTED_REFRESH_STATUSES = {
 }
 
 
+def _set_stored_draft_stale_compat(lead: dict, is_stale: bool) -> None:
+    try:
+        from crm_store import set_stored_draft_stale as setter
+    except ImportError:
+        flag = "1" if is_stale else "0"
+        lead["Draft_Stale"] = flag
+        lead["_Stored_Draft_Stale"] = flag
+        return
+    setter(lead, is_stale)
+
+
 def _resolve_campaign(campaign: dict | None = None) -> dict | None:
     if campaign is not None:
         return campaign
@@ -1763,14 +1774,12 @@ def is_pending_template_refresh_target(lead: dict) -> bool:
 
 
 def rerender_saved_draft(lead: dict, campaign: dict | None = None) -> dict:
-    from crm_store import set_stored_draft_stale
-
     drafts = preview_saved_draft_rerender(lead, campaign=campaign)
     lead.update(drafts)
 
     active_campaign = _resolve_campaign(campaign) or {}
     lead["Draft_Config_Version"] = str(active_campaign.get("draft_config_version") or active_campaign.get("config_version") or "1")
-    set_stored_draft_stale(lead, False)
+    _set_stored_draft_stale_compat(lead, False)
     if (lead.get("Status") or "new").strip() == "new":
         lead["Status"] = "draft_ready"
     return drafts
@@ -1781,7 +1790,7 @@ def mark_template_editor_pending_drafts_stale(
     *,
     template_keys: set[str] | None = None,
 ) -> dict[str, int]:
-    from crm_store import save_leads_batch, set_stored_draft_stale
+    from crm_store import save_leads_batch
 
     active_campaign = _resolve_campaign(campaign)
     candidates = _load_template_editor_candidate_leads(active_campaign, template_keys=template_keys, stale_only=False)
@@ -1794,7 +1803,7 @@ def mark_template_editor_pending_drafts_stale(
         current_stale = (lead.get("Draft_Stale") or "0") == "1"
         if should_stale == current_stale:
             continue
-        set_stored_draft_stale(lead, should_stale)
+        _set_stored_draft_stale_compat(lead, should_stale)
         if should_stale:
             stale_marked += 1
         else:

@@ -45,7 +45,6 @@ from crm_store import (
     preferred_channel,
     save_lead,
     save_leads,
-    set_stored_draft_stale,
 )
 from crm_templates import (
     build_template_editor_change_scope,
@@ -64,6 +63,15 @@ from crm_templates import (
 )
 from crm_schedule import clear_scheduled_send, queue_scheduled_email, scheduled_send_label
 from crm_tracker import ARCHIVE_AFTER_DAYS, apply_contact_outcome, check_and_archive_stale, parse_contact_log
+
+
+try:
+    from crm_store import set_stored_draft_stale
+except ImportError:
+    def set_stored_draft_stale(lead: dict, is_stale: bool) -> None:
+        flag = "1" if is_stale else "0"
+        lead["Draft_Stale"] = flag
+        lead["_Stored_Draft_Stale"] = flag
 
 
 st.set_page_config(
