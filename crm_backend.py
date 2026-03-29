@@ -73,6 +73,29 @@ LEAD_QUEUE_FIELDS = {
 }
 
 
+def _lead_has_saved_drafts_sql(payload_sql: str = "payload") -> str:
+    return (
+        f"(coalesce({payload_sql} ->> 'Email_Draft', '') <> '' "
+        f"or coalesce({payload_sql} ->> 'WhatsApp_Draft', '') <> '' "
+        f"or coalesce({payload_sql} ->> 'Phone_Script', '') <> '')"
+    )
+
+
+def _draft_stale_sql(payload_sql: str = "payload", draft_version_sql: str = "%s") -> str:
+    has_drafts_sql = _lead_has_saved_drafts_sql(payload_sql)
+    return (
+        f"(coalesce({payload_sql} ->> 'Draft_Stale', '0') = '1' "
+        f"or ({has_drafts_sql} "
+        f"and coalesce({payload_sql} ->> 'Draft_Config_Version', '') <> '' "
+        f"and coalesce({payload_sql} ->> 'Draft_Config_Version', '') <> {draft_version_sql}))"
+    )
+
+
+def _campaign_draft_version(campaign_id: str) -> str:
+    config = postgres_get_campaign(campaign_id)
+    return str(config.get("draft_config_version") or config.get("config_version") or "1")
+
+
 def backend_name() -> str:
     return (os.getenv("CRM_BACKEND") or "csv").strip().lower() or "csv"
 
@@ -650,7 +673,21 @@ def _postgres_upsert_lead_row(cur: Any, campaign_id: str, lead: dict[str, Any], 
     _sync_scheduled_send_row(cur, campaign_id, lead)
 
 
-def _lead_row_to_payload(row: dict[str, Any], *, include_campaign_id: bool = False) -> dict[str, Any]:
+def _apply_effective_draft_stale(payload: dict[str, Any], draft_version: str) -> dict[str, Any]:
+    has_drafts = any((payload.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+    stored_stale = (payload.get("Draft_Stale") or "").strip() == "1"
+    row_draft_version = (payload.get("Draft_Config_Version") or "").strip()
+    version_stale = has_drafts and row_draft_version and row_draft_version != draft_version
+    payload["Draft_Stale"] = "1" if has_drafts and (stored_stale or version_stale) else "0"
+    return payload
+
+
+def _lead_row_to_payload(
+    row: dict[str, Any],
+    *,
+    include_campaign_id: bool = False,
+    draft_version: str = "",
+) -> dict[str, Any]:
     payload = dict(row.get("payload") or {})
     for column in ALL_COLUMNS:
         payload.setdefault(column, "")
@@ -677,6 +714,8 @@ def _lead_row_to_payload(row: dict[str, Any], *, include_campaign_id: bool = Fal
     payload["Approved_At"] = row.get("approved_at").isoformat() if row.get("approved_at") else payload.get("Approved_At", "")
     payload["Sent_At"] = row.get("sent_at").isoformat() if row.get("sent_at") else payload.get("Sent_At", "")
     payload["SMTP_Message_ID"] = row.get("smtp_message_id") or payload.get("SMTP_Message_ID", "")
+    if draft_version:
+        _apply_effective_draft_stale(payload, draft_version)
     if include_campaign_id:
         payload["Campaign_ID"] = row.get("campaign_id") or ""
     return payload
@@ -706,6 +745,39 @@ def postgres_load_leads(campaign_id: str) -> list[dict[str, Any]]:
     return leads
 
 
+def postgres_load_template_refresh_candidates(
+    campaign_id: str,
+    *,
+    template_keys: list[str] | None = None,
+    stale_only: bool = False,
+) -> list[dict[str, Any]]:
+    where_clauses = [
+        "status = any(%s)",
+        _lead_has_saved_drafts_sql(),
+    ]
+    params: list[Any] = [["new", "draft_ready"]]
+
+    if stale_only:
+        where_clauses.append("coalesce(payload ->> 'Draft_Stale', '0') = '1'")
+
+    template_values = sorted({value for value in (template_keys or []) if value})
+    if template_values:
+        where_clauses.append(
+            """
+            (
+                coalesce(payload ->> 'Template_Used', '') = any(%s)
+                or coalesce(payload ->> 'Template_Used', '') = ''
+            )
+            """
+        )
+        params.append(template_values)
+
+    rows = _postgres_load_full_lead_rows(campaign_id, where_sql=" and ".join(where_clauses), params=tuple(params))
+    leads = [_lead_row_to_payload(row) for row in rows]
+    leads.sort(key=_lead_sort_key)
+    return leads
+
+
 def postgres_load_review_queue_summary(
     campaign_id: str,
     *,
@@ -713,6 +785,8 @@ def postgres_load_review_queue_summary(
     offset: int = 0,
 ) -> list[dict[str, Any]]:
     ensure_postgres_ready()
+    draft_version = _campaign_draft_version(campaign_id)
+    draft_stale_sql = _draft_stale_sql()
     query = """
         select lead_id,
                coalesce(payload ->> 'Unternehmen', '') as company,
@@ -722,10 +796,10 @@ def postgres_load_review_queue_summary(
         from leads
         where campaign_id = %s
           and status = 'draft_ready'
-          and coalesce(payload ->> 'Draft_Stale', '0') <> '1'
+          and not {draft_stale_sql}
         order by priority asc, analyzed_at asc, lead_id asc
-    """
-    params: list[Any] = [campaign_id]
+    """.format(draft_stale_sql=draft_stale_sql)
+    params: list[Any] = [campaign_id, draft_version]
     if limit > 0:
         query += "\n        limit %s"
         params.append(limit)
@@ -748,6 +822,7 @@ def postgres_load_review_queue_summary(
 
 
 def postgres_load_outreach_leads(campaign_id: str) -> list[dict[str, Any]]:
+    draft_version = _campaign_draft_version(campaign_id)
     rows = _postgres_load_full_lead_rows(
         campaign_id,
         where_sql="""
@@ -760,7 +835,7 @@ def postgres_load_outreach_leads(campaign_id: str) -> list[dict[str, Any]]:
             )
         """,
     )
-    leads = [_lead_row_to_payload(row) for row in rows]
+    leads = [_lead_row_to_payload(row, draft_version=draft_version) for row in rows]
     leads.sort(key=lambda lead: (_safe_int(lead.get("Priority"), 5), lead.get("Unternehmen") or "", lead.get("ID") or ""))
     return leads
 
@@ -773,6 +848,8 @@ def postgres_load_outreach_summary(
     page_size: int = 100,
 ) -> dict[str, Any]:
     ensure_postgres_ready()
+    draft_version = _campaign_draft_version(campaign_id)
+    draft_stale_sql = _draft_stale_sql()
     search_text = (search or "").strip().lower()
     page = max(1, int(page or 1))
     page_size = max(1, int(page_size or 100))
@@ -804,7 +881,7 @@ def postgres_load_outreach_summary(
                coalesce(payload ->> 'Unternehmen', '') as company,
                status,
                priority,
-               coalesce(payload ->> 'Draft_Stale', '0') as draft_stale,
+               case when {draft_stale_sql} then '1' else '0' end as draft_stale,
                coalesce(payload ->> 'Email', '') as email,
                coalesce(payload ->> 'TelNr', '') as phone,
                coalesce(payload ->> 'Preferred_Channel', '') as preferred_channel,
@@ -824,7 +901,7 @@ def postgres_load_outreach_summary(
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute(count_query, tuple(params))
         count_row = cur.fetchone() or {}
-        cur.execute(query, tuple([*params, page_size, offset]))
+        cur.execute(query, tuple([draft_version, *params, page_size, offset]))
         rows = cur.fetchall()
     items = [
         {
@@ -919,6 +996,8 @@ def postgres_load_all_leads_summary(
     page_size: int = 25,
 ) -> dict[str, Any]:
     ensure_postgres_ready()
+    draft_version = _campaign_draft_version(campaign_id)
+    draft_stale_sql = _draft_stale_sql()
     search_text = (search or "").strip().lower()
     page = max(1, int(page or 1))
     page_size = max(1, int(page_size or 25))
@@ -980,11 +1059,13 @@ def postgres_load_all_leads_summary(
         params.append(priority_values)
 
     if stale == "Draft stale":
-        where_clauses.append("coalesce(payload ->> 'Draft_Stale', '0') = '1'")
+        where_clauses.append(draft_stale_sql)
+        params.append(draft_version)
     elif stale == "Research stale":
         where_clauses.append("coalesce(payload ->> 'Research_Stale', '0') = '1'")
     elif stale == "Fresh only":
-        where_clauses.append("coalesce(payload ->> 'Draft_Stale', '0') <> '1'")
+        where_clauses.append(f"not {draft_stale_sql}")
+        params.append(draft_version)
         where_clauses.append("coalesce(payload ->> 'Research_Stale', '0') <> '1'")
 
     where_sql = " and ".join(where_clauses)
@@ -994,7 +1075,7 @@ def postgres_load_all_leads_summary(
                coalesce(payload ->> 'Unternehmen', '') as company,
                status,
                priority,
-               coalesce(payload ->> 'Draft_Stale', '0') as draft_stale,
+               case when {draft_stale_sql} then '1' else '0' end as draft_stale,
                coalesce(payload ->> 'Research_Stale', '0') as research_stale,
                coalesce(payload ->> 'Email', '') as email,
                coalesce(payload ->> 'TelNr', '') as phone,
@@ -1010,7 +1091,7 @@ def postgres_load_all_leads_summary(
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute(count_query, tuple(params))
         count_row = cur.fetchone() or {}
-        cur.execute(query, tuple([*params, page_size, offset]))
+        cur.execute(query, tuple([draft_version, *params, page_size, offset]))
         rows = cur.fetchall()
 
     items = [
@@ -1038,6 +1119,7 @@ def postgres_load_all_leads_summary(
 
 
 def postgres_load_recontact_leads(campaign_id: str) -> list[dict[str, Any]]:
+    draft_version = _campaign_draft_version(campaign_id)
     rows = _postgres_load_full_lead_rows(
         campaign_id,
         where_sql="""
@@ -1055,11 +1137,13 @@ def postgres_load_recontact_leads(campaign_id: str) -> list[dict[str, Any]]:
             )
         """,
     )
-    return [_lead_row_to_payload(row) for row in rows]
+    return [_lead_row_to_payload(row, draft_version=draft_version) for row in rows]
 
 
 def postgres_load_lead_metrics(campaign_id: str) -> dict[str, int]:
     ensure_postgres_ready()
+    draft_version = _campaign_draft_version(campaign_id)
+    draft_stale_sql = _draft_stale_sql()
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1069,14 +1153,14 @@ def postgres_load_lead_metrics(campaign_id: str) -> dict[str, int]:
                 count(*) filter (
                     where status = 'approved'
                       and coalesce(payload ->> 'Drafts_Approved', '0') = '1'
-                      and coalesce(payload ->> 'Draft_Stale', '0') <> '1'
+                      and not {draft_stale_sql}
                 ) as approved_fresh,
-                count(*) filter (where coalesce(payload ->> 'Draft_Stale', '0') = '1') as draft_stale,
+                count(*) filter (where {draft_stale_sql}) as draft_stale,
                 count(*) filter (where coalesce(payload ->> 'Research_Stale', '0') = '1') as research_stale
             from leads
             where campaign_id = %s
-            """,
-            (campaign_id,),
+            """.format(draft_stale_sql=draft_stale_sql),
+            (draft_version, draft_version, campaign_id),
         )
         row = cur.fetchone() or {}
     return {
@@ -1090,6 +1174,8 @@ def postgres_load_lead_metrics(campaign_id: str) -> dict[str, int]:
 
 def postgres_load_dashboard_snapshot(campaign_id: str, today_iso: str) -> dict[str, Any]:
     ensure_postgres_ready()
+    draft_version = _campaign_draft_version(campaign_id)
+    draft_stale_sql = _draft_stale_sql()
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -1110,12 +1196,12 @@ def postgres_load_dashboard_snapshot(campaign_id: str, today_iso: str) -> dict[s
               and coalesce(payload ->> 'Website_Category', '') <> ''
               and (
                     coalesce(payload ->> 'Analyzed_At', '') = ''
-                    or coalesce(payload ->> 'Draft_Stale', '0') = '1'
+                    or {draft_stale_sql}
                   )
               and status not in ('done', 'won', 'lost', 'blacklist')
             order by priority asc, lead_id asc
-            """,
-            (campaign_id,),
+            """.format(draft_stale_sql=draft_stale_sql),
+            (campaign_id, draft_version),
         )
         pending_rows = cur.fetchall()
 

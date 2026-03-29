@@ -43,6 +43,9 @@ _LEGACY_HOOKS_LIBRARY_PATH = Path(__file__).parent / "hooks_library.json"
 _LEGACY_TEMPLATE_OVERRIDES_PATH = Path(__file__).parent / "template_overrides.json"
 _hooks_override_cache: dict[str, dict[str, list[str]]] = {}
 _template_override_cache: dict[str, dict] = {}
+_UNSET = object()
+_TEMPLATE_DRAFT_FIELDS = ("Email_Draft", "WhatsApp_Draft", "Phone_Script")
+_PENDING_TEMPLATE_EDITOR_STATUSES = {"new", "draft_ready"}
 
 _PROTECTED_REFRESH_STATUSES = {
     "approved",
@@ -149,33 +152,43 @@ def _clean_string_list(value) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def get_effective_hooks_library(campaign: dict | None = None) -> dict[str, list[str]]:
+def _effective_hooks_library_from_override(override: dict | None) -> dict[str, list[str]]:
     hooks = {key: list(values) for key, values in HOOKS.items()}
-    override = _load_hooks_override(campaign=campaign)
-    for key, values in override.items():
-        cleaned = _clean_string_list(values)
-        if cleaned:
-            hooks[key] = cleaned
+    if isinstance(override, dict):
+        for key, values in override.items():
+            cleaned = _clean_string_list(values)
+            if cleaned:
+                hooks[key] = cleaned
     return hooks
+
+
+def get_effective_hooks_library(campaign: dict | None = None) -> dict[str, list[str]]:
+    return _effective_hooks_library_from_override(_load_hooks_override(campaign=campaign))
 
 
 def get_template_override_payload(campaign: dict | None = None) -> dict:
     return deepcopy(_load_template_overrides(campaign=campaign))
 
 
-def get_effective_subject_templates(campaign: dict | None = None) -> list[str]:
-    override = _load_template_overrides(campaign=campaign)
-    if "subject_templates" in override:
+def _effective_subject_templates_from_override(override: dict | None) -> list[str]:
+    if isinstance(override, dict) and "subject_templates" in override:
         return _clean_string_list(override.get("subject_templates"))
     return list(SUBJECT_TEMPLATES)
 
 
-def get_effective_special_subject_option(campaign: dict | None = None) -> str:
-    override = _load_template_overrides(campaign=campaign)
-    if "special_subject_option" in override:
+def get_effective_subject_templates(campaign: dict | None = None) -> list[str]:
+    return _effective_subject_templates_from_override(_load_template_overrides(campaign=campaign))
+
+
+def _effective_special_subject_option_from_override(override: dict | None) -> str:
+    if isinstance(override, dict) and "special_subject_option" in override:
         value = override.get("special_subject_option")
         return str(value).strip() if value is not None else ""
     return SPECIAL_SUBJECT_OPTION
+
+
+def get_effective_special_subject_option(campaign: dict | None = None) -> str:
+    return _effective_special_subject_option_from_override(_load_template_overrides(campaign=campaign))
 
 
 def _campaign_value(campaign: dict | None, key: str, env_key: str = "", default: str = "") -> str:
@@ -1301,20 +1314,95 @@ DEFAULT_TEMPLATE_KEY = "kein_seo"
 TEMPLATES["default"] = TEMPLATES[DEFAULT_TEMPLATE_KEY]
 
 
-def get_effective_templates(campaign: dict | None = None) -> dict[str, dict[str, str]]:
+def _effective_templates_from_override(override: dict | None) -> dict[str, dict[str, str]]:
     templates = {key: dict(value) for key, value in TEMPLATES.items() if key != "default"}
-    override = _load_template_overrides(campaign=campaign)
-    override_templates = override.get("templates")
-    if isinstance(override_templates, dict):
-        for template_key, channels in override_templates.items():
-            if template_key not in templates or not isinstance(channels, dict):
-                continue
-            for channel in ("email", "whatsapp", "phone_script"):
-                value = channels.get(channel)
-                if isinstance(value, str):
-                    templates[template_key][channel] = value
+    if isinstance(override, dict):
+        override_templates = override.get("templates")
+        if isinstance(override_templates, dict):
+            for template_key, channels in override_templates.items():
+                if template_key not in templates or not isinstance(channels, dict):
+                    continue
+                for channel in ("email", "whatsapp", "phone_script"):
+                    value = channels.get(channel)
+                    if isinstance(value, str):
+                        templates[template_key][channel] = value
     templates["default"] = dict(templates.get(DEFAULT_TEMPLATE_KEY, {}))
     return templates
+
+
+def get_effective_templates(campaign: dict | None = None) -> dict[str, dict[str, str]]:
+    return _effective_templates_from_override(_load_template_overrides(campaign=campaign))
+
+
+def build_template_editor_snapshot(
+    campaign: dict | None = None,
+    *,
+    hooks_override=_UNSET,
+    template_override=_UNSET,
+) -> dict[str, object]:
+    hooks_payload = _load_hooks_override(campaign=campaign) if hooks_override is _UNSET else hooks_override
+    template_payload = _load_template_overrides(campaign=campaign) if template_override is _UNSET else template_override
+    return {
+        "hooks": _effective_hooks_library_from_override(hooks_payload if isinstance(hooks_payload, dict) else {}),
+        "templates": _effective_templates_from_override(template_payload if isinstance(template_payload, dict) else {}),
+        "subject_templates": _effective_subject_templates_from_override(template_payload if isinstance(template_payload, dict) else {}),
+        "special_subject_option": _effective_special_subject_option_from_override(
+            template_payload if isinstance(template_payload, dict) else {}
+        ),
+    }
+
+
+def _template_scope_keys(keys: set[str]) -> set[str]:
+    normalized = {key for key in keys if key}
+    if DEFAULT_TEMPLATE_KEY in normalized:
+        normalized.add("default")
+    return normalized
+
+
+def build_template_editor_change_scope(
+    before_snapshot: dict[str, object],
+    after_snapshot: dict[str, object],
+    *,
+    change_type: str,
+    selected_template_key: str = "",
+) -> dict[str, object]:
+    if change_type == "template":
+        template_key = (selected_template_key or "").strip()
+        before_templates = before_snapshot.get("templates") if isinstance(before_snapshot.get("templates"), dict) else {}
+        after_templates = after_snapshot.get("templates") if isinstance(after_snapshot.get("templates"), dict) else {}
+        changed = bool(template_key) and before_templates.get(template_key) != after_templates.get(template_key)
+        return {
+            "changed": changed,
+            "subjects_changed": False,
+            "template_keys": _template_scope_keys({template_key}) if changed else set(),
+        }
+
+    if change_type == "hooks":
+        before_hooks = before_snapshot.get("hooks") if isinstance(before_snapshot.get("hooks"), dict) else {}
+        after_hooks = after_snapshot.get("hooks") if isinstance(after_snapshot.get("hooks"), dict) else {}
+        changed_keys = {
+            key
+            for key in set(before_hooks) | set(after_hooks)
+            if before_hooks.get(key, []) != after_hooks.get(key, [])
+        }
+        return {
+            "changed": bool(changed_keys),
+            "subjects_changed": False,
+            "template_keys": _template_scope_keys(changed_keys),
+        }
+
+    if change_type == "subjects":
+        changed = (
+            before_snapshot.get("subject_templates") != after_snapshot.get("subject_templates")
+            or before_snapshot.get("special_subject_option") != after_snapshot.get("special_subject_option")
+        )
+        return {
+            "changed": changed,
+            "subjects_changed": changed,
+            "template_keys": set(),
+        }
+
+    raise ValueError(f"Unknown template editor change type: {change_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -1596,7 +1684,73 @@ def render_drafts(
 
 
 def has_saved_drafts(lead: dict) -> bool:
-    return any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+    return any((lead.get(field) or "").strip() for field in _TEMPLATE_DRAFT_FIELDS)
+
+
+def resolve_saved_draft_template_key(lead: dict, campaign: dict | None = None) -> str:
+    pain_categories_raw = lead.get("Pain_Categories", "") or ""
+    pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
+    template_key = (lead.get("Template_Used") or "").strip()
+    effective_templates = get_effective_templates(campaign=campaign)
+    if template_key not in effective_templates:
+        template_key = pick_template_key(pain_categories, lead)
+    return template_key
+
+
+def preview_saved_draft_rerender(lead: dict, campaign: dict | None = None) -> dict:
+    template_key = resolve_saved_draft_template_key(lead, campaign=campaign)
+    hook = choose_hook(template_key, lead, campaign=campaign)
+    return render_drafts(lead, hook, "", template_key=template_key, campaign=campaign)
+
+
+def saved_draft_differs_from_current_copy(lead: dict, campaign: dict | None = None) -> bool:
+    preview = preview_saved_draft_rerender(lead, campaign=campaign)
+    return any((lead.get(field) or "") != (preview.get(field) or "") for field in _TEMPLATE_DRAFT_FIELDS)
+
+
+def _is_pending_template_editor_lead(lead: dict) -> bool:
+    status = (lead.get("Status") or "new").strip() or "new"
+    return status in _PENDING_TEMPLATE_EDITOR_STATUSES and has_saved_drafts(lead)
+
+
+def _lead_matches_template_keys(lead: dict, template_keys: set[str] | None, campaign: dict | None = None) -> bool:
+    if not template_keys:
+        return True
+    return resolve_saved_draft_template_key(lead, campaign=campaign) in template_keys
+
+
+def _load_template_editor_candidate_leads(
+    campaign: dict | None = None,
+    *,
+    template_keys: set[str] | None = None,
+    stale_only: bool = False,
+) -> list[dict]:
+    from crm_store import load_leads
+
+    active_campaign = _resolve_campaign(campaign)
+    if backend.is_postgres_backend() and active_campaign is not None:
+        loader = getattr(backend, "postgres_load_template_refresh_candidates", None)
+        if callable(loader):
+            leads = loader(
+                active_campaign["id"],
+                template_keys=sorted(template_keys) if template_keys else None,
+                stale_only=stale_only,
+            )
+        else:
+            leads = load_leads(campaign=active_campaign, derive_effective_draft_stale=False)
+    else:
+        leads = load_leads(campaign=campaign, derive_effective_draft_stale=False)
+
+    candidates: list[dict] = []
+    for lead in leads:
+        if not _is_pending_template_editor_lead(lead):
+            continue
+        if stale_only and (lead.get("Draft_Stale") or "0") != "1":
+            continue
+        if not _lead_matches_template_keys(lead, template_keys, campaign=active_campaign or campaign):
+            continue
+        candidates.append(lead)
+    return candidates
 
 
 def is_pending_template_refresh_target(lead: dict) -> bool:
@@ -1609,23 +1763,70 @@ def is_pending_template_refresh_target(lead: dict) -> bool:
 
 
 def rerender_saved_draft(lead: dict, campaign: dict | None = None) -> dict:
-    pain_categories_raw = lead.get("Pain_Categories", "") or ""
-    pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
-    template_key = (lead.get("Template_Used") or "").strip()
-    effective_templates = get_effective_templates(campaign=campaign)
-    if template_key not in effective_templates:
-        template_key = pick_template_key(pain_categories, lead)
+    from crm_store import set_stored_draft_stale
 
-    hook = choose_hook(template_key, lead, campaign=campaign)
-    drafts = render_drafts(lead, hook, "", template_key=template_key, campaign=campaign)
+    drafts = preview_saved_draft_rerender(lead, campaign=campaign)
     lead.update(drafts)
 
     active_campaign = _resolve_campaign(campaign) or {}
     lead["Draft_Config_Version"] = str(active_campaign.get("draft_config_version") or active_campaign.get("config_version") or "1")
-    lead["Draft_Stale"] = "0"
+    set_stored_draft_stale(lead, False)
     if (lead.get("Status") or "new").strip() == "new":
         lead["Status"] = "draft_ready"
     return drafts
+
+
+def mark_template_editor_pending_drafts_stale(
+    campaign: dict | None = None,
+    *,
+    template_keys: set[str] | None = None,
+) -> dict[str, int]:
+    from crm_store import save_leads_batch, set_stored_draft_stale
+
+    active_campaign = _resolve_campaign(campaign)
+    candidates = _load_template_editor_candidate_leads(active_campaign, template_keys=template_keys, stale_only=False)
+    updates: list[dict] = []
+    stale_marked = 0
+    stale_cleared = 0
+
+    for lead in candidates:
+        should_stale = saved_draft_differs_from_current_copy(lead, campaign=active_campaign)
+        current_stale = (lead.get("Draft_Stale") or "0") == "1"
+        if should_stale == current_stale:
+            continue
+        set_stored_draft_stale(lead, should_stale)
+        if should_stale:
+            stale_marked += 1
+        else:
+            stale_cleared += 1
+        updates.append(dict(lead))
+
+    if updates:
+        save_leads_batch(updates, campaign=active_campaign)
+
+    return {
+        "checked": len(candidates),
+        "updated": len(updates),
+        "stale_marked": stale_marked,
+        "stale_cleared": stale_cleared,
+    }
+
+
+def refresh_targeted_pending_drafts(campaign: dict | None = None) -> int:
+    from crm_store import save_leads_batch
+
+    active_campaign = _resolve_campaign(campaign)
+    candidates = _load_template_editor_candidate_leads(active_campaign, stale_only=True)
+    if not candidates:
+        return 0
+
+    refreshed: list[dict] = []
+    for lead in candidates:
+        rerender_saved_draft(lead, campaign=active_campaign)
+        refreshed.append(dict(lead))
+
+    save_leads_batch(refreshed, campaign=active_campaign)
+    return len(refreshed)
 
 
 def refresh_saved_drafts(

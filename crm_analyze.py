@@ -29,6 +29,7 @@ from crm_store import (
     load_leads,
     progress_save_interval,
     save_leads_batch,
+    set_stored_draft_stale,
 )
 from crm_research import (
     categorize_website, fetch_and_clean_html,
@@ -566,7 +567,7 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
             messages = render_drafts(lead, hook, urgency, template_key=template_key, campaign=campaign)
             lead.update(messages)
             lead["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
-            lead["Draft_Stale"] = "0"
+            set_stored_draft_stale(lead, False)
             print(f"done (template: {messages.get('Template_Used', '?')})")
 
             # 5. Update status

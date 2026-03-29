@@ -21,7 +21,6 @@ load_dotenv()
 
 import crm_backend as backend
 from campaign_service import (
-    bump_campaign_version,
     create_campaign,
     get_active_campaign,
     get_campaign,
@@ -46,8 +45,11 @@ from crm_store import (
     preferred_channel,
     save_lead,
     save_leads,
+    set_stored_draft_stale,
 )
 from crm_templates import (
+    build_template_editor_change_scope,
+    build_template_editor_snapshot,
     compose_email_draft,
     get_effective_hooks_library,
     get_effective_special_subject_option,
@@ -56,7 +58,9 @@ from crm_templates import (
     get_subject_options,
     get_template_override_payload,
     invalidate_campaign_copy_cache,
+    mark_template_editor_pending_drafts_stale,
     parse_email_draft,
+    refresh_targeted_pending_drafts,
 )
 from crm_schedule import clear_scheduled_send, queue_scheduled_email, scheduled_send_label
 from crm_tracker import ARCHIVE_AFTER_DAYS, apply_contact_outcome, check_and_archive_stale, parse_contact_log
@@ -96,8 +100,32 @@ ALL_LEADS_CHANNEL_OPTIONS = ["email", "whatsapp", "phone", "none"]
 ALL_LEADS_PRIORITY_OPTIONS = ["1", "2", "3", "4", "5"]
 REVIEW_QUEUE_PAGE_SIZE = 100
 OUTREACH_PAGE_SIZE = 100
-PRE_CONTACT_TEMPLATE_REFRESH_STATUSES = {"new", "draft_ready", "approved"}
 TEMPLATE_EDITOR_NOTICE_KEY = "template_editor_notice"
+TEMPLATE_PLACEHOLDER_HELP = [
+    ("hook", "The selected hook sentence(s) for this lead."),
+    ("subject", "The auto-selected email subject from the shared subject library."),
+    ("urgency", "An urgency line from GPT; usually blank in template-only mode."),
+    ("salutation", "Formal greeting, for example 'Guten Tag Herr Muster,' or 'Sehr geehrte Damen und Herren,'."),
+    ("contact", "Best direct contact label for the lead."),
+    ("subject_intro", "Short direct prefix for subject lines, for example 'Herr Muster, '."),
+    ("subject_name", "Short contact/company label for subject lines."),
+    ("company", "The lead's company name."),
+    ("price", "Lead-specific price if set, otherwise the campaign default price."),
+    ("sender_name", "Sender name from Campaign Config."),
+    ("sender_company", "Sender company from Campaign Config."),
+    ("sender_company_signature", "Sender company line for signatures; blank when it would duplicate the sender name."),
+    ("sender_company_phone", "Optional 'von <company>' suffix used in phone intros."),
+    ("sender_website", "Sender website from Campaign Config."),
+    ("sender_phone", "Sender phone from Campaign Config, including the line break used in signatures."),
+    ("sender_email", "Sender email from Campaign Config, including the line break used in signatures."),
+    ("rank_keyword", "Search phrase for this lead, for example 'Installateur 1140'."),
+    ("rank_keyword_district", "District/location portion of the rank keyword, for example '1140' or 'Wien'."),
+    ("competitors_line", "Short competitor list formatted for inline sentences."),
+    ("competitors_short", "First competitor name only."),
+    ("competitors_raw", "Raw competitor list joined by ' | '."),
+    ("rating", "Google rating for the lead when available."),
+    ("review_count", "Google review count for the lead when available."),
+]
 
 
 def _clear_cached_result(cache_func, *args) -> None:
@@ -165,6 +193,59 @@ def _render_template_editor_notice() -> None:
         return
     renderer = getattr(st, level, st.info)
     renderer(message)
+
+
+def _render_template_placeholder_reference() -> None:
+    with st.expander("Placeholder Reference", expanded=False):
+        st.caption("These are the live placeholders available in subjects, hooks, and templates.")
+        for placeholder, description in TEMPLATE_PLACEHOLDER_HELP:
+            st.markdown(f"- `{{{{{placeholder}}}}}`: {description}")
+
+
+def _humanize_template_editor_key(value: str) -> str:
+    return (value or "").replace("_", " ").strip().title()
+
+
+def _join_template_editor_labels(labels: list[str]) -> str:
+    cleaned = [label for label in labels if label]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{', '.join(cleaned[:-1])}, and {cleaned[-1]}"
+
+
+def _describe_template_editor_change(
+    *,
+    change_type: str,
+    before_snapshot: dict[str, object],
+    after_snapshot: dict[str, object],
+    selected_template_key: str = "",
+) -> str:
+    if change_type == "subjects":
+        return "subject settings"
+
+    if change_type == "template":
+        label = _humanize_template_editor_key(selected_template_key)
+        return f"{label} template" if label else "template copy"
+
+    before_hooks = before_snapshot.get("hooks") if isinstance(before_snapshot.get("hooks"), dict) else {}
+    after_hooks = after_snapshot.get("hooks") if isinstance(after_snapshot.get("hooks"), dict) else {}
+    changed_categories = sorted(
+        _humanize_template_editor_key(key)
+        for key in set(before_hooks) | set(after_hooks)
+        if before_hooks.get(key, []) != after_hooks.get(key, [])
+    )
+    if not changed_categories:
+        return "hook library"
+    if len(changed_categories) <= 3:
+        return f"{_join_template_editor_labels(changed_categories)} hooks"
+    return (
+        f"{_join_template_editor_labels(changed_categories[:2])}, and "
+        f"{len(changed_categories) - 2} more hook categories"
+    )
 
 
 @st.cache_data(ttl=300)
@@ -734,7 +815,7 @@ def _apply_draft_edits_to_row(
         if row.get("Status") not in TERMINAL_STATUSES:
             row["Next_Action_Type"] = selected_channel
     row["Drafts_Approved"] = "1"
-    row["Draft_Stale"] = "0"
+    set_stored_draft_stale(row, False)
     row["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
     if row.get("Status") in {"new", "draft_ready"}:
         row["Status"] = "approved"
@@ -1274,7 +1355,7 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
             drafts = render_drafts(lead, hook, "", template_key=template_key, campaign=campaign)
             lead.update(drafts)
             lead["Draft_Config_Version"] = str(campaign.get("draft_config_version") or campaign.get("config_version") or "1")
-            lead["Draft_Stale"] = "0"
+            set_stored_draft_stale(lead, False)
             lead["Analyzed_At"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             lead["Drafts_Approved"] = "0"
             if lead.get("Status", "new") in {"new", "approved", "draft_ready"} or was_stale:
@@ -1297,7 +1378,8 @@ def _persist_campaign_copy_changes(
     *,
     hooks_payload: dict | None = None,
     template_payload: dict | None = None,
-) -> None:
+) -> dict:
+    updated_campaign = campaign
     if backend.is_postgres_backend():
         updates: dict[str, object] = {}
         if hooks_payload is not None:
@@ -1305,65 +1387,100 @@ def _persist_campaign_copy_changes(
         if template_payload is not None:
             updates["template_overrides_json"] = template_payload
         if updates:
-            update_campaign(campaign["id"], updates)
+            updated_campaign = update_campaign(campaign["id"], updates, bump_version=False)
     else:
-        changed = False
         if hooks_payload is not None:
             _write_json_payload(get_hooks_library_path(campaign), hooks_payload)
-            changed = True
         if template_payload is not None:
             _write_json_payload(get_template_overrides_path(campaign), template_payload)
-            changed = True
-        if changed:
-            bump_campaign_version(campaign["id"])
-    invalidate_campaign_copy_cache(campaign)
+        updated_campaign = get_campaign(campaign["id"])
+    invalidate_campaign_copy_cache(updated_campaign)
+    return updated_campaign
 
 
-def _refresh_non_contacted_template_drafts(campaign: dict) -> int:
-    from crm_templates import has_saved_drafts, rerender_saved_draft
+def _build_template_editor_save_notice(
+    *,
+    change_label: str,
+    changed: bool,
+    stats: dict[str, int],
+) -> tuple[str, str]:
+    stale_marked = int(stats.get("stale_marked") or 0)
+    stale_cleared = int(stats.get("stale_cleared") or 0)
+    if not changed:
+        return ("info", f"No changes detected in {change_label}. Pending drafts were left alone.")
+    if stale_marked and stale_cleared:
+        return (
+            "success",
+            f"Saved {change_label}. Marked {stale_marked} pending draft(s) stale and cleared {stale_cleared} pending stale draft(s).",
+        )
+    if stale_marked:
+        return ("success", f"Saved {change_label}. Marked {stale_marked} pending draft(s) stale.")
+    if stale_cleared:
+        return (
+            "success",
+            f"Saved {change_label}. No pending drafts became stale; {stale_cleared} pending stale draft(s) are fresh again.",
+        )
+    return ("info", f"Saved {change_label}. No pending drafts were affected.")
 
-    leads = load_leads(campaign=campaign)
-    refreshed = 0
-    today_iso = date.today().isoformat()
 
-    for lead in leads:
-        status = (lead.get("Status") or "new").strip() or "new"
-        if status not in PRE_CONTACT_TEMPLATE_REFRESH_STATUSES:
-            continue
-        if not has_saved_drafts(lead):
-            continue
+def _apply_template_editor_change(
+    campaign: dict,
+    *,
+    change_type: str,
+    hooks_payload: dict | None = None,
+    template_payload: dict | None = None,
+    selected_template_key: str = "",
+) -> None:
+    snapshot_kwargs: dict[str, object] = {}
+    if hooks_payload is not None:
+        snapshot_kwargs["hooks_override"] = hooks_payload
+    if template_payload is not None:
+        snapshot_kwargs["template_override"] = template_payload
 
-        rerender_saved_draft(lead, campaign=campaign)
-        clear_scheduled_send(lead)
-        lead["Drafts_Approved"] = "0"
-        lead["Approved_At"] = ""
-        lead["Status"] = "draft_ready"
+    before_snapshot = build_template_editor_snapshot(campaign=campaign)
+    after_snapshot = build_template_editor_snapshot(campaign=campaign, **snapshot_kwargs)
+    change_scope = build_template_editor_change_scope(
+        before_snapshot,
+        after_snapshot,
+        change_type=change_type,
+        selected_template_key=selected_template_key,
+    )
+    change_label = _describe_template_editor_change(
+        change_type=change_type,
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+        selected_template_key=selected_template_key,
+    )
 
-        preferred = (lead.get("Preferred_Channel") or "").strip()
-        if preferred and preferred != "none":
-            lead["Next_Action_Type"] = preferred
-            if not (lead.get("Next_Action_Date") or "").strip():
-                lead["Next_Action_Date"] = today_iso
+    updated_campaign = _persist_campaign_copy_changes(
+        campaign,
+        hooks_payload=hooks_payload,
+        template_payload=template_payload,
+    )
 
-        refreshed += 1
+    stats = {"stale_marked": 0, "stale_cleared": 0}
+    if change_scope.get("changed"):
+        template_keys = set(change_scope.get("template_keys") or [])
+        stats = mark_template_editor_pending_drafts_stale(
+            updated_campaign,
+            template_keys=template_keys or None,
+        )
 
-    if refreshed:
-        save_leads(leads, campaign=campaign)
-    return refreshed
+    level, message = _build_template_editor_save_notice(
+        change_label=change_label,
+        changed=bool(change_scope.get("changed")),
+        stats=stats,
+    )
+    _set_template_editor_notice(level, message)
+    reload(campaign_id=campaign["id"], campaign_changed=True)
 
 
 def _render_campaign_template_editor(campaign: dict) -> None:
     st.divider()
     st.subheader("Template Editor")
     _render_template_editor_notice()
-    st.caption("Edit campaign-specific draft copy here. Saving changes marks existing drafts as stale so you can regenerate them with the new wording.")
-
-    placeholder_help = (
-        "Available placeholders: {{hook}}, {{salutation}}, {{contact}}, {{price}}, {{sender_name}}, "
-        "{{sender_company}}, {{sender_website}}, {{sender_phone}}, {{sender_email}}, {{rank_keyword}}, "
-        "{{rank_keyword_district}}, {{competitors_line}}, "
-        "{{competitors_short}}, {{subject_intro}}, {{subject_name}}."
-    )
+    st.caption("Edit campaign-specific draft copy here. Saving changes only marks affected pending drafts as stale so you can regenerate the new wording without touching approved leads.")
+    _render_template_placeholder_reference()
 
     subjects_tab, hooks_tab, templates_tab = st.tabs(["Subjects", "Hooks", "Templates"])
 
@@ -1382,6 +1499,7 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 height=260,
             )
             st.caption("These are the shared subject suggestions shown in the draft editor.")
+            st.caption("Subject suggestions can also use the placeholders from the reference above.")
             c1, c2 = st.columns(2)
             save_subjects = c1.form_submit_button("Save Subject Settings", type="primary", width="stretch")
             reset_subjects = c2.form_submit_button("Reset Subject Settings", width="stretch")
@@ -1390,21 +1508,19 @@ def _render_campaign_template_editor(campaign: dict) -> None:
             payload = get_template_override_payload(campaign=campaign)
             payload["special_subject_option"] = special_subject.strip()
             payload["subject_templates"] = [line.strip() for line in subject_lines.splitlines() if line.strip()]
-            _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload(campaign_id=campaign["id"], campaign_changed=True)
+            _apply_template_editor_change(campaign, change_type="subjects", template_payload=payload)
 
         if reset_subjects:
             payload = get_template_override_payload(campaign=campaign)
             payload.pop("special_subject_option", None)
             payload.pop("subject_templates", None)
-            _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload(campaign_id=campaign["id"], campaign_changed=True)
+            _apply_template_editor_change(campaign, change_type="subjects", template_payload=payload)
 
     with hooks_tab:
         effective_hooks = get_effective_hooks_library(campaign=campaign)
         with st.form(f"hooks_editor_{campaign['id']}"):
             st.caption("One hook per line. Hooks can also use the same placeholders as templates.")
-            st.caption(placeholder_help)
+            st.caption("Use the placeholders from the reference above.")
             hook_inputs: dict[str, str] = {}
             for category, items in effective_hooks.items():
                 with st.expander(category.replace("_", " ").title(), expanded=False):
@@ -1423,12 +1539,10 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 for category, text in hook_inputs.items()
                 if [line.strip() for line in text.splitlines() if line.strip()]
             }
-            _persist_campaign_copy_changes(campaign, hooks_payload=hooks_payload)
-            reload(campaign_id=campaign["id"], campaign_changed=True)
+            _apply_template_editor_change(campaign, change_type="hooks", hooks_payload=hooks_payload)
 
         if reset_hooks:
-            _persist_campaign_copy_changes(campaign, hooks_payload={})
-            reload(campaign_id=campaign["id"], campaign_changed=True)
+            _apply_template_editor_change(campaign, change_type="hooks", hooks_payload={})
 
     with templates_tab:
         effective_templates = get_effective_templates(campaign=campaign)
@@ -1442,7 +1556,7 @@ def _render_campaign_template_editor(campaign: dict) -> None:
         template = effective_templates[selected_template_key]
         with st.form(f"template_editor_form_{campaign['id']}_{selected_template_key}"):
             st.caption("Edit the full template text used for future draft generation.")
-            st.caption(placeholder_help)
+            st.caption("Use the placeholders from the reference above.")
             email_template = st.text_area("Email template", value=template.get("email", ""), height=420)
             whatsapp_template = st.text_area("WhatsApp template", value=template.get("whatsapp", ""), height=160)
             phone_template = st.text_area("Phone script template", value=template.get("phone_script", ""), height=320)
@@ -1458,8 +1572,12 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 "whatsapp": whatsapp_template,
                 "phone_script": phone_template,
             }
-            _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload(campaign_id=campaign["id"], campaign_changed=True)
+            _apply_template_editor_change(
+                campaign,
+                change_type="template",
+                template_payload=payload,
+                selected_template_key=selected_template_key,
+            )
 
         if reset_template:
             payload = get_template_override_payload(campaign=campaign)
@@ -1468,26 +1586,29 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                 templates_payload.pop(selected_template_key, None)
                 if not templates_payload:
                     payload.pop("templates", None)
-            _persist_campaign_copy_changes(campaign, template_payload=payload)
-            reload(campaign_id=campaign["id"], campaign_changed=True)
+            _apply_template_editor_change(
+                campaign,
+                change_type="template",
+                template_payload=payload,
+                selected_template_key=selected_template_key,
+            )
 
     st.caption(
-        "Need to apply the latest copy everywhere? This refreshes saved drafts for "
-        "`new`, `draft_ready`, and `approved` leads, clears approval/queued sends, "
-        "and leaves contacted leads untouched."
+        "Need to apply the latest copy to pending stale drafts? This rebuilds only stale "
+        "`new` / `draft_ready` drafts from Template Editor changes. Approved drafts stay untouched."
     )
-    if st.button("Refresh Non-Contacted Drafts", width="stretch", key=f"refresh_template_drafts_{campaign['id']}"):
-        with st.spinner("Refreshing non-contacted drafts from current templates..."):
-            refreshed = _refresh_non_contacted_template_drafts(campaign)
+    if st.button("Refresh Stale Pending Drafts", width="stretch", key=f"refresh_template_drafts_{campaign['id']}"):
+        with st.spinner("Refreshing stale pending drafts from current templates..."):
+            refreshed = refresh_targeted_pending_drafts(campaign)
         if refreshed:
             _set_template_editor_notice(
                 "success",
-                f"Refreshed {refreshed} non-contacted draft(s). Approved leads were moved back to review.",
+                f"Refreshed {refreshed} stale pending draft(s).",
             )
         else:
             _set_template_editor_notice(
                 "info",
-                "No saved drafts found for `new`, `draft_ready`, or `approved` leads.",
+                "No stale pending drafts were waiting for a template-editor refresh.",
             )
         reload(campaign_id=campaign["id"])
 
@@ -1727,7 +1848,7 @@ def _render_review_queue(campaign: dict) -> None:
                 lead["Next_Action_Type"] = selected_channel
                 lead["Status"] = "approved"
                 lead["Drafts_Approved"] = "1"
-                lead["Draft_Stale"] = "0"
+                set_stored_draft_stale(lead, False)
                 if queue_today and "email" in available_channels(lead):
                     queue_scheduled_email(lead, "today")
                 elif queue_tomorrow and "email" in available_channels(lead):

@@ -174,7 +174,19 @@ def _research_version(campaign: Optional[dict] = None) -> str:
     return str(active.get("research_config_version") or active.get("config_version") or "1")
 
 
-def _apply_staleness_defaults(row: dict, draft_version: str, research_version: str) -> dict:
+def set_stored_draft_stale(lead: dict, is_stale: bool) -> None:
+    value = "1" if is_stale else "0"
+    lead["Draft_Stale"] = value
+    lead["_Stored_Draft_Stale"] = value
+
+
+def _apply_staleness_defaults(
+    row: dict,
+    draft_version: str,
+    research_version: str,
+    *,
+    derive_effective_draft_stale: bool = True,
+) -> dict:
     if not row.get("Status"):
         row["Status"] = "new"
     if not row.get("Contact_Count"):
@@ -212,8 +224,26 @@ def _apply_staleness_defaults(row: dict, draft_version: str, research_version: s
     row_draft_version = (row.get("Draft_Config_Version") or "").strip()
 
     row["Research_Stale"] = "1" if has_research and row_research_version and row_research_version != research_version else "0"
-    row["Draft_Stale"] = "1" if has_drafts and row_draft_version and row_draft_version != draft_version else "0"
+    stored_draft_stale = (row.get("Draft_Stale") or "").strip() == "1"
+    row["_Stored_Draft_Stale"] = "1" if stored_draft_stale else "0"
+    version_stale = has_drafts and row_draft_version and row_draft_version != draft_version
+    if derive_effective_draft_stale:
+        row["Draft_Stale"] = "1" if has_drafts and (stored_draft_stale or version_stale) else "0"
+    else:
+        row["Draft_Stale"] = "1" if has_drafts and stored_draft_stale else "0"
     return row
+
+
+def _persistable_row(lead: dict, draft_version: str, research_version: str) -> dict:
+    row = {col: lead.get(col, "") for col in ALL_COLUMNS}
+    stored_draft_stale = "1" if str(lead.get("_Stored_Draft_Stale", row.get("Draft_Stale", "0")) or "").strip() == "1" else "0"
+    row["Draft_Stale"] = stored_draft_stale
+    return _apply_staleness_defaults(
+        row,
+        draft_version,
+        research_version,
+        derive_effective_draft_stale=False,
+    )
 
 
 def ensure_lead_ids(leads: list[dict], campaign: Optional[dict] = None) -> int:
@@ -259,14 +289,27 @@ def ensure_lead_ids(leads: list[dict], campaign: Optional[dict] = None) -> int:
     return assigned
 
 
-def load_leads(csv_path: str = "", campaign: Optional[dict] = None) -> list[dict]:
+def load_leads(
+    csv_path: str = "",
+    campaign: Optional[dict] = None,
+    *,
+    derive_effective_draft_stale: bool = True,
+) -> list[dict]:
     """Load all rows from the active CRM CSV. Missing columns default to ''."""
     if backend.is_postgres_backend() and not csv_path:
         active_campaign = campaign or get_active_campaign()
         leads = backend.postgres_load_leads(active_campaign["id"])
         draft_version = _draft_version(active_campaign)
         research_version = _research_version(active_campaign)
-        return [_apply_staleness_defaults(dict(lead), draft_version, research_version) for lead in leads]
+        return [
+            _apply_staleness_defaults(
+                dict(lead),
+                draft_version,
+                research_version,
+                derive_effective_draft_stale=derive_effective_draft_stale,
+            )
+            for lead in leads
+        ]
 
     path = _resolve_csv_path(csv_path=csv_path, campaign=campaign)
     if not os.path.exists(path):
@@ -281,7 +324,14 @@ def load_leads(csv_path: str = "", campaign: Optional[dict] = None) -> list[dict
             for col in ALL_COLUMNS:
                 if col not in row:
                     row[col] = ""
-            leads.append(_apply_staleness_defaults(dict(row), draft_version, research_version))
+            leads.append(
+                _apply_staleness_defaults(
+                    dict(row),
+                    draft_version,
+                    research_version,
+                    derive_effective_draft_stale=derive_effective_draft_stale,
+                )
+            )
     return leads
 
 
@@ -293,8 +343,7 @@ def save_leads(leads: list[dict], csv_path: str = "", campaign: Optional[dict] =
         research_version = _research_version(active_campaign)
         normalized = []
         for lead in leads:
-            row = {col: lead.get(col, "") for col in ALL_COLUMNS}
-            normalized.append(_apply_staleness_defaults(row, draft_version, research_version))
+            normalized.append(_persistable_row(lead, draft_version, research_version))
         backend.postgres_save_leads(active_campaign["id"], normalized)
         return
 
@@ -314,9 +363,7 @@ def save_leads(leads: list[dict], csv_path: str = "", campaign: Optional[dict] =
         draft_version = _draft_version(campaign)
         research_version = _research_version(campaign)
         for lead in leads:
-            row = {col: lead.get(col, "") for col in ALL_COLUMNS}
-            row = _apply_staleness_defaults(row, draft_version, research_version)
-            writer.writerow(row)
+            writer.writerow(_persistable_row(lead, draft_version, research_version))
         tmp_path = tmp.name
 
     os.replace(tmp_path, path)
@@ -330,8 +377,7 @@ def save_lead(lead: dict, csv_path: str = "", campaign: Optional[dict] = None) -
 
     if backend.is_postgres_backend() and not csv_path:
         active_campaign = campaign or get_active_campaign()
-        row = {col: lead.get(col, "") for col in ALL_COLUMNS}
-        normalized = _apply_staleness_defaults(row, _draft_version(active_campaign), _research_version(active_campaign))
+        normalized = _persistable_row(lead, _draft_version(active_campaign), _research_version(active_campaign))
         backend.postgres_upsert_lead(active_campaign["id"], normalized)
         return
 
@@ -359,8 +405,7 @@ def save_leads_batch(leads: list[dict], csv_path: str = "", campaign: Optional[d
             lead_id = str(lead.get("ID") or "").strip()
             if not lead_id:
                 continue
-            row = {col: lead.get(col, "") for col in ALL_COLUMNS}
-            normalized.append(_apply_staleness_defaults(row, draft_version, research_version))
+            normalized.append(_persistable_row(lead, draft_version, research_version))
         backend.postgres_upsert_leads(active_campaign["id"], normalized)
         return
 
