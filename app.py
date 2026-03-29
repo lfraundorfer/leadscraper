@@ -96,6 +96,8 @@ ALL_LEADS_CHANNEL_OPTIONS = ["email", "whatsapp", "phone", "none"]
 ALL_LEADS_PRIORITY_OPTIONS = ["1", "2", "3", "4", "5"]
 REVIEW_QUEUE_PAGE_SIZE = 100
 OUTREACH_PAGE_SIZE = 100
+PRE_CONTACT_TEMPLATE_REFRESH_STATUSES = {"new", "draft_ready", "approved"}
+TEMPLATE_EDITOR_NOTICE_KEY = "template_editor_notice"
 
 
 def _clear_cached_result(cache_func, *args) -> None:
@@ -147,6 +149,22 @@ def reload(*, campaign_id: str = "", campaign_changed: bool = False) -> None:
     elif campaign_id:
         invalidate_lead_cache(campaign_id)
     st.rerun()
+
+
+def _set_template_editor_notice(level: str, message: str) -> None:
+    st.session_state[TEMPLATE_EDITOR_NOTICE_KEY] = {"level": level, "message": message}
+
+
+def _render_template_editor_notice() -> None:
+    notice = st.session_state.pop(TEMPLATE_EDITOR_NOTICE_KEY, None)
+    if not isinstance(notice, dict):
+        return
+    level = str(notice.get("level") or "info").strip()
+    message = str(notice.get("message") or "").strip()
+    if not message:
+        return
+    renderer = getattr(st, level, st.info)
+    renderer(message)
 
 
 @st.cache_data(ttl=300)
@@ -1301,9 +1319,43 @@ def _persist_campaign_copy_changes(
     invalidate_campaign_copy_cache(campaign)
 
 
+def _refresh_non_contacted_template_drafts(campaign: dict) -> int:
+    from crm_templates import has_saved_drafts, rerender_saved_draft
+
+    leads = load_leads(campaign=campaign)
+    refreshed = 0
+    today_iso = date.today().isoformat()
+
+    for lead in leads:
+        status = (lead.get("Status") or "new").strip() or "new"
+        if status not in PRE_CONTACT_TEMPLATE_REFRESH_STATUSES:
+            continue
+        if not has_saved_drafts(lead):
+            continue
+
+        rerender_saved_draft(lead, campaign=campaign)
+        clear_scheduled_send(lead)
+        lead["Drafts_Approved"] = "0"
+        lead["Approved_At"] = ""
+        lead["Status"] = "draft_ready"
+
+        preferred = (lead.get("Preferred_Channel") or "").strip()
+        if preferred and preferred != "none":
+            lead["Next_Action_Type"] = preferred
+            if not (lead.get("Next_Action_Date") or "").strip():
+                lead["Next_Action_Date"] = today_iso
+
+        refreshed += 1
+
+    if refreshed:
+        save_leads(leads, campaign=campaign)
+    return refreshed
+
+
 def _render_campaign_template_editor(campaign: dict) -> None:
     st.divider()
     st.subheader("Template Editor")
+    _render_template_editor_notice()
     st.caption("Edit campaign-specific draft copy here. Saving changes marks existing drafts as stale so you can regenerate them with the new wording.")
 
     placeholder_help = (
@@ -1418,6 +1470,26 @@ def _render_campaign_template_editor(campaign: dict) -> None:
                     payload.pop("templates", None)
             _persist_campaign_copy_changes(campaign, template_payload=payload)
             reload(campaign_id=campaign["id"], campaign_changed=True)
+
+    st.caption(
+        "Need to apply the latest copy everywhere? This refreshes saved drafts for "
+        "`new`, `draft_ready`, and `approved` leads, clears approval/queued sends, "
+        "and leaves contacted leads untouched."
+    )
+    if st.button("Refresh Non-Contacted Drafts", width="stretch", key=f"refresh_template_drafts_{campaign['id']}"):
+        with st.spinner("Refreshing non-contacted drafts from current templates..."):
+            refreshed = _refresh_non_contacted_template_drafts(campaign)
+        if refreshed:
+            _set_template_editor_notice(
+                "success",
+                f"Refreshed {refreshed} non-contacted draft(s). Approved leads were moved back to review.",
+            )
+        else:
+            _set_template_editor_notice(
+                "info",
+                "No saved drafts found for `new`, `draft_ready`, or `approved` leads.",
+            )
+        reload(campaign_id=campaign["id"])
 
 
 def _active_campaign_switch() -> dict:
