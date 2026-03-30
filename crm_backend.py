@@ -76,8 +76,7 @@ LEAD_QUEUE_FIELDS = {
 def _lead_has_saved_drafts_sql(payload_sql: str = "payload") -> str:
     return (
         f"(coalesce({payload_sql} ->> 'Email_Draft', '') <> '' "
-        f"or coalesce({payload_sql} ->> 'WhatsApp_Draft', '') <> '' "
-        f"or coalesce({payload_sql} ->> 'Phone_Script', '') <> '')"
+        f"or coalesce({payload_sql} ->> 'WhatsApp_Draft', '') <> '')"
     )
 
 
@@ -674,7 +673,7 @@ def _postgres_upsert_lead_row(cur: Any, campaign_id: str, lead: dict[str, Any], 
 
 
 def _apply_effective_draft_stale(payload: dict[str, Any], draft_version: str) -> dict[str, Any]:
-    has_drafts = any((payload.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+    has_drafts = any((payload.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft"))
     stored_stale = (payload.get("Draft_Stale") or "").strip() == "1"
     row_draft_version = (payload.get("Draft_Config_Version") or "").strip()
     version_stale = has_drafts and row_draft_version and row_draft_version != draft_version
@@ -751,6 +750,7 @@ def postgres_load_template_refresh_candidates(
     template_keys: list[str] | None = None,
     stale_only: bool = False,
 ) -> list[dict[str, Any]]:
+    legacy_default_categories = {"kein_seo", "kein_kontakt", "veraltet", "not_ranked", "kein_design", "kein_ssl"}
     where_clauses = [
         "status = any(%s)",
         _lead_has_saved_drafts_sql(),
@@ -760,7 +760,10 @@ def postgres_load_template_refresh_candidates(
     if stale_only:
         where_clauses.append("coalesce(payload ->> 'Draft_Stale', '0') = '1'")
 
-    template_values = sorted({value for value in (template_keys or []) if value})
+    template_values = {value for value in (template_keys or []) if value}
+    if "default" in template_values:
+        template_values.update(legacy_default_categories)
+    template_values = sorted(template_values)
     if template_values:
         where_clauses.append(
             """
@@ -831,7 +834,6 @@ def postgres_load_outreach_leads(campaign_id: str) -> list[dict[str, Any]]:
             and (
                 coalesce(payload ->> 'Email_Draft', '') <> ''
                 or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
-                or coalesce(payload ->> 'Phone_Script', '') <> ''
             )
         """,
     )
@@ -862,7 +864,6 @@ def postgres_load_outreach_summary(
           and (
                 coalesce(payload ->> 'Email_Draft', '') <> ''
                 or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
-                or coalesce(payload ->> 'Phone_Script', '') <> ''
               )
     """
     params: list[Any] = [campaign_id]
@@ -945,7 +946,6 @@ def postgres_load_outreach_counts(campaign_id: str, today_iso: str) -> dict[str,
                   and (
                         coalesce(payload ->> 'Email_Draft', '') <> ''
                         or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
-                        or coalesce(payload ->> 'Phone_Script', '') <> ''
                       )
             )
             select
@@ -1133,7 +1133,6 @@ def postgres_load_recontact_leads(campaign_id: str) -> list[dict[str, Any]]:
             and (
                 coalesce(payload ->> 'Email_Draft', '') <> ''
                 or coalesce(payload ->> 'WhatsApp_Draft', '') <> ''
-                or coalesce(payload ->> 'Phone_Script', '') <> ''
             )
         """,
     )

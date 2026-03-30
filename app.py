@@ -51,11 +51,13 @@ from crm_templates import (
     build_template_editor_snapshot,
     compose_email_draft,
     get_effective_hooks_library,
+    get_effective_shared_templates,
     get_effective_special_subject_option,
     get_effective_subject_templates,
-    get_effective_templates,
     get_subject_options,
     get_template_override_payload,
+    hook_category_keys,
+    humanize_hook_category,
     invalidate_campaign_copy_cache,
     mark_template_editor_pending_drafts_stale,
     parse_email_draft,
@@ -111,6 +113,7 @@ OUTREACH_PAGE_SIZE = 100
 TEMPLATE_EDITOR_NOTICE_KEY = "template_editor_notice"
 TEMPLATE_PLACEHOLDER_HELP = [
     ("hook", "The selected hook sentence(s) for this lead."),
+    ("wa_hook", "The selected WhatsApp hook sentence(s) for this lead."),
     ("subject", "The auto-selected email subject from the shared subject library."),
     ("urgency", "An urgency line from GPT; usually blank in template-only mode."),
     ("salutation", "Formal greeting, for example 'Guten Tag Herr Muster,' or 'Sehr geehrte Damen und Herren,'."),
@@ -211,7 +214,7 @@ def _render_template_placeholder_reference() -> None:
 
 
 def _humanize_template_editor_key(value: str) -> str:
-    return (value or "").replace("_", " ").strip().title()
+    return humanize_hook_category(value)
 
 
 def _join_template_editor_labels(labels: list[str]) -> str:
@@ -235,24 +238,29 @@ def _describe_template_editor_change(
     if change_type == "subjects":
         return "subject settings"
 
-    if change_type == "template":
-        label = _humanize_template_editor_key(selected_template_key)
-        return f"{label} template" if label else "template copy"
+    if change_type == "email_template":
+        return "shared email template"
 
-    before_hooks = before_snapshot.get("hooks") if isinstance(before_snapshot.get("hooks"), dict) else {}
-    after_hooks = after_snapshot.get("hooks") if isinstance(after_snapshot.get("hooks"), dict) else {}
+    if change_type == "whatsapp_template":
+        return "shared WhatsApp template"
+
+    hook_channel = "email" if change_type == "email_hooks" else "whatsapp"
+    before_hooks_by_channel = before_snapshot.get("hooks") if isinstance(before_snapshot.get("hooks"), dict) else {}
+    after_hooks_by_channel = after_snapshot.get("hooks") if isinstance(after_snapshot.get("hooks"), dict) else {}
+    before_hooks = before_hooks_by_channel.get(hook_channel) if isinstance(before_hooks_by_channel.get(hook_channel), dict) else {}
+    after_hooks = after_hooks_by_channel.get(hook_channel) if isinstance(after_hooks_by_channel.get(hook_channel), dict) else {}
     changed_categories = sorted(
         _humanize_template_editor_key(key)
         for key in set(before_hooks) | set(after_hooks)
         if before_hooks.get(key, []) != after_hooks.get(key, [])
     )
     if not changed_categories:
-        return "hook library"
+        return f"{hook_channel} hook library"
     if len(changed_categories) <= 3:
-        return f"{_join_template_editor_labels(changed_categories)} hooks"
+        return f"{_join_template_editor_labels(changed_categories)} {hook_channel} hooks"
     return (
         f"{_join_template_editor_labels(changed_categories[:2])}, and "
-        f"{len(changed_categories) - 2} more hook categories"
+        f"{len(changed_categories) - 2} more {hook_channel} hook categories"
     )
 
 
@@ -378,7 +386,7 @@ def cached_outreach_leads(campaign_id: str) -> list[dict]:
         lead for lead in leads
         if lead.get("Status") == "approved"
         and lead.get("Drafts_Approved") == "1"
-        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft"))
     ]
     approved.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Unternehmen") or ""))
     return approved
@@ -574,7 +582,7 @@ def cached_recontact_leads(campaign_id: str) -> list[dict]:
         lead for lead in leads
         if lead.get("Status") not in TERMINAL_STATUSES
         and _has_contact_history(lead)
-        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft"))
         and lead.get("Status") != "approved"
     ]
 
@@ -810,13 +818,12 @@ def _apply_draft_edits_to_row(
     subject: str,
     body: str,
     whatsapp: str,
-    phone_script: str,
     selected_channel: str,
     schedule_choice: str = "",
 ) -> None:
     row["Email_Draft"] = compose_email_draft(subject, body)
     row["WhatsApp_Draft"] = whatsapp.strip()
-    row["Phone_Script"] = phone_script.strip()
+    row["Phone_Script"] = ""
     valid_channels = available_channels(row)
     if selected_channel in valid_channels:
         row["Preferred_Channel"] = selected_channel
@@ -840,7 +847,6 @@ def _save_draft_edits(
     subject: str,
     body: str,
     whatsapp: str,
-    phone_script: str,
     selected_channel: str,
     schedule_choice: str = "",
 ) -> dict | None:
@@ -853,7 +859,6 @@ def _save_draft_edits(
         subject=subject,
         body=body,
         whatsapp=whatsapp,
-        phone_script=phone_script,
         selected_channel=selected_channel,
         schedule_choice=schedule_choice,
     )
@@ -868,7 +873,6 @@ def _record_outreach_action(
     subject: str,
     body: str,
     whatsapp: str,
-    phone_script: str,
     selected_channel: str,
     outcome: str,
     channel: str,
@@ -884,7 +888,6 @@ def _record_outreach_action(
         subject=subject,
         body=body,
         whatsapp=whatsapp,
-        phone_script=phone_script,
         selected_channel=selected_channel,
         schedule_choice=schedule_choice,
     )
@@ -906,7 +909,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
     subject_key = f"{key_prefix}_subject_text"
     email_body_key = f"{key_prefix}_email_body"
     whatsapp_key = f"{key_prefix}_wa"
-    phone_key = f"{key_prefix}_phone"
     action_note_key = f"{key_prefix}_action_note"
 
     with st.form(f"{key_prefix}_workspace_form"):
@@ -926,8 +928,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
         )
         email_body = st.text_area("Email body", value=current_body, height=240, key=email_body_key)
         wa_draft = st.text_area("WhatsApp draft", value=lead.get("WhatsApp_Draft", ""), height=120, key=whatsapp_key)
-        phone_script = st.text_area("Phone script", value=lead.get("Phone_Script", ""), height=220, key=phone_key)
-        _render_draft_links(email_body, wa_draft, phone_script)
+        _render_draft_links(email_body, wa_draft)
         action_note = st.text_input(
             "Action note",
             value="",
@@ -1028,7 +1029,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             schedule_choice="clear",
         )
@@ -1040,7 +1040,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             schedule_choice="today",
         )
@@ -1052,7 +1051,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             schedule_choice="tomorrow",
         )
@@ -1066,7 +1064,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 subject=selected_subject,
                 body=email_body,
                 whatsapp=wa_draft,
-                phone_script=phone_script,
                 selected_channel=selected_channel,
                 schedule_choice="clear",
             )
@@ -1083,7 +1080,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             outcome="sent",
             channel="email",
@@ -1098,7 +1094,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             outcome="sent",
             channel="whatsapp",
@@ -1113,7 +1108,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             outcome="called",
             channel="phone",
@@ -1127,7 +1121,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             outcome="voicemail",
             channel="phone",
@@ -1141,7 +1134,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             outcome="no_answer",
             channel="phone",
@@ -1155,7 +1147,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             subject=selected_subject,
             body=email_body,
             whatsapp=wa_draft,
-            phone_script=phone_script,
             selected_channel=selected_channel,
             outcome="done",
             channel=selected_channel,
@@ -1490,7 +1481,15 @@ def _render_campaign_template_editor(campaign: dict) -> None:
     st.caption("Edit campaign-specific draft copy here. Saving changes only marks affected pending drafts as stale so you can regenerate the new wording without touching approved leads.")
     _render_template_placeholder_reference()
 
-    subjects_tab, hooks_tab, templates_tab = st.tabs(["Subjects", "Hooks", "Templates"])
+    category_keys = list(hook_category_keys())
+    tab_labels = [
+        "Subjects",
+        "Email Hooks",
+        "WhatsApp Hooks",
+        "Shared Email Template",
+        "Shared WhatsApp Template",
+    ]
+    subjects_tab, email_hooks_tab, whatsapp_hooks_tab, email_template_tab, whatsapp_template_tab = st.tabs(tab_labels)
 
     with subjects_tab:
         effective_subjects = get_effective_subject_templates(campaign=campaign)
@@ -1524,81 +1523,152 @@ def _render_campaign_template_editor(campaign: dict) -> None:
             payload.pop("subject_templates", None)
             _apply_template_editor_change(campaign, change_type="subjects", template_payload=payload)
 
-    with hooks_tab:
-        effective_hooks = get_effective_hooks_library(campaign=campaign)
-        with st.form(f"hooks_editor_{campaign['id']}"):
+    with email_hooks_tab:
+        effective_email_hooks = get_effective_hooks_library(campaign=campaign, channel="email")
+        effective_whatsapp_hooks = get_effective_hooks_library(campaign=campaign, channel="whatsapp")
+        with st.form(f"email_hooks_editor_{campaign['id']}"):
             st.caption("One hook per line. Hooks can also use the same placeholders as templates.")
             st.caption("Use the placeholders from the reference above.")
+            st.caption("These hooks feed the shared email body for exactly six campaign categories.")
             hook_inputs: dict[str, str] = {}
-            for category, items in effective_hooks.items():
-                with st.expander(category.replace("_", " ").title(), expanded=False):
+            for category in category_keys:
+                label = _humanize_template_editor_key(category)
+                with st.expander(label, expanded=False):
                     hook_inputs[category] = st.text_area(
-                        f"{category} hooks",
-                        value="\n".join(items),
+                        f"{label} email hooks",
+                        value="\n".join(effective_email_hooks.get(category, [])),
                         height=180,
                     )
             c1, c2 = st.columns(2)
-            save_hooks = c1.form_submit_button("Save Hook Library", type="primary", width="stretch")
-            reset_hooks = c2.form_submit_button("Reset All Hooks", width="stretch")
+            save_hooks = c1.form_submit_button("Save Email Hooks", type="primary", width="stretch")
+            reset_hooks = c2.form_submit_button("Reset Email Hooks", width="stretch")
 
         if save_hooks:
             hooks_payload = {
-                category: [line.strip() for line in text.splitlines() if line.strip()]
-                for category, text in hook_inputs.items()
-                if [line.strip() for line in text.splitlines() if line.strip()]
+                "email": {
+                    category: [line.strip() for line in text.splitlines() if line.strip()]
+                    for category, text in hook_inputs.items()
+                    if [line.strip() for line in text.splitlines() if line.strip()]
+                },
+                "whatsapp": effective_whatsapp_hooks,
             }
-            _apply_template_editor_change(campaign, change_type="hooks", hooks_payload=hooks_payload)
+            _apply_template_editor_change(campaign, change_type="email_hooks", hooks_payload=hooks_payload)
 
         if reset_hooks:
-            _apply_template_editor_change(campaign, change_type="hooks", hooks_payload={})
+            hooks_payload = {
+                "email": {},
+                "whatsapp": effective_whatsapp_hooks,
+            }
+            _apply_template_editor_change(campaign, change_type="email_hooks", hooks_payload=hooks_payload)
 
-    with templates_tab:
-        effective_templates = get_effective_templates(campaign=campaign)
-        template_keys = [key for key in effective_templates if key != "default"]
-        selected_template_key = st.selectbox(
-            "Template category",
-            options=template_keys,
-            format_func=lambda key: key.replace("_", " ").title(),
-            key=f"template_editor_pick_{campaign['id']}",
-        )
-        template = effective_templates[selected_template_key]
-        with st.form(f"template_editor_form_{campaign['id']}_{selected_template_key}"):
-            st.caption("Edit the full template text used for future draft generation.")
+    with whatsapp_hooks_tab:
+        effective_email_hooks = get_effective_hooks_library(campaign=campaign, channel="email")
+        effective_whatsapp_hooks = get_effective_hooks_library(campaign=campaign, channel="whatsapp")
+        with st.form(f"whatsapp_hooks_editor_{campaign['id']}"):
+            st.caption("One hook per line. Hooks can also use the same placeholders as templates.")
             st.caption("Use the placeholders from the reference above.")
-            email_template = st.text_area("Email template", value=template.get("email", ""), height=420)
-            whatsapp_template = st.text_area("WhatsApp template", value=template.get("whatsapp", ""), height=160)
-            phone_template = st.text_area("Phone script template", value=template.get("phone_script", ""), height=320)
+            st.caption("These hooks feed the shared WhatsApp body via `{{wa_hook}}` for the same six categories.")
+            hook_inputs: dict[str, str] = {}
+            for category in category_keys:
+                label = _humanize_template_editor_key(category)
+                with st.expander(label, expanded=False):
+                    hook_inputs[category] = st.text_area(
+                        f"{label} WhatsApp hooks",
+                        value="\n".join(effective_whatsapp_hooks.get(category, [])),
+                        height=180,
+                    )
             c1, c2 = st.columns(2)
-            save_template = c1.form_submit_button("Save Template", type="primary", width="stretch")
-            reset_template = c2.form_submit_button("Reset This Template", width="stretch")
+            save_hooks = c1.form_submit_button("Save WhatsApp Hooks", type="primary", width="stretch")
+            reset_hooks = c2.form_submit_button("Reset WhatsApp Hooks", width="stretch")
+
+        if save_hooks:
+            hooks_payload = {
+                "email": effective_email_hooks,
+                "whatsapp": {
+                    category: [line.strip() for line in text.splitlines() if line.strip()]
+                    for category, text in hook_inputs.items()
+                    if [line.strip() for line in text.splitlines() if line.strip()]
+                },
+            }
+            _apply_template_editor_change(campaign, change_type="whatsapp_hooks", hooks_payload=hooks_payload)
+
+        if reset_hooks:
+            hooks_payload = {
+                "email": effective_email_hooks,
+                "whatsapp": {},
+            }
+            _apply_template_editor_change(campaign, change_type="whatsapp_hooks", hooks_payload=hooks_payload)
+
+    with email_template_tab:
+        effective_shared_templates = get_effective_shared_templates(campaign=campaign)
+        with st.form(f"shared_email_template_editor_{campaign['id']}"):
+            st.caption("Edit the single shared email body used for every lead in this campaign.")
+            st.caption("Only the subject and hook category change per lead.")
+            email_template = st.text_area("Shared email template", value=effective_shared_templates.get("email", ""), height=480)
+            c1, c2 = st.columns(2)
+            save_template = c1.form_submit_button("Save Shared Email Template", type="primary", width="stretch")
+            reset_template = c2.form_submit_button("Reset Shared Email Template", width="stretch")
 
         if save_template:
             payload = get_template_override_payload(campaign=campaign)
-            templates_payload = payload.setdefault("templates", {})
-            templates_payload[selected_template_key] = {
-                "email": email_template,
-                "whatsapp": whatsapp_template,
-                "phone_script": phone_template,
-            }
+            shared_templates = payload.setdefault("shared_templates", {})
+            shared_templates["email"] = email_template
+            shared_templates["whatsapp"] = effective_shared_templates.get("whatsapp", "")
+            payload.pop("templates", None)
             _apply_template_editor_change(
                 campaign,
-                change_type="template",
+                change_type="email_template",
                 template_payload=payload,
-                selected_template_key=selected_template_key,
             )
 
         if reset_template:
             payload = get_template_override_payload(campaign=campaign)
-            templates_payload = payload.get("templates")
-            if isinstance(templates_payload, dict):
-                templates_payload.pop(selected_template_key, None)
-                if not templates_payload:
-                    payload.pop("templates", None)
+            shared_templates = payload.get("shared_templates")
+            if isinstance(shared_templates, dict):
+                shared_templates.pop("email", None)
+                if not shared_templates:
+                    payload.pop("shared_templates", None)
+            payload.pop("templates", None)
             _apply_template_editor_change(
                 campaign,
-                change_type="template",
+                change_type="email_template",
                 template_payload=payload,
-                selected_template_key=selected_template_key,
+            )
+
+    with whatsapp_template_tab:
+        effective_shared_templates = get_effective_shared_templates(campaign=campaign)
+        with st.form(f"shared_whatsapp_template_editor_{campaign['id']}"):
+            st.caption("Edit the single shared WhatsApp body used for every lead in this campaign.")
+            st.caption("Only the hook category changes per lead, via `{{wa_hook}}`.")
+            whatsapp_template = st.text_area("Shared WhatsApp template", value=effective_shared_templates.get("whatsapp", ""), height=240)
+            c1, c2 = st.columns(2)
+            save_template = c1.form_submit_button("Save Shared WhatsApp Template", type="primary", width="stretch")
+            reset_template = c2.form_submit_button("Reset Shared WhatsApp Template", width="stretch")
+
+        if save_template:
+            payload = get_template_override_payload(campaign=campaign)
+            shared_templates = payload.setdefault("shared_templates", {})
+            shared_templates["email"] = effective_shared_templates.get("email", "")
+            shared_templates["whatsapp"] = whatsapp_template
+            payload.pop("templates", None)
+            _apply_template_editor_change(
+                campaign,
+                change_type="whatsapp_template",
+                template_payload=payload,
+            )
+
+        if reset_template:
+            payload = get_template_override_payload(campaign=campaign)
+            shared_templates = payload.get("shared_templates")
+            if isinstance(shared_templates, dict):
+                shared_templates.pop("whatsapp", None)
+                if not shared_templates:
+                    payload.pop("shared_templates", None)
+            payload.pop("templates", None)
+            _apply_template_editor_change(
+                campaign,
+                change_type="whatsapp_template",
+                template_payload=payload,
             )
 
     st.caption(
@@ -1836,8 +1906,7 @@ def _render_review_queue(campaign: dict) -> None:
             )
             email_body = st.text_area("Email body", value=current_body, height=260, key=f"{review_key_prefix}_email_body")
             wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120, key=f"{review_key_prefix}_wa")
-            phone_script = st.text_area("Phone script", value=selected.get("Phone_Script", ""), height=240, key=f"{review_key_prefix}_phone")
-            _render_draft_links(email_body, wa_draft, phone_script)
+            _render_draft_links(email_body, wa_draft)
             st.caption(f"Queue status: {scheduled_send_label(selected)}")
             c1, c2, c3, c4, c5 = st.columns(5)
             approve = c1.form_submit_button("Approve", type="primary", width="stretch")
@@ -1851,7 +1920,7 @@ def _render_review_queue(campaign: dict) -> None:
             if lead is not None:
                 lead["Email_Draft"] = compose_email_draft(selected_subject, email_body)
                 lead["WhatsApp_Draft"] = wa_draft
-                lead["Phone_Script"] = phone_script
+                lead["Phone_Script"] = ""
                 lead["Preferred_Channel"] = selected_channel
                 lead["Next_Action_Type"] = selected_channel
                 lead["Status"] = "approved"
@@ -2134,7 +2203,7 @@ def _render_recontact(campaign: dict, leads: list[dict]) -> None:
         lead for lead in leads
         if lead.get("Status") not in TERMINAL_STATUSES
         and _has_contact_history(lead)
-        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft", "Phone_Script"))
+        and any((lead.get(field) or "").strip() for field in ("Email_Draft", "WhatsApp_Draft"))
         and lead.get("Status") != "approved"
     ]
     candidates.sort(key=lambda lead: (_first_contact_sort_key(lead), int(lead.get("Priority") or 5), lead.get("Unternehmen") or ""))
@@ -2318,7 +2387,8 @@ def _render_all_leads(campaign: dict) -> None:
             st.markdown("**Research**")
             st.text(f"Website score: {lead.get('Website_Score') or '-'}")
             st.text(f"Google rank:   {lead.get('Google_Rank_Position') or '-'}")
-            st.text(f"Template:      {lead.get('Template_Used') or '-'}")
+            template_used = (lead.get("Template_Used") or "").strip()
+            st.text(f"Hook Category: {humanize_hook_category(template_used) if template_used else '-'}")
 
             default_price = campaign.get("price_default") or "500"
             price_value = st.text_input("Price", value=lead.get("Price") or default_price, key=f"price_{lid}")

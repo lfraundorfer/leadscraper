@@ -127,6 +127,7 @@ Notes:
 - it gets a campaign id like `schluesseldienst_wien`
 - once created, it is stored in Supabase right away in hosted mode and appears in Streamlit after a refresh
 - you can edit `Campaign Config` and `Template Editor` as soon as the campaign exists
+- `Template Editor` now manages shared campaign-level email/WhatsApp bodies plus separate email and WhatsApp hook libraries
 - if you change templates after drafts were already generated, run `python crm.py refresh-drafts` or rerun `python crm.py analyze`
 
 ## CLI Commands
@@ -156,7 +157,7 @@ python crm.py stats
 
 ## Streamlit Pages
 
-- `Campaigns`: create/activate campaigns, edit config, edit hooks/templates, run pipeline stages
+- `Campaigns`: create/activate campaigns, edit config, edit shared email/WhatsApp templates, edit email/WhatsApp hooks, run pipeline stages
 - `Dashboard`: KPIs and batch draft generation
 - `Review Queue`: review drafts, approve, queue for today/tomorrow
 - `Outreach`: manual email/WhatsApp/phone actions, queued send overview

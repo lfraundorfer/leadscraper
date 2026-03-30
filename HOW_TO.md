@@ -255,8 +255,7 @@ What it does:
 - generates:
   - email draft
   - WhatsApp draft
-  - phone script
-- fills `Template_Used`
+  - hook category in `Template_Used`
 - clears `Draft_Stale`
 - usually sets the lead to `draft_ready`
 
@@ -358,7 +357,6 @@ For each lead you can:
 - see portfolio references
 - edit the email subject and body
 - edit the WhatsApp draft
-- edit the phone script
 - choose the preferred first channel
 
 ### Approve

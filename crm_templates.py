@@ -8,7 +8,8 @@ Slot syntax: {{slot_name}}  (double braces — replaced by fill_template())
 ALL slots in templates must use {{key}} — no single-brace {key} format.
 
 Available slots:
-  {{hook}}             – GPT-generated 2-3 sentence specific hook
+  {{hook}}             – Selected email hook for the lead
+  {{wa_hook}}          – Selected WhatsApp hook for the lead
   {{urgency}}          – GPT-generated 1 sentence urgency
   {{company}}          – Company name (nur wenn ein direkter Konkurrenzvergleich nötig ist)
   {{salutation}}       – "Guten Tag Herr Mustermann," or "Sehr geehrte Damen und Herren,"
@@ -41,11 +42,53 @@ import crm_backend as backend
 
 _LEGACY_HOOKS_LIBRARY_PATH = Path(__file__).parent / "hooks_library.json"
 _LEGACY_TEMPLATE_OVERRIDES_PATH = Path(__file__).parent / "template_overrides.json"
-_hooks_override_cache: dict[str, dict[str, list[str]]] = {}
+_hooks_override_cache: dict[str, dict] = {}
 _template_override_cache: dict[str, dict] = {}
 _UNSET = object()
-_TEMPLATE_DRAFT_FIELDS = ("Email_Draft", "WhatsApp_Draft", "Phone_Script")
+_TEMPLATE_DRAFT_FIELDS = ("Email_Draft", "WhatsApp_Draft")
 _PENDING_TEMPLATE_EDITOR_STATUSES = {"new", "draft_ready"}
+_HOOK_CHANNELS = ("email", "whatsapp")
+_SHARED_TEMPLATE_CHANNELS = ("email", "whatsapp")
+CANONICAL_HOOK_CATEGORIES = (
+    "default",
+    "no_website",
+    "platzhalter",
+    "kein_mobil",
+    "bad_reviews",
+    "keine_bewertungen",
+)
+HOOK_CATEGORY_LABELS = {
+    "default": "Default",
+    "no_website": "Keine Website",
+    "platzhalter": "Placeholder",
+    "kein_mobil": "Kein Mobil",
+    "bad_reviews": "Bad Reviews",
+    "keine_bewertungen": "No Reviews",
+}
+_LEGACY_SHARED_TEMPLATE_KEY = "kein_seo"
+_LEGACY_DEFAULT_MERGE_KEYS = (
+    "default",
+    "kein_seo",
+    "kein_kontakt",
+    "veraltet",
+    "not_ranked",
+    "kein_design",
+    "kein_ssl",
+)
+_CATEGORY_NORMALIZATION = {
+    "default": "default",
+    "no_website": "no_website",
+    "platzhalter": "platzhalter",
+    "kein_mobil": "kein_mobil",
+    "bad_reviews": "bad_reviews",
+    "keine_bewertungen": "keine_bewertungen",
+    "kein_kontakt": "default",
+    "veraltet": "default",
+    "not_ranked": "default",
+    "kein_seo": "default",
+    "kein_design": "default",
+    "kein_ssl": "default",
+}
 
 _PROTECTED_REFRESH_STATUSES = {
     "approved",
@@ -57,6 +100,123 @@ _PROTECTED_REFRESH_STATUSES = {
     "no_contact",
     "blacklist",
 }
+
+
+def normalize_hook_category(value: str) -> str:
+    return _CATEGORY_NORMALIZATION.get((value or "").strip(), "default")
+
+
+def humanize_hook_category(value: str) -> str:
+    normalized = normalize_hook_category(value)
+    return HOOK_CATEGORY_LABELS.get(normalized, normalized.replace("_", " ").title())
+
+
+def hook_category_keys() -> tuple[str, ...]:
+    return CANONICAL_HOOK_CATEGORIES
+
+
+def _clean_string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _dedupe_string_list(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in values:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _empty_hook_library() -> dict[str, list[str]]:
+    return {category: [] for category in CANONICAL_HOOK_CATEGORIES}
+
+
+def _normalize_flat_hook_payload(payload: dict | None) -> dict[str, list[str]]:
+    normalized = _empty_hook_library()
+    if not isinstance(payload, dict):
+        return normalized
+
+    default_items: list[str] = []
+    for key in _LEGACY_DEFAULT_MERGE_KEYS:
+        default_items.extend(_clean_string_list(payload.get(key)))
+    for key, values in payload.items():
+        normalized_key = normalize_hook_category(key)
+        cleaned = _clean_string_list(values)
+        if not cleaned:
+            continue
+        if normalized_key == "default":
+            if key not in _LEGACY_DEFAULT_MERGE_KEYS and key not in CANONICAL_HOOK_CATEGORIES:
+                default_items.extend(cleaned)
+            continue
+        normalized[normalized_key] = _dedupe_string_list(cleaned)
+
+    normalized["default"] = _dedupe_string_list(default_items)
+    return normalized
+
+
+def _normalize_hook_override_payload(override: dict | None) -> dict[str, dict[str, list[str]]]:
+    if not isinstance(override, dict):
+        return {channel: _empty_hook_library() for channel in _HOOK_CHANNELS}
+
+    if any(isinstance(override.get(channel), dict) for channel in _HOOK_CHANNELS):
+        email_payload = _normalize_flat_hook_payload(override.get("email") if isinstance(override.get("email"), dict) else {})
+        whatsapp_source = override.get("whatsapp") if isinstance(override.get("whatsapp"), dict) else None
+        whatsapp_payload = _normalize_flat_hook_payload(whatsapp_source) if whatsapp_source is not None else deepcopy(email_payload)
+        return {
+            "email": email_payload,
+            "whatsapp": whatsapp_payload,
+        }
+
+    email_payload = _normalize_flat_hook_payload(override)
+    return {
+        "email": email_payload,
+        "whatsapp": deepcopy(email_payload),
+    }
+
+
+def _effective_shared_templates_from_override(override: dict | None) -> dict[str, str]:
+    legacy_default = TEMPLATES.get(_LEGACY_SHARED_TEMPLATE_KEY, {})
+    shared = {
+        "email": str(legacy_default.get("email") or "").strip(),
+        "whatsapp": str(legacy_default.get("whatsapp") or "").strip(),
+    }
+    if not isinstance(override, dict):
+        shared["whatsapp"] = _normalize_whatsapp_shared_template(shared["whatsapp"])
+        return shared
+
+    shared_override = override.get("shared_templates")
+    if isinstance(shared_override, dict):
+        for channel in _SHARED_TEMPLATE_CHANNELS:
+            value = shared_override.get(channel)
+            if isinstance(value, str) and value.strip():
+                shared[channel] = value
+        shared["whatsapp"] = _normalize_whatsapp_shared_template(shared["whatsapp"])
+        return shared
+
+    legacy_templates = override.get("templates")
+    if isinstance(legacy_templates, dict):
+        source = legacy_templates.get(_LEGACY_SHARED_TEMPLATE_KEY)
+        if not isinstance(source, dict):
+            source = legacy_templates.get("default")
+        if isinstance(source, dict):
+            for channel in _SHARED_TEMPLATE_CHANNELS:
+                value = source.get(channel)
+                if isinstance(value, str) and value.strip():
+                    shared[channel] = value
+    shared["whatsapp"] = _normalize_whatsapp_shared_template(shared["whatsapp"])
+    return shared
+
+
+def _normalize_whatsapp_shared_template(template: str) -> str:
+    text = str(template or "")
+    if "{{wa_hook}}" in text or "{{hook}}" not in text:
+        return text
+    return text.replace("{{hook}}", "{{wa_hook}}")
 
 
 def _set_stored_draft_stale_compat(lead: dict, is_stale: bool) -> None:
@@ -102,7 +262,7 @@ def _resolve_template_overrides_path(campaign: dict | None = None) -> Path:
     return _LEGACY_TEMPLATE_OVERRIDES_PATH
 
 
-def _load_hooks_override(campaign: dict | None = None) -> dict[str, list[str]]:
+def _load_hooks_override(campaign: dict | None = None) -> dict:
     active_campaign = _resolve_campaign(campaign)
     if backend.is_postgres_backend() and active_campaign is not None:
         cache_key = f"campaign:{active_campaign.get('id', '')}:hooks"
@@ -157,28 +317,31 @@ def invalidate_campaign_copy_cache(campaign: dict | None = None) -> None:
     _template_override_cache.pop(str(_resolve_template_overrides_path(campaign)), None)
 
 
-def _clean_string_list(value) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
-
-
-def _effective_hooks_library_from_override(override: dict | None) -> dict[str, list[str]]:
-    hooks = {key: list(values) for key, values in HOOKS.items()}
-    if isinstance(override, dict):
-        for key, values in override.items():
-            cleaned = _clean_string_list(values)
-            if cleaned:
-                hooks[key] = cleaned
+def _effective_hooks_library_from_override(
+    override: dict | None,
+    *,
+    channel: str = "email",
+) -> dict[str, list[str]]:
+    hooks = _normalize_flat_hook_payload(HOOKS)
+    normalized_override = _normalize_hook_override_payload(override)
+    channel_override = normalized_override.get(channel, {})
+    for key in CANONICAL_HOOK_CATEGORIES:
+        cleaned = _clean_string_list(channel_override.get(key))
+        if cleaned:
+            hooks[key] = cleaned
     return hooks
 
 
-def get_effective_hooks_library(campaign: dict | None = None) -> dict[str, list[str]]:
-    return _effective_hooks_library_from_override(_load_hooks_override(campaign=campaign))
+def get_effective_hooks_library(campaign: dict | None = None, *, channel: str = "email") -> dict[str, list[str]]:
+    return _effective_hooks_library_from_override(_load_hooks_override(campaign=campaign), channel=channel)
 
 
 def get_template_override_payload(campaign: dict | None = None) -> dict:
     return deepcopy(_load_template_overrides(campaign=campaign))
+
+
+def get_effective_shared_templates(campaign: dict | None = None) -> dict[str, str]:
+    return _effective_shared_templates_from_override(_load_template_overrides(campaign=campaign))
 
 
 def _effective_subject_templates_from_override(override: dict | None) -> list[str]:
@@ -667,32 +830,37 @@ CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
 }
 
 
-def build_default_campaign_copy_payloads(campaign: dict | None = None) -> tuple[dict[str, list[str]], dict]:
+def build_default_campaign_copy_payloads(campaign: dict | None = None) -> tuple[dict[str, dict[str, list[str]]], dict]:
     seed_slots = _campaign_copy_seed_slots(campaign)
-    hooks_payload = {
+    starter_email_hooks = {
         category: [fill_template(item, seed_slots) for item in items]
         for category, items in STARTER_HOOK_LIBRARY.items()
     }
+    canonical_email_hooks = _normalize_flat_hook_payload(starter_email_hooks)
+    hooks_payload = {
+        "email": canonical_email_hooks,
+        "whatsapp": deepcopy(canonical_email_hooks),
+    }
+    starter_shared = STARTER_TEMPLATE_BLUEPRINTS.get(_LEGACY_SHARED_TEMPLATE_KEY, {})
     template_payload = {
         "special_subject_option": fill_template(STARTER_SPECIAL_SUBJECT_OPTION, seed_slots),
         "subject_templates": [fill_template(item, seed_slots) for item in STARTER_SUBJECT_TEMPLATES],
-        "templates": {
-            template_key: {
-                channel: fill_template(value, seed_slots)
-                for channel, value in channels.items()
-            }
-            for template_key, channels in STARTER_TEMPLATE_BLUEPRINTS.items()
+        "shared_templates": {
+            channel: fill_template(str(starter_shared.get(channel) or ""), seed_slots)
+            for channel in _SHARED_TEMPLATE_CHANNELS
         },
     }
     return hooks_payload, template_payload
 
 
-def get_hook(category: str, lead_id: str = "", campaign: dict | None = None) -> str:
+def get_hook(category: str, lead_id: str = "", campaign: dict | None = None, *, channel: str = "email") -> str:
     """Pick a hook deterministically by lead ID (same lead always gets same hook).
     Checks the active campaign hooks_library.json first, falls back to built-in HOOKS.
     """
-    override = _load_hooks_override(campaign=campaign)
-    options = override.get(category) or HOOKS.get(category) or HOOKS.get("kein_seo", [""])
+    normalized_category = normalize_hook_category(category)
+    options = get_effective_hooks_library(campaign=campaign, channel=channel).get(normalized_category) or []
+    if not options:
+        return ""
     idx = int("".join(filter(str.isdigit, lead_id)) or "0") % len(options)
     return options[idx]
 
@@ -817,20 +985,20 @@ def _hook_repetition_score(candidate: str, template_key: str, lead: dict, campai
     return score
 
 
-def choose_hook(template_key: str, lead: dict, campaign: dict | None = None) -> str:
+def choose_hook(template_key: str, lead: dict, campaign: dict | None = None, *, channel: str = "email") -> str:
     """
     Pick the least repetitive local hook for the chosen template.
     Still deterministic: ties are broken by lead ID.
     """
-    override = _load_hooks_override(campaign=campaign)
-    options = override.get(template_key) or HOOKS.get(template_key) or HOOKS.get("kein_seo", [""])
+    normalized_category = normalize_hook_category(template_key)
+    options = get_effective_hooks_library(campaign=campaign, channel=channel).get(normalized_category) or []
     if not options:
         return ""
 
     ranked = sorted(
         enumerate(options),
         key=lambda item: (
-            _hook_repetition_score(item[1], template_key, lead, campaign=campaign),
+            _hook_repetition_score(item[1], normalized_category, lead, campaign=campaign),
             abs(item[0] - _stable_index(lead.get("ID", ""), len(options))),
             item[0],
         ),
@@ -1319,25 +1487,21 @@ CTA: "Auf welche Adresse schicke ich Ihnen die Ideen?" """,
     },
 }
 
-DEFAULT_TEMPLATE_KEY = "kein_seo"
+DEFAULT_TEMPLATE_KEY = "default"
 
-# Fallback
-TEMPLATES["default"] = TEMPLATES[DEFAULT_TEMPLATE_KEY]
+# Legacy fallback for old payloads that still expect a default template body.
+TEMPLATES["default"] = TEMPLATES[_LEGACY_SHARED_TEMPLATE_KEY]
 
 
 def _effective_templates_from_override(override: dict | None) -> dict[str, dict[str, str]]:
-    templates = {key: dict(value) for key, value in TEMPLATES.items() if key != "default"}
-    if isinstance(override, dict):
-        override_templates = override.get("templates")
-        if isinstance(override_templates, dict):
-            for template_key, channels in override_templates.items():
-                if template_key not in templates or not isinstance(channels, dict):
-                    continue
-                for channel in ("email", "whatsapp", "phone_script"):
-                    value = channels.get(channel)
-                    if isinstance(value, str):
-                        templates[template_key][channel] = value
-    templates["default"] = dict(templates.get(DEFAULT_TEMPLATE_KEY, {}))
+    shared = _effective_shared_templates_from_override(override)
+    template = {
+        "email": shared.get("email", ""),
+        "whatsapp": shared.get("whatsapp", ""),
+        "phone_script": "",
+    }
+    templates = {category: dict(template) for category in CANONICAL_HOOK_CATEGORIES}
+    templates["default"] = dict(template)
     return templates
 
 
@@ -1354,8 +1518,16 @@ def build_template_editor_snapshot(
     hooks_payload = _load_hooks_override(campaign=campaign) if hooks_override is _UNSET else hooks_override
     template_payload = _load_template_overrides(campaign=campaign) if template_override is _UNSET else template_override
     return {
-        "hooks": _effective_hooks_library_from_override(hooks_payload if isinstance(hooks_payload, dict) else {}),
-        "templates": _effective_templates_from_override(template_payload if isinstance(template_payload, dict) else {}),
+        "hooks": {
+            channel: _effective_hooks_library_from_override(
+                hooks_payload if isinstance(hooks_payload, dict) else {},
+                channel=channel,
+            )
+            for channel in _HOOK_CHANNELS
+        },
+        "shared_templates": _effective_shared_templates_from_override(
+            template_payload if isinstance(template_payload, dict) else {}
+        ),
         "subject_templates": _effective_subject_templates_from_override(template_payload if isinstance(template_payload, dict) else {}),
         "special_subject_option": _effective_special_subject_option_from_override(
             template_payload if isinstance(template_payload, dict) else {}
@@ -1364,10 +1536,7 @@ def build_template_editor_snapshot(
 
 
 def _template_scope_keys(keys: set[str]) -> set[str]:
-    normalized = {key for key in keys if key}
-    if DEFAULT_TEMPLATE_KEY in normalized:
-        normalized.add("default")
-    return normalized
+    return {normalize_hook_category(key) for key in keys if key}
 
 
 def build_template_editor_change_scope(
@@ -1377,20 +1546,23 @@ def build_template_editor_change_scope(
     change_type: str,
     selected_template_key: str = "",
 ) -> dict[str, object]:
-    if change_type == "template":
-        template_key = (selected_template_key or "").strip()
-        before_templates = before_snapshot.get("templates") if isinstance(before_snapshot.get("templates"), dict) else {}
-        after_templates = after_snapshot.get("templates") if isinstance(after_snapshot.get("templates"), dict) else {}
-        changed = bool(template_key) and before_templates.get(template_key) != after_templates.get(template_key)
+    if change_type in {"email_template", "whatsapp_template"}:
+        channel = "email" if change_type == "email_template" else "whatsapp"
+        before_templates = before_snapshot.get("shared_templates") if isinstance(before_snapshot.get("shared_templates"), dict) else {}
+        after_templates = after_snapshot.get("shared_templates") if isinstance(after_snapshot.get("shared_templates"), dict) else {}
+        changed = before_templates.get(channel, "") != after_templates.get(channel, "")
         return {
             "changed": changed,
             "subjects_changed": False,
-            "template_keys": _template_scope_keys({template_key}) if changed else set(),
+            "template_keys": set(),
         }
 
-    if change_type == "hooks":
-        before_hooks = before_snapshot.get("hooks") if isinstance(before_snapshot.get("hooks"), dict) else {}
-        after_hooks = after_snapshot.get("hooks") if isinstance(after_snapshot.get("hooks"), dict) else {}
+    if change_type in {"email_hooks", "whatsapp_hooks"}:
+        channel = "email" if change_type == "email_hooks" else "whatsapp"
+        before_hooks_by_channel = before_snapshot.get("hooks") if isinstance(before_snapshot.get("hooks"), dict) else {}
+        after_hooks_by_channel = after_snapshot.get("hooks") if isinstance(after_snapshot.get("hooks"), dict) else {}
+        before_hooks = before_hooks_by_channel.get(channel) if isinstance(before_hooks_by_channel.get(channel), dict) else {}
+        after_hooks = after_hooks_by_channel.get(channel) if isinstance(after_hooks_by_channel.get(channel), dict) else {}
         changed_keys = {
             key
             for key in set(before_hooks) | set(after_hooks)
@@ -1425,14 +1597,8 @@ CATEGORY_PRIORITY = [
     "no_website",
     "platzhalter",
     "kein_mobil",
-    "kein_kontakt",
-    "veraltet",
-    "kein_design",
     "bad_reviews",
     "keine_bewertungen",
-    "not_ranked",
-    "kein_seo",
-    "kein_ssl",
 ]
 
 
@@ -1467,15 +1633,14 @@ def pick_template_key(pain_categories: list[str], lead: dict) -> str:
     )
 
     # Walk priority list
+    normalized_pain_categories = [normalize_hook_category(key) for key in pain_categories if key]
     for key in CATEGORY_PRIORITY:
-        if key not in pain_categories:
+        if key not in normalized_pain_categories:
             continue
         # Data-gated keys: only use if backed by real evidence
         if key == "bad_reviews" and not has_neg_reviews:
             continue
         if key == "keine_bewertungen" and not has_few_reviews:
-            continue
-        if key == "not_ranked" and not not_ranking:
             continue
         # kein_mobil: only if score <= 5 (don't fire on borderline sites)
         if key == "kein_mobil":
@@ -1494,7 +1659,7 @@ def pick_template_key(pain_categories: list[str], lead: dict) -> str:
     if has_few_reviews and rating_str:  # only if we actually have Places API data
         return "keine_bewertungen"
     if not_ranking:
-        return "not_ranked"
+        return "default"
 
     return "default"
 
@@ -1662,22 +1827,28 @@ def render_drafts(
     urgency: str,
     template_key: str | None = None,
     campaign: dict | None = None,
+    wa_hook: str = "",
 ) -> dict:
     """
-    Fill the appropriate template with lead data + selected hook.
+    Fill the shared campaign templates with channel-specific hooks.
     Returns {"Email_Draft": str, "WhatsApp_Draft": str, "Phone_Script": str, "Template_Used": str}
     """
     pain_categories_raw = lead.get("Pain_Categories", "") or ""
     pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
 
-    key = template_key or pick_template_key(pain_categories, lead)
+    key = normalize_hook_category(template_key or pick_template_key(pain_categories, lead))
     templates = get_effective_templates(campaign=campaign)
     tmpl = templates.get(key, templates["default"])
     if not (hook or "").strip():
-        hook = choose_hook(key, lead, campaign=campaign)
+        hook = choose_hook(key, lead, campaign=campaign, channel="email")
+    if not (wa_hook or "").strip():
+        wa_hook = choose_hook(key, lead, campaign=campaign, channel="whatsapp")
     slots = build_slots(lead, hook, urgency, campaign=campaign)
+    slots["wa_hook"] = wa_hook
     if slots["hook"]:
         slots["hook"] = fill_template(slots["hook"], slots)
+    if slots["wa_hook"]:
+        slots["wa_hook"] = fill_template(slots["wa_hook"], slots)
 
     # Inject one shared subject line from the universal subject library
     slots["subject"] = get_subject(lead, hook=hook, urgency=urgency, campaign=campaign)
@@ -1685,11 +1856,14 @@ def render_drafts(
     email_filled = fill_template(tmpl["email"], slots)
     subject, body = parse_email_draft(email_filled)
     email_draft = compose_email_draft(subject, body) if subject else email_filled
+    whatsapp_slots = dict(slots)
+    if whatsapp_slots.get("wa_hook"):
+        whatsapp_slots["hook"] = whatsapp_slots["wa_hook"]
 
     return {
         "Email_Draft": email_draft,
-        "WhatsApp_Draft": fill_template(tmpl["whatsapp"], slots),
-        "Phone_Script": fill_template(tmpl["phone_script"], slots),
+        "WhatsApp_Draft": fill_template(tmpl["whatsapp"], whatsapp_slots),
+        "Phone_Script": "",
         "Template_Used": key,
     }
 
@@ -1701,7 +1875,7 @@ def has_saved_drafts(lead: dict) -> bool:
 def resolve_saved_draft_template_key(lead: dict, campaign: dict | None = None) -> str:
     pain_categories_raw = lead.get("Pain_Categories", "") or ""
     pain_categories = [c.strip() for c in pain_categories_raw.split(" | ") if c.strip()]
-    template_key = (lead.get("Template_Used") or "").strip()
+    template_key = normalize_hook_category(lead.get("Template_Used") or "")
     effective_templates = get_effective_templates(campaign=campaign)
     if template_key not in effective_templates:
         template_key = pick_template_key(pain_categories, lead)

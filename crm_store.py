@@ -210,7 +210,6 @@ def _apply_staleness_defaults(
         [
             "Email_Draft",
             "WhatsApp_Draft",
-            "Phone_Script",
             "Draft_Config_Version",
         ],
     )
@@ -281,7 +280,7 @@ def ensure_lead_ids(leads: list[dict], campaign: Optional[dict] = None) -> int:
         if not lead.get("Drafts_Approved"):
             lead["Drafts_Approved"] = "0"
         lead["Preferred_Channel"] = preferred_channel(lead)
-        if not lead.get("Draft_Config_Version") and _data_exists(lead, ["Email_Draft", "WhatsApp_Draft", "Phone_Script"]):
+        if not lead.get("Draft_Config_Version") and _data_exists(lead, ["Email_Draft", "WhatsApp_Draft"]):
             lead["Draft_Config_Version"] = draft_version
         if not lead.get("Research_Config_Version") and _data_exists(lead, ["Website_Category", "Google_Rank_Keyword", "Google_Rating"]):
             lead["Research_Config_Version"] = research_version

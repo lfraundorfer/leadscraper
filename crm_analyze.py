@@ -4,7 +4,7 @@ crm_analyze.py – OpenAI API: website analysis + personalized message generatio
 For each lead:
   1. Fetches website HTML (if real website)
   2. Calls GPT-4o to score website and identify pain points
-  3. Calls GPT-4o to generate email, WhatsApp, and phone script
+  3. Calls GPT-4o to generate email and WhatsApp drafts
   4. Assigns channel + priority
   5. Updates CSV with all results
 """
@@ -339,7 +339,7 @@ GOOGLE-SUCHE "{rank_keyword}":
   Im Local 3-Pack (Karte): {map_pack}
   Sichtbare Konkurrenten: {competitors}
 
-Generiere drei Outreach-Materialien auf Deutsch.
+Generiere zwei Outreach-Materialien auf Deutsch.
 Antworte AUSSCHLIESSLICH in diesem JSON-Format (kein Markdown, kein Text davor/danach):
 
 {{
@@ -347,8 +347,7 @@ Antworte AUSSCHLIESSLICH in diesem JSON-Format (kein Markdown, kein Text davor/d
     "subject": "<Betreff – konkret, max 60 Zeichen, nicht generisch>",
     "body": "<E-Mail-Body 150-200 Wörter>"
   }},
-  "whatsapp": "<WhatsApp-Nachricht 60-80 Wörter>",
-  "phone_script": "<Gesprächsskript – strukturiert wie unten beschrieben>"
+  "whatsapp": "<WhatsApp-Nachricht 60-80 Wörter>"
 }}
 
 --- EMAIL (150-200 Wörter, formell, Sie-Form) ---
@@ -364,24 +363,11 @@ Antworte AUSSCHLIESSLICH in diesem JSON-Format (kein Markdown, kein Text davor/d
 • Keine formale Anrede ("Sehr geehrte...") – stattdessen: Name oder "Guten Tag"
 • Kein Link in der ersten Nachricht
 • Endet mit einer einfachen Ja/Nein-Frage oder einem Terminangebot
-
---- PHONE_SCRIPT ---
-OPENING (10-15 Sek): [Einstieg + Vorstellung + Erlaubnis]
-HOOK (20-30 Sek): [Das KONKRETE Problem das ihnen Kunden kostet]
-PUNKTE:
-1. [Problem was passiert gerade?]
-2. [Was biete ich an?]
-3. [Was ändert sich konkret?]
-EINWÄNDE:
-"Kein Interesse" → [Antwort max 2 Sätze]
-"Haben schon eine Website" → [Antwort max 2 Sätze]
-"Zu teuer" → [Antwort max 2 Sätze]
-"Keine Zeit" → [Antwort max 2 Sätze]
-CTA: [Terminvorschlag mit 2 konkreten Optionen]"""
+"""
 
 
 def generate_messages(lead: dict, analysis: dict, client: OpenAI, campaign: dict) -> dict:
-    """Call GPT to generate email, WhatsApp, and phone script. Returns dict."""
+    """Call GPT to generate email and WhatsApp drafts. Returns dict."""
     contact = lead.get("Kontaktname", "").strip() or "Sehr geehrte Damen und Herren"
     adresse = lead.get("Adresse", "")
     plz, bezirk = get_bezirk(adresse)
@@ -442,7 +428,7 @@ def generate_messages(lead: dict, analysis: dict, client: OpenAI, campaign: dict
             return {
                 "Email_Draft": f"Betreff: {data['email']['subject']}\n\n{data['email']['body']}",
                 "WhatsApp_Draft": data.get("whatsapp", ""),
-                "Phone_Script": data.get("phone_script", ""),
+                "Phone_Script": "",
             }
         except Exception as e:
             if attempt < 2:
