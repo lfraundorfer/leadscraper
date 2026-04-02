@@ -10,29 +10,93 @@ import crm_backend as backend
 from campaign_service import get_campaign, list_campaigns
 from crm_mailer import send_email_result
 from crm_schedule import vienna_now
-from crm_store import load_leads, save_leads
+from crm_store import get_lead_by_id, load_leads, save_lead
+
+
+BLOCKED_SCHEDULE_ERRORS = {
+    "draft_not_approved",
+    "draft_stale",
+    "lead_not_found",
+    "missing_draft",
+    "missing_email",
+    "missing_subject",
+    "terminal_status",
+}
+
+
+def _failed_schedule_status(error: str) -> str:
+    code = error.strip().lower()
+    if code in BLOCKED_SCHEDULE_ERRORS:
+        return "blocked"
+    return "queued"
+
+
+def _mark_postgres_send_failure(campaign_id: str, lead_id: str, *, error: str, status: str) -> None:
+    with backend.postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            update leads
+            set scheduled_send_status = %s,
+                scheduled_send_error = %s,
+                scheduled_send_attempts = scheduled_send_attempts + 1,
+                payload = jsonb_set(
+                    jsonb_set(
+                        jsonb_set(payload, '{Scheduled_Send_Status}', to_jsonb(%s::text), true),
+                        '{Scheduled_Send_Error}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    '{Scheduled_Send_Attempts}',
+                    to_jsonb((scheduled_send_attempts + 1)::text),
+                    true
+                ),
+                updated_at = now()
+            where campaign_id = %s
+              and lead_id = %s
+            """,
+            (status, error, status, error, campaign_id, lead_id),
+        )
+        cur.execute(
+            """
+            update scheduled_sends
+            set status = %s,
+                last_error = %s,
+                attempts = attempts + 1,
+                updated_at = now()
+            where campaign_id = %s
+              and lead_id = %s
+              and channel = 'email'
+            """,
+            (status, error, campaign_id, lead_id),
+        )
 
 
 def _mark_send_result(campaign: dict, lead_id: str, *, ok: bool, message_id: str = "", error: str = "") -> None:
-    leads = load_leads(campaign=campaign)
-    changed = False
-    for lead in leads:
-        if (lead.get("ID") or "").strip() != lead_id.strip():
-            continue
+    if backend.is_postgres_backend():
         if ok:
-            lead["Scheduled_Send_Status"] = "sent"
-            lead["Scheduled_Send_Error"] = ""
-            lead["Sent_At"] = datetime.now().astimezone().isoformat()
-            if message_id:
-                lead["SMTP_Message_ID"] = message_id
-        else:
-            lead["Scheduled_Send_Status"] = "queued"
-            lead["Scheduled_Send_Error"] = error.strip()
-            lead["Scheduled_Send_Attempts"] = str(int(lead.get("Scheduled_Send_Attempts") or 0) + 1)
-        changed = True
-        break
-    if changed:
-        save_leads(leads, campaign=campaign)
+            return
+        _mark_postgres_send_failure(
+            campaign["id"],
+            lead_id,
+            error=str(error or "send_failed"),
+            status=_failed_schedule_status(error),
+        )
+        return
+
+    lead = get_lead_by_id(lead_id, campaign=campaign)
+    if lead is None:
+        return
+    if ok:
+        lead["Scheduled_Send_Status"] = "sent"
+        lead["Scheduled_Send_Error"] = ""
+        lead["Sent_At"] = datetime.now().astimezone().isoformat()
+        if message_id:
+            lead["SMTP_Message_ID"] = message_id
+    else:
+        lead["Scheduled_Send_Status"] = _failed_schedule_status(error)
+        lead["Scheduled_Send_Error"] = error.strip()
+        lead["Scheduled_Send_Attempts"] = str(int(lead.get("Scheduled_Send_Attempts") or 0) + 1)
+    save_lead(lead, campaign=campaign)
 
 
 def _queued_due_leads(limit: int = 100) -> list[tuple[dict, dict]]:
