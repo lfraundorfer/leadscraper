@@ -32,7 +32,9 @@ from campaign_service import (
     set_active_campaign,
     update_campaign,
 )
+from crm_fields import is_pre_contact_status, normalize_company_key
 from crm_mailer import format_phone_e164, send_email
+from crm_mail_sync import sync_mailbox
 from crm_scrape import scrape_campaign
 from crm_store import (
     ALL_COLUMNS,
@@ -45,6 +47,7 @@ from crm_store import (
     preferred_channel,
     save_lead,
     save_leads,
+    save_leads_batch,
 )
 from crm_templates import (
     build_template_editor_change_scope,
@@ -87,6 +90,13 @@ st.set_page_config(
 PRIORITY_COLOR = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🟢", 5: "⚫"}
 CHANNEL_EMOJI = {"email": "📧", "phone": "📞", "whatsapp": "💬", "none": "⛔", "": "⛔"}
 CHANNEL_LABELS = {"email": "📧 Email", "whatsapp": "💬 WhatsApp", "phone": "📞 Phone call", "none": "⛔ None"}
+MAIL_STATUS_LABELS = {
+    "sent": "Queued/Sent",
+    "unknown": "No signal yet",
+    "delivered": "Delivered",
+    "failed": "Failed",
+    "replied": "Replied",
+}
 STATUS_EMOJI = {
     "new": "🆕", "draft_ready": "✍️", "approved": "✅",
     "contacted": "📤", "replied": "💬", "meeting_scheduled": "📅",
@@ -158,6 +168,11 @@ def invalidate_lead_cache(campaign_id: str) -> None:
         _clear_cached_result(cached_outreach_counts, campaign_id)
         _clear_cached_result(cached_all_leads_summary)
         _clear_cached_result(cached_recontact_leads, campaign_id)
+        _clear_cached_result(cached_mail_summary)
+        _clear_cached_result(cached_recent_mail_rows)
+        _clear_cached_result(cached_lead_mail_status)
+        _clear_cached_result(cached_mail_events)
+        _clear_cached_result(cached_unmatched_mailbox_events)
         return
     _clear_cached_result(cached_leads)
     _clear_cached_result(cached_lead)
@@ -169,6 +184,11 @@ def invalidate_lead_cache(campaign_id: str) -> None:
     _clear_cached_result(cached_outreach_counts)
     _clear_cached_result(cached_all_leads_summary)
     _clear_cached_result(cached_recontact_leads)
+    _clear_cached_result(cached_mail_summary)
+    _clear_cached_result(cached_recent_mail_rows)
+    _clear_cached_result(cached_lead_mail_status)
+    _clear_cached_result(cached_mail_events)
+    _clear_cached_result(cached_unmatched_mailbox_events)
 
 
 def invalidate_campaign_cache(campaign_id: str = "") -> None:
@@ -292,6 +312,89 @@ def cached_lead(campaign_id: str, lead_id: str) -> dict | None:
 
 
 @st.cache_data(ttl=300)
+def cached_mail_summary(campaign_id: str, lookback_hours: int = 24) -> dict:
+    if not backend.is_postgres_backend():
+        return {
+            "total": 0,
+            "failed": 0,
+            "replied": 0,
+            "delivered": 0,
+            "unknown": 0,
+            "sent": 0,
+            "last_sync_at": "",
+        }
+    loader = getattr(backend, "postgres_load_mail_summary", None)
+    return loader(campaign_id, lookback_hours=lookback_hours) if callable(loader) else {}
+
+
+@st.cache_data(ttl=300)
+def cached_recent_mail_rows(campaign_id: str, lookback_hours: int = 24) -> list[dict]:
+    if not backend.is_postgres_backend():
+        return []
+    loader = getattr(backend, "postgres_load_recent_mail_rows", None)
+    return loader(campaign_id, lookback_hours=lookback_hours) if callable(loader) else []
+
+
+@st.cache_data(ttl=300)
+def cached_lead_mail_status(campaign_id: str, lead_id: str) -> dict | None:
+    if not backend.is_postgres_backend():
+        return None
+    loader = getattr(backend, "postgres_get_lead_mail_status", None)
+    return loader(campaign_id, lead_id) if callable(loader) else None
+
+
+@st.cache_data(ttl=300)
+def cached_mail_events(campaign_id: str, smtp_message_id: str) -> list[dict]:
+    if not backend.is_postgres_backend():
+        return []
+    loader = getattr(backend, "postgres_load_mail_events_for_message", None)
+    return loader(campaign_id, smtp_message_id) if callable(loader) else []
+
+
+@st.cache_data(ttl=300)
+def cached_unmatched_mailbox_events(lookback_hours: int = 24) -> list[dict]:
+    if not backend.is_postgres_backend():
+        return []
+    loader = getattr(backend, "postgres_load_unmatched_mailbox_events", None)
+    return loader(lookback_hours=lookback_hours) if callable(loader) else []
+
+
+def _campaign_blacklisted_company_keys(campaign_id: str) -> set[str]:
+    return {
+        normalize_company_key(lead.get("Unternehmen", ""))
+        for lead in cached_leads(campaign_id)
+        if lead.get("Status") == "blacklist"
+    }
+
+
+def _should_show_blacklisted_company(search: str, statuses: tuple[str, ...]) -> bool:
+    return bool((search or "").strip()) or "blacklist" in statuses
+
+
+def _blacklist_company_matches(campaign: dict, lead: dict) -> int:
+    company_key = normalize_company_key(lead.get("Unternehmen", ""))
+    if not company_key:
+        lead["Status"] = "blacklist"
+        lead["Next_Action_Type"] = "none"
+        clear_scheduled_send(lead)
+        save_lead(lead, campaign=campaign)
+        return 1
+
+    updates: list[dict] = []
+    for row in load_leads(campaign=campaign):
+        if normalize_company_key(row.get("Unternehmen", "")) != company_key:
+            continue
+        row["Status"] = "blacklist"
+        row["Next_Action_Type"] = "none"
+        clear_scheduled_send(row)
+        updates.append(row)
+
+    if updates:
+        save_leads_batch(updates, campaign=campaign)
+    return len(updates)
+
+
+@st.cache_data(ttl=300)
 def cached_campaign_metrics(campaign_id: str) -> dict[str, int]:
     if backend.is_postgres_backend():
         metric_loader = getattr(backend, "postgres_load_lead_metrics", None)
@@ -344,13 +447,17 @@ def cached_dashboard_snapshot(campaign_id: str) -> dict:
 
 @st.cache_data(ttl=300)
 def cached_review_queue(campaign_id: str, page: int, page_size: int) -> dict:
+    blacklisted_company_keys = _campaign_blacklisted_company_keys(campaign_id)
     if backend.is_postgres_backend():
         queue_loader = getattr(backend, "postgres_load_review_queue_summary", None)
         if callable(queue_loader):
             offset = max(0, (page - 1) * page_size)
             rows = queue_loader(campaign_id, limit=page_size + 1, offset=offset)
             return {
-                "items": rows[:page_size],
+                "items": [
+                    row for row in rows[:page_size]
+                    if normalize_company_key(row.get("Unternehmen", "")) not in blacklisted_company_keys
+                ],
                 "has_more": len(rows) > page_size,
             }
 
@@ -364,6 +471,7 @@ def cached_review_queue(campaign_id: str, page: int, page_size: int) -> dict:
         }
         for lead in cached_leads(campaign_id)
         if lead.get("Status") == "draft_ready" and lead.get("Draft_Stale") != "1"
+        and normalize_company_key(lead.get("Unternehmen", "")) not in blacklisted_company_keys
     ]
     queue.sort(key=lambda lead: (int(lead.get("Priority") or 5), lead.get("Analyzed_At") or "", lead.get("ID") or ""))
     offset = max(0, (page - 1) * page_size)
@@ -495,6 +603,8 @@ def cached_all_leads_summary(
     page: int,
     page_size: int,
 ) -> dict:
+    show_blacklisted = _should_show_blacklisted_company(search, statuses)
+    blacklisted_company_keys = _campaign_blacklisted_company_keys(campaign_id)
     if backend.is_postgres_backend():
         summary_loader = getattr(backend, "postgres_load_all_leads_summary", None)
         if callable(summary_loader):
@@ -512,6 +622,7 @@ def cached_all_leads_summary(
     items = [_all_leads_summary_item(lead) for lead in cached_leads(campaign_id)]
     filtered = [
         item for item in items
+        if show_blacklisted or normalize_company_key(item.get("Unternehmen", "")) not in blacklisted_company_keys
         if _all_leads_summary_matches(item, search)
         and _all_leads_summary_filter(item, statuses, channels, priorities, stale)
     ]
@@ -631,6 +742,29 @@ def _next_review_selection(queue_ids: list[str], current_id: str) -> str:
 
 def _channel_label(channel: str) -> str:
     return CHANNEL_LABELS.get(channel, channel)
+
+
+def _mail_status_label(status: str) -> str:
+    normalized = (status or "").strip().lower()
+    return MAIL_STATUS_LABELS.get(normalized, normalized or "-")
+
+
+def _render_latest_mail_status(campaign: dict, lead: dict) -> None:
+    lid = str(lead.get("ID") or "").strip()
+    if not backend.is_postgres_backend() or not lid:
+        return
+    status = cached_lead_mail_status(campaign["id"], lid)
+    if not status:
+        return
+    status_text = _mail_status_label(str(status.get("status") or ""))
+    sent_at = str(status.get("sent_at").isoformat() if status.get("sent_at") else "")
+    reason = str(status.get("status_reason") or "").strip()
+    details = [status_text]
+    if sent_at:
+        details.append(sent_at)
+    st.caption(f"Mail status: {' | '.join(details)}")
+    if reason:
+        st.caption(f"Reason: {reason}")
 
 
 def _apply_subject_suggestion(key_prefix: str) -> None:
@@ -902,6 +1036,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
     if not channel_options:
         st.warning("No usable outreach channel on this lead.")
         return
+    _render_latest_mail_status(campaign, lead)
 
     current_subject, current_body = parse_email_draft(lead.get("Email_Draft", ""))
     planned = planned_channel(lead)
@@ -1307,6 +1442,7 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
             lid = lead.get("ID", "?")
             company = lead.get("Unternehmen", "")[:35]
             was_stale = lead.get("Draft_Stale") == "1"
+            lead_status = (lead.get("Status") or "new").strip() or "new"
             status_txt.caption(f"Building drafts for {lid} - {company}")
             prog.progress(idx / len(targets))
 
@@ -1343,10 +1479,9 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
             else:
                 lead["Preferred_Channel"] = primary
             lead["Priority"] = str(priority)
-            if not lead.get("Next_Action_Date") and lead["Preferred_Channel"] != "none":
-                lead["Next_Action_Date"] = date.today().isoformat()
-                lead["Next_Action_Type"] = lead["Preferred_Channel"]
-            elif lead.get("Status", "new") in {"new", "draft_ready", "approved"} and lead["Preferred_Channel"] != "none":
+            if is_pre_contact_status(lead_status) and lead["Preferred_Channel"] != "none":
+                if not lead.get("Next_Action_Date"):
+                    lead["Next_Action_Date"] = date.today().isoformat()
                 lead["Next_Action_Type"] = lead["Preferred_Channel"]
 
             template_key = pick_template_key(analysis.get("pain_categories", []), lead)
@@ -1357,7 +1492,7 @@ def _generate_drafts(lead_ids: list[str], container) -> int:
             set_stored_draft_stale(lead, False)
             lead["Analyzed_At"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             lead["Drafts_Approved"] = "0"
-            if lead.get("Status", "new") in {"new", "approved", "draft_ready"} or was_stale:
+            if is_pre_contact_status(lead_status):
                 lead["Status"] = "draft_ready"
 
             save_lead(lead, campaign=campaign)
@@ -1947,10 +2082,7 @@ def _render_review_queue(campaign: dict) -> None:
         if blacklist:
             lead = get_lead_by_id(lid, campaign=campaign)
             if lead is not None:
-                lead["Status"] = "blacklist"
-                lead["Next_Action_Type"] = "none"
-                clear_scheduled_send(lead)
-                save_lead(lead, campaign=campaign)
+                _blacklist_company_matches(campaign, lead)
             skipped_ids.discard(lid)
             st.session_state[skipped_key] = sorted(skipped_ids)
             st.session_state[selected_key] = _next_review_selection(queue_ids, lid)
@@ -2197,6 +2329,133 @@ def _render_outreach(campaign: dict) -> None:
         _render_contact_log(selected)
 
 
+def _render_mail_page(campaign: dict) -> None:
+    st.title("Mail")
+    st.caption("Sync mailbox replies and daemon notices, then inspect the latest delivery state for recent outbound emails.")
+
+    if not backend.is_postgres_backend():
+        st.info("Mailbox sync requires the Postgres backend.")
+        return
+
+    lookback_hours = 24
+    notice_key = _campaign_state_key(campaign, "mail_notice")
+    notice = st.session_state.pop(notice_key, None)
+    if isinstance(notice, dict) and notice.get("message"):
+        renderer = getattr(st, str(notice.get("level") or "info"), st.info)
+        renderer(str(notice.get("message")))
+
+    action_col, sync_info_col = st.columns([1, 3])
+    if action_col.button("Sync Mailbox", type="primary", key=_campaign_state_key(campaign, "mail_sync")):
+        try:
+            with st.spinner("Syncing mailbox..."):
+                result = sync_mailbox(lookback_hours=lookback_hours)
+            st.session_state[notice_key] = {
+                "level": "success",
+                "message": (
+                    f"Mailbox sync complete. Relevant={result.get('inbox_relevant', 0)} | "
+                    f"Matched={result.get('matched', 0)} | Unmatched={result.get('unmatched', 0)}"
+                ),
+            }
+        except Exception as exc:
+            st.session_state[notice_key] = {"level": "error", "message": f"Mailbox sync failed: {exc}"}
+        reload(campaign_id=campaign["id"])
+
+    summary = cached_mail_summary(campaign["id"], lookback_hours)
+    last_sync_at = str(summary.get("last_sync_at") or "").strip()
+    sync_info_col.caption(f"Last sync: {last_sync_at or '-'} | Window: last {lookback_hours} hours")
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Failed", summary.get("failed", 0))
+    metric_cols[1].metric("Replied", summary.get("replied", 0))
+    metric_cols[2].metric("Delivered", summary.get("delivered", 0))
+    metric_cols[3].metric("No Signal", summary.get("unknown", 0))
+    metric_cols[4].metric("Recent Outbound", summary.get("total", 0))
+
+    rows = cached_recent_mail_rows(campaign["id"], lookback_hours)
+    if not rows:
+        st.info("No recent outbound emails in the current lookback window.")
+    else:
+        selected_key = _campaign_state_key(campaign, "mail_selected")
+        row_map = {str(row.get("smtp_message_id") or ""): row for row in rows if row.get("smtp_message_id")}
+        row_ids = list(row_map)
+        if st.session_state.get(selected_key) not in row_ids:
+            st.session_state[selected_key] = row_ids[0]
+
+        summary_rows = [
+            {
+                "Lead": row.get("lead_id") or "",
+                "Company": row.get("company") or "",
+                "To": row.get("recipient_email") or "",
+                "Sent": row.get("sent_at").isoformat() if row.get("sent_at") else "",
+                "Status": _mail_status_label(str(row.get("status") or "")),
+                "Reason": row.get("status_reason") or "",
+            }
+            for row in rows
+        ]
+
+        list_col, detail_col = st.columns([2, 3])
+        with list_col:
+            st.dataframe(summary_rows, width="stretch", hide_index=True)
+            selected_message_id = st.selectbox(
+                "Open outbound email",
+                options=row_ids,
+                format_func=lambda smtp_message_id: (
+                    f"{row_map[smtp_message_id].get('lead_id', '')} | "
+                    f"{(row_map[smtp_message_id].get('company') or '')[:36]} | "
+                    f"{_mail_status_label(str(row_map[smtp_message_id].get('status') or ''))}"
+                ),
+                key=selected_key,
+            )
+
+        with detail_col:
+            selected = row_map[selected_message_id]
+            st.markdown(
+                f"### {selected.get('lead_id', '?')} - {selected.get('company', '')}"
+            )
+            st.text(f"To: {selected.get('recipient_email') or '-'}")
+            st.text(f"Sent at: {selected.get('sent_at').isoformat() if selected.get('sent_at') else '-'}")
+            st.text(f"Mail status: {_mail_status_label(str(selected.get('status') or ''))}")
+            st.text(f"Last event: {selected.get('last_event_type') or '-'}")
+            if selected.get("status_reason"):
+                st.warning(str(selected.get("status_reason")))
+            st.text(f"SMTP Message-ID: {selected.get('smtp_message_id') or '-'}")
+
+            events = cached_mail_events(campaign["id"], selected_message_id)
+            st.markdown("**Matched Mailbox Events**")
+            if not events:
+                st.caption("No matched mailbox events yet.")
+            else:
+                for event in events[:10]:
+                    event_at = event.get("event_at").isoformat() if event.get("event_at") else "-"
+                    event_type = event.get("event_type") or "-"
+                    event_from = event.get("from_address") or "-"
+                    line = f"- `{event_at}` | `{event_type}` | `{event_from}`"
+                    if event.get("reason"):
+                        line += f" | {event.get('reason')}"
+                    st.markdown(line)
+
+    unmatched = cached_unmatched_mailbox_events(lookback_hours)
+    st.divider()
+    st.subheader("Unmatched Notices")
+    if not unmatched:
+        st.caption("No unmatched mailbox notices in the current lookback window.")
+    else:
+        st.dataframe(
+            [
+                {
+                    "At": row.get("event_at").isoformat() if row.get("event_at") else "",
+                    "Type": row.get("event_type") or "",
+                    "From": row.get("from_address") or "",
+                    "Subject": row.get("subject") or "",
+                    "Reason": row.get("reason") or "",
+                }
+                for row in unmatched
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+
 def _render_recontact(campaign: dict, leads: list[dict]) -> None:
     st.title("Re-contact")
     candidates = [
@@ -2237,7 +2496,11 @@ def _render_recontact(campaign: dict, leads: list[dict]) -> None:
 
 def _render_all_leads(campaign: dict) -> None:
     st.title("All Leads")
-    st.caption("Search applies on submit and results are paginated to keep the page responsive with large lead lists and browser extensions like Bitwarden.")
+    st.caption(
+        "Search applies on submit and results are paginated to keep the page responsive with large lead lists and browser "
+        "extensions like Bitwarden. Blacklisted companies stay hidden here unless you search for them or filter "
+        "`Status = blacklist`."
+    )
 
     state_keys = _init_all_leads_state(campaign)
     with st.form(key=f"all_leads_filters_{campaign['id']}"):
@@ -2424,10 +2687,7 @@ def _render_all_leads(campaign: dict) -> None:
             if st.button("Blacklist", key=f"blacklist_{lid}"):
                 row = get_lead_by_id(lid, campaign=campaign)
                 if row is not None:
-                    row["Status"] = "blacklist"
-                    row["Next_Action_Type"] = "none"
-                    clear_scheduled_send(row)
-                    save_lead(row, campaign=campaign)
+                    _blacklist_company_matches(campaign, row)
                 reload(campaign_id=campaign["id"])
             st.divider()
             _render_contact_log(lead)
@@ -2600,7 +2860,7 @@ def _ensure_stale_contacts_archived(campaign: dict) -> None:
 campaign = _active_campaign_switch()
 page = st.sidebar.radio(
     "Navigation",
-    ["Campaigns", "Dashboard", "Review Queue", "Outreach", "Re-contact", "All Leads"],
+    ["Campaigns", "Dashboard", "Review Queue", "Outreach", "Mail", "Re-contact", "All Leads"],
     label_visibility="collapsed",
 )
 dashboard_snapshot: dict = {}
@@ -2618,6 +2878,8 @@ elif page == "Review Queue":
     _render_review_queue(campaign)
 elif page == "Outreach":
     _render_outreach(campaign)
+elif page == "Mail":
+    _render_mail_page(campaign)
 elif page == "Re-contact":
     _render_recontact(campaign, cached_recontact_leads(campaign["id"]))
 else:

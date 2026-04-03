@@ -12,6 +12,7 @@ Commands:
   daily [--limit N]    Show today's action list
   log <ID> <outcome>   Log a contact attempt
   send-email <ID>      Send the generated email via SMTP
+  sync-mailbox         Sync mailbox replies and daemon notices via IMAP
   send-scheduled       Process queued email sends that are due
   stats                Show pipeline overview
 """
@@ -79,6 +80,19 @@ def cmd_log(args) -> None:
 def cmd_send_email(args) -> None:
     from crm_mailer import send_email
     send_email(args.id, dry_run=args.dry_run)
+
+
+def cmd_sync_mailbox(args) -> None:
+    from crm_mail_sync import sync_mailbox
+
+    summary = sync_mailbox(lookback_hours=args.lookback_hours)
+    print(
+        "Mailbox sync complete: "
+        f"relevant={summary['inbox_relevant']} "
+        f"matched={summary['matched']} "
+        f"unmatched={summary['unmatched']} "
+        f"unknown={summary['unknown_marked']}"
+    )
 
 
 def cmd_stats(_args) -> None:
@@ -173,6 +187,7 @@ Examples:
   python crm.py log LEAD-001 sent --channel email --notes "Sent intro email"
   python crm.py log LEAD-002 called --notes "Left voicemail"
   python crm.py send-email LEAD-001 --dry-run
+  python crm.py sync-mailbox --lookback-hours 24
   python crm.py send-scheduled --dry-run
   python crm.py stats
   python crm.py campaigns
@@ -256,6 +271,9 @@ Examples:
     p.add_argument("id", help="Lead ID, e.g. LEAD-001")
     p.add_argument("--dry-run", action="store_true", help="Print email without sending")
 
+    p = subparsers.add_parser("sync-mailbox", help="Sync mailbox replies and delivery notices via IMAP")
+    p.add_argument("--lookback-hours", type=int, default=24, help="How far back to scan the mailbox (default: 24)")
+
     p = subparsers.add_parser("send-scheduled", help="Send all queued emails that are due right now")
     p.add_argument("--limit", type=int, default=100, help="Max queued emails to process (default: 100)")
     p.add_argument("--dry-run", action="store_true", help="Show what would send without sending anything")
@@ -283,6 +301,7 @@ Examples:
         "daily": cmd_daily,
         "log": cmd_log,
         "send-email": cmd_send_email,
+        "sync-mailbox": cmd_sync_mailbox,
         "send-scheduled": cmd_send_scheduled,
         "stats": cmd_stats,
         "generate-hooks": cmd_generate_hooks,

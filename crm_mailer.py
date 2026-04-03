@@ -204,16 +204,28 @@ def send_email_result(
         print(f"Email sent to {to_addr} ({lead.get('Unternehmen', '')})")
         sent_at = datetime.now().astimezone()
         event = apply_contact_outcome(lead, "sent", notes=notes, channel="email", now=sent_at)
+        message_id = str(msg.get("Message-ID") or "")
         lead["Sent_At"] = sent_at.isoformat()
-        lead["SMTP_Message_ID"] = str(msg.get("Message-ID") or "")
+        lead["SMTP_Message_ID"] = message_id
         lead["Scheduled_Send_Error"] = ""
         if (lead.get("Scheduled_Send_Channel") or "").strip() == "email":
             lead["Scheduled_Send_Status"] = "sent"
         if backend.is_postgres_backend():
-            backend.postgres_persist_outreach_lead(active_campaign["id"], lead, contact_event=event)
+            backend.postgres_persist_outreach_lead(
+                active_campaign["id"],
+                lead,
+                contact_event=event,
+                outbound_email={
+                    "smtp_message_id": message_id,
+                    "recipient_email": to_addr,
+                    "subject": subject,
+                    "sent_at": sent_at,
+                    "source": "app",
+                },
+            )
         else:
             save_lead(lead, campaign=active_campaign)
-        return {"ok": True, "message_id": str(msg.get("Message-ID") or ""), "error": ""}
+        return {"ok": True, "message_id": message_id, "error": ""}
     except Exception as e:
         print(f"Failed to send email for {lead_id}: {e}")
         return {"ok": False, "message_id": "", "error": str(e)}

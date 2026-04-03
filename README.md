@@ -180,6 +180,7 @@ The sender only processes leads where:
 Run it manually:
 
 ```bash
+python crm.py sync-mailbox --lookback-hours 24
 python crm.py send-scheduled
 ```
 
@@ -198,6 +199,13 @@ SMTP_HOST=smtp.hostinger.com
 SMTP_PORT=465
 SMTP_USER=you@your-domain.com
 SMTP_PASS=...
+IMAP_HOST=imap.hostinger.com
+IMAP_PORT=993
+IMAP_USER=you@your-domain.com
+IMAP_PASS=...
+IMAP_INBOX_FOLDER=INBOX
+# Optional: used only to backfill missing subject/recipient metadata on sent mail rows
+IMAP_SENT_FOLDER=Sent
 SENDER_NAME=Linus
 SENDER_EMAIL=you@your-domain.com
 SENDER_PHONE=+43...
@@ -212,6 +220,7 @@ TZ=Europe/Vienna
 - moved hooks/template overrides into campaign JSON for Postgres mode
 - removed flyer, screenshots, portfolio images, and portfolio URL copy from the v1 flow
 - added scheduled email queue fields and processing
+- added IMAP mailbox sync for replies, bounces, and delivery notices
 - kept WhatsApp and phone as manual actions
 - kept heavy scraping/research/analyze work local
 
@@ -226,7 +235,18 @@ crm_store.py        Lead load/save logic
 crm_schedule.py     Vienna scheduling rules
 crm_scheduled.py    Queued email sender
 crm_mailer.py       SMTP sending
+crm_mail_sync.py    IMAP mailbox sync + bounce/reply parsing
 crm_tracker.py      Contact logging and follow-up logic
 crm_templates.py    Hooks, templates, and draft rendering
 app.py              Streamlit dashboard
 ```
+
+## Mail Visibility
+
+- Use the new `Mail` page in Streamlit to manually sync the mailbox and inspect recent outbound email status.
+- `python crm.py sync-mailbox --lookback-hours 24` scans the inbox for replies and daemon notices, then matches them back to sent CRM emails by `Message-ID` first and recipient fallback second.
+- Delivery state is conservative:
+  - `Failed`: a bounce/DSN says the message was not delivered
+  - `Replied`: a reply matched the original outbound email
+  - `Delivered`: an explicit delivery notice was received
+  - `No signal yet`: no explicit success/failure mail has arrived yet

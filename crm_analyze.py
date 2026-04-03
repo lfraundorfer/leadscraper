@@ -20,6 +20,7 @@ from datetime import date, timedelta
 from openai import OpenAI
 
 from campaign_service import format_rank_keyword, get_active_campaign, mark_campaign_stage_run
+from crm_fields import TERMINAL_STATUSES, is_pre_contact_status
 from herold_scraper import HeroldFetcher
 from crm_store import (
     WIEN_BEZIRK,
@@ -470,7 +471,11 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
             print(f"Lead {single_id} not found.")
             return
     else:
-        targets = [l for l in leads if force or not l.get("Analyzed_At") or l.get("Draft_Stale") == "1"]
+        targets = [
+            l for l in leads
+            if l.get("Status") not in TERMINAL_STATUSES
+            and (force or not l.get("Analyzed_At") or l.get("Draft_Stale") == "1")
+        ]
         if limit:
             targets = targets[:limit]
 
@@ -488,6 +493,7 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
             website = lead.get("Website", "").strip()
             print(f"\n  {lid} {company[:45]}")
             was_stale = lead.get("Draft_Stale") == "1"
+            lead_status = (lead.get("Status") or "new").strip() or "new"
 
             if (
                 was_stale
@@ -544,10 +550,9 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
                 lead["Preferred_Channel"] = primary
             lead["Priority"] = str(priority)
 
-            if not lead.get("Next_Action_Date") and lead["Preferred_Channel"] != "none":
-                lead["Next_Action_Date"] = date.today().isoformat()
-                lead["Next_Action_Type"] = lead["Preferred_Channel"]
-            elif lead.get("Status", "new") in {"new", "draft_ready", "approved"} and lead["Preferred_Channel"] != "none":
+            if is_pre_contact_status(lead_status) and lead["Preferred_Channel"] != "none":
+                if not lead.get("Next_Action_Date"):
+                    lead["Next_Action_Date"] = date.today().isoformat()
                 lead["Next_Action_Type"] = lead["Preferred_Channel"]
 
             # 4. Generate messages (local templates + local hooks by default)
@@ -566,11 +571,11 @@ def main(force: bool = False, single_id: str = "", no_review: bool = False, limi
 
             # 5. Update status
             lead["Analyzed_At"] = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")
-            if no_review:
+            if no_review and is_pre_contact_status(lead_status):
                 lead["Status"] = "approved"
                 lead["Drafts_Approved"] = "1"
             else:
-                if lead.get("Status", "new") in {"new", "approved", "draft_ready"} or was_stale:
+                if is_pre_contact_status(lead_status):
                     lead["Status"] = "draft_ready"
                 lead["Drafts_Approved"] = "0"
 

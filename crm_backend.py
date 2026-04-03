@@ -29,7 +29,7 @@ _POSTGRES_POOL_COND = threading.Condition(_POSTGRES_STATE_LOCK)
 _POSTGRES_POOL: list[Any] = []
 _POSTGRES_POOL_SIZE = 0
 _POSTGRES_POOL_URL = ""
-POSTGRES_SCHEMA_VERSION = 1
+POSTGRES_SCHEMA_VERSION = 2
 
 CAMPAIGN_COLUMNS = [
     "id",
@@ -88,6 +88,10 @@ def _draft_stale_sql(payload_sql: str = "payload", draft_version_sql: str = "%s"
         f"and coalesce({payload_sql} ->> 'Draft_Config_Version', '') <> '' "
         f"and coalesce({payload_sql} ->> 'Draft_Config_Version', '') <> {draft_version_sql}))"
     )
+
+
+def _normalized_company_sql(payload_sql: str = "payload") -> str:
+    return f"regexp_replace(lower(coalesce({payload_sql} ->> 'Unternehmen', '')), '[^a-z0-9]', '', 'g')"
 
 
 def _campaign_draft_version(campaign_id: str) -> str:
@@ -353,7 +357,7 @@ def ensure_postgres_schema() -> None:
             )
             cur.execute("select value_json from app_meta where key = 'schema_version'")
             current_version = _app_meta_int(cur.fetchone())
-            if current_version < POSTGRES_SCHEMA_VERSION:
+            if current_version < 1:
                 cur.execute(
                     """
                     create table if not exists campaigns (
@@ -452,7 +456,82 @@ def ensure_postgres_schema() -> None:
                 cur.execute("create index if not exists idx_leads_scheduled_status_at on leads (scheduled_send_status, scheduled_send_at)")
                 cur.execute("create index if not exists idx_scheduled_sends_status_at on scheduled_sends (status, scheduled_at)")
                 cur.execute("create index if not exists idx_contact_events_campaign_lead on contact_events (campaign_id, lead_id, occurred_at desc)")
-                _upsert_app_meta_value(cur, "schema_version", POSTGRES_SCHEMA_VERSION, Jsonb)
+                current_version = 1
+                _upsert_app_meta_value(cur, "schema_version", current_version, Jsonb)
+            if current_version < 2:
+                cur.execute(
+                    """
+                    create table if not exists outbound_emails (
+                        id bigserial primary key,
+                        campaign_id text not null references campaigns(id) on delete cascade,
+                        lead_id text not null,
+                        smtp_message_id text not null unique,
+                        recipient_email text not null default '',
+                        subject text not null default '',
+                        sent_at timestamptz not null,
+                        source text not null default 'app',
+                        status text not null default 'sent',
+                        status_reason text not null default '',
+                        last_event_type text not null default '',
+                        last_event_at timestamptz,
+                        last_sync_at timestamptz,
+                        created_at timestamptz not null default now(),
+                        updated_at timestamptz not null default now()
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    create table if not exists mailbox_events (
+                        id bigserial primary key,
+                        campaign_id text references campaigns(id) on delete cascade,
+                        lead_id text not null default '',
+                        folder_name text not null default '',
+                        mailbox_uid text not null default '',
+                        event_at timestamptz not null,
+                        event_type text not null default '',
+                        from_address text not null default '',
+                        subject text not null default '',
+                        raw_message_id text not null default '',
+                        related_smtp_message_id text not null default '',
+                        reason text not null default '',
+                        matched boolean not null default false,
+                        metadata_json jsonb not null default '{}'::jsonb,
+                        created_at timestamptz not null default now(),
+                        updated_at timestamptz not null default now(),
+                        unique (folder_name, mailbox_uid)
+                    )
+                    """
+                )
+                cur.execute("create index if not exists idx_outbound_emails_campaign_sent_at on outbound_emails (campaign_id, sent_at desc)")
+                cur.execute("create index if not exists idx_outbound_emails_campaign_lead on outbound_emails (campaign_id, lead_id, sent_at desc)")
+                cur.execute("create index if not exists idx_outbound_emails_status on outbound_emails (status, sent_at desc)")
+                cur.execute("create index if not exists idx_mailbox_events_campaign_event_at on mailbox_events (campaign_id, event_at desc)")
+                cur.execute("create index if not exists idx_mailbox_events_related_message on mailbox_events (related_smtp_message_id, event_at desc)")
+                cur.execute(
+                    """
+                    insert into outbound_emails (
+                        campaign_id, lead_id, smtp_message_id, recipient_email, subject,
+                        sent_at, source, status, created_at, updated_at
+                    )
+                    select campaign_id,
+                           lead_id,
+                           smtp_message_id,
+                           coalesce(payload ->> 'Email', ''),
+                           '',
+                           sent_at,
+                           'backfill',
+                           'sent',
+                           coalesce(sent_at, now()),
+                           now()
+                    from leads
+                    where coalesce(smtp_message_id, '') <> ''
+                      and sent_at is not null
+                    on conflict (smtp_message_id) do nothing
+                    """
+                )
+                current_version = 2
+                _upsert_app_meta_value(cur, "schema_version", current_version, Jsonb)
             _POSTGRES_SCHEMA_READY = True
 
 
@@ -509,6 +588,23 @@ def postgres_set_active_campaign_id(campaign_id: str) -> None:
     _, _, Jsonb = _load_psycopg()
     with postgres_connection() as conn, conn.cursor() as cur:
         _upsert_app_meta_value(cur, "active_campaign_id", campaign_id, Jsonb)
+
+
+def postgres_get_app_meta_value(key: str, default: Any = None) -> Any:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute("select value_json from app_meta where key = %s", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return default
+        return _app_meta_value(row)
+
+
+def postgres_set_app_meta_value(key: str, value: Any) -> None:
+    ensure_postgres_ready()
+    _, _, Jsonb = _load_psycopg()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        _upsert_app_meta_value(cur, key, value, Jsonb)
 
 
 def _campaign_row_to_config(row: dict[str, Any]) -> dict[str, Any]:
@@ -790,18 +886,31 @@ def postgres_load_review_queue_summary(
     ensure_postgres_ready()
     draft_version = _campaign_draft_version(campaign_id)
     draft_stale_sql = _draft_stale_sql()
+    company_key_sql = _normalized_company_sql("queue_leads.payload")
+    blacklisted_company_sql = _normalized_company_sql("blacklisted.payload")
     query = """
         select lead_id,
-               coalesce(payload ->> 'Unternehmen', '') as company,
+               coalesce(queue_leads.payload ->> 'Unternehmen', '') as company,
                priority,
-               coalesce(payload ->> 'Analyzed_At', '') as analyzed_at,
-               coalesce(payload ->> 'Research_Stale', '0') as research_stale
-        from leads
-        where campaign_id = %s
+               coalesce(queue_leads.payload ->> 'Analyzed_At', '') as analyzed_at,
+               coalesce(queue_leads.payload ->> 'Research_Stale', '0') as research_stale
+        from leads queue_leads
+        where queue_leads.campaign_id = %s
           and status = 'draft_ready'
           and not {draft_stale_sql}
+          and not exists (
+                select 1
+                from leads blacklisted
+                where blacklisted.campaign_id = queue_leads.campaign_id
+                  and blacklisted.status = 'blacklist'
+                  and {blacklisted_company_sql} = {company_key_sql}
+          )
         order by priority asc, analyzed_at asc, lead_id asc
-    """.format(draft_stale_sql=draft_stale_sql)
+    """.format(
+        draft_stale_sql=draft_stale_sql.replace("payload", "queue_leads.payload"),
+        company_key_sql=company_key_sql,
+        blacklisted_company_sql=blacklisted_company_sql,
+    )
     params: list[Any] = [campaign_id, draft_version]
     if limit > 0:
         query += "\n        limit %s"
@@ -998,6 +1107,8 @@ def postgres_load_all_leads_summary(
     ensure_postgres_ready()
     draft_version = _campaign_draft_version(campaign_id)
     draft_stale_sql = _draft_stale_sql()
+    company_key_sql = _normalized_company_sql()
+    blacklisted_company_sql = _normalized_company_sql("blacklisted.payload")
     search_text = (search or "").strip().lower()
     page = max(1, int(page or 1))
     page_size = max(1, int(page_size or 25))
@@ -1044,6 +1155,21 @@ def postgres_load_all_leads_summary(
         params.extend([like_value, like_value, like_value, like_value, like_value])
 
     status_values = [value for value in (statuses or []) if value]
+    if not search_text and "blacklist" not in status_values:
+        where_clauses.append(
+            """
+            not exists (
+                select 1
+                from leads blacklisted
+                where blacklisted.campaign_id = leads.campaign_id
+                  and blacklisted.status = 'blacklist'
+                  and {blacklisted_company_sql} = {company_key_sql}
+            )
+            """.format(
+                blacklisted_company_sql=blacklisted_company_sql,
+                company_key_sql=company_key_sql,
+            )
+        )
     if status_values:
         where_clauses.append("status = any(%s)")
         params.append(status_values)
@@ -1368,6 +1494,121 @@ def _insert_contact_event_row(
     )
 
 
+def _mail_event_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now().astimezone()
+    parsed = _parse_schedule_timestamp(text.replace(" ", "T")) if " " in text else _parse_schedule_timestamp(text)
+    return parsed or datetime.now().astimezone()
+
+
+def _mail_status_rank(status: str) -> int:
+    normalized = (status or "").strip().lower()
+    return {
+        "sent": 0,
+        "unknown": 1,
+        "delivered": 2,
+        "failed": 3,
+        "replied": 4,
+    }.get(normalized, 0)
+
+
+def _mail_status_from_event_type(event_type: str) -> str:
+    normalized = (event_type or "").strip().lower()
+    if normalized in {"bounce_hard", "bounce_soft"}:
+        return "failed"
+    if normalized == "reply":
+        return "replied"
+    if normalized == "delivery_notice":
+        return "delivered"
+    return "unknown"
+
+
+def _apply_outbound_status_update(
+    cur: Any,
+    *,
+    smtp_message_id: str,
+    event_type: str,
+    event_at: Any,
+    reason: str = "",
+) -> None:
+    mail_status = _mail_status_from_event_type(event_type)
+    if not smtp_message_id or not mail_status:
+        return
+
+    event_timestamp = _mail_event_timestamp(event_at)
+    cur.execute(
+        """
+        select status, last_event_at
+        from outbound_emails
+        where smtp_message_id = %s
+        """,
+        (smtp_message_id,),
+    )
+    row = cur.fetchone() or {}
+    current_status = row.get("status") or "sent"
+    current_event_at = row.get("last_event_at")
+    should_update = _mail_status_rank(mail_status) > _mail_status_rank(current_status)
+    if not should_update and _mail_status_rank(mail_status) == _mail_status_rank(current_status):
+        should_update = current_event_at is None or event_timestamp >= current_event_at
+    if not should_update:
+        return
+
+    cur.execute(
+        """
+        update outbound_emails
+        set status = %s,
+            status_reason = %s,
+            last_event_type = %s,
+            last_event_at = %s,
+            updated_at = now()
+        where smtp_message_id = %s
+        """,
+        (mail_status, reason.strip(), event_type.strip(), event_timestamp, smtp_message_id),
+    )
+
+
+def _insert_outbound_email_row(cur: Any, campaign_id: str, lead_id: str, outbound_email: dict[str, Any]) -> None:
+    smtp_message_id = str(outbound_email.get("smtp_message_id") or "").strip()
+    if not smtp_message_id:
+        return
+
+    cur.execute(
+        """
+        insert into outbound_emails (
+            campaign_id, lead_id, smtp_message_id, recipient_email, subject,
+            sent_at, source, status, status_reason, created_at, updated_at
+        )
+        values (%s, %s, %s, %s, %s, %s, %s, 'sent', '', now(), now())
+        on conflict (smtp_message_id) do update
+        set campaign_id = excluded.campaign_id,
+            lead_id = excluded.lead_id,
+            recipient_email = case
+                when excluded.recipient_email <> '' then excluded.recipient_email
+                else outbound_emails.recipient_email
+            end,
+            subject = case
+                when excluded.subject <> '' then excluded.subject
+                else outbound_emails.subject
+            end,
+            sent_at = excluded.sent_at,
+            source = excluded.source,
+            updated_at = now()
+        """,
+        (
+            campaign_id,
+            lead_id,
+            smtp_message_id,
+            str(outbound_email.get("recipient_email") or "").strip(),
+            str(outbound_email.get("subject") or "").strip(),
+            _mail_event_timestamp(outbound_email.get("sent_at") or datetime.now().astimezone()),
+            str(outbound_email.get("source") or "app").strip() or "app",
+        ),
+    )
+
+
 def postgres_get_lead_by_id(lead_id: str, campaign_id: str = "") -> dict[str, Any] | None:
     ensure_postgres_ready()
     query = """
@@ -1395,6 +1636,7 @@ def postgres_persist_outreach_lead(
     lead: dict[str, Any],
     *,
     contact_event: dict[str, Any] | None = None,
+    outbound_email: dict[str, Any] | None = None,
 ) -> None:
     ensure_postgres_ready()
     lead_id = str(lead.get("ID") or "").strip()
@@ -1414,6 +1656,245 @@ def postgres_persist_outreach_lead(
                 outcome=str(contact_event.get("outcome") or "").strip(),
                 notes=str(contact_event.get("notes") or ""),
             )
+        if outbound_email:
+            _insert_outbound_email_row(cur, campaign_id, lead_id, outbound_email)
+
+
+def postgres_record_outbound_email(campaign_id: str, lead_id: str, outbound_email: dict[str, Any]) -> None:
+    ensure_postgres_ready()
+    lead_id = str(lead_id or "").strip()
+    if not lead_id:
+        raise ValueError("Lead ID is required for postgres_record_outbound_email().")
+    with postgres_connection() as conn, conn.cursor() as cur:
+        _insert_outbound_email_row(cur, campaign_id, lead_id, outbound_email)
+
+
+def postgres_recent_outbound_emails(since_at: Any, *, campaign_id: str = "") -> list[dict[str, Any]]:
+    ensure_postgres_ready()
+    where_clauses = ["sent_at >= %s"]
+    params: list[Any] = [_mail_event_timestamp(since_at)]
+    if campaign_id:
+        where_clauses.append("campaign_id = %s")
+        params.append(campaign_id)
+    query = f"""
+        select campaign_id, lead_id, smtp_message_id, recipient_email, subject, sent_at,
+               status, status_reason, last_event_type, last_event_at, last_sync_at
+        from outbound_emails
+        where {' and '.join(where_clauses)}
+        order by sent_at desc, smtp_message_id desc
+    """
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(query, tuple(params))
+        return cur.fetchall()
+
+
+def postgres_record_mailbox_event(event: dict[str, Any]) -> None:
+    ensure_postgres_ready()
+    _, _, Jsonb = _load_psycopg()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into mailbox_events (
+                campaign_id, lead_id, folder_name, mailbox_uid, event_at, event_type,
+                from_address, subject, raw_message_id, related_smtp_message_id, reason,
+                matched, metadata_json, created_at, updated_at
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            on conflict (folder_name, mailbox_uid) do update
+            set campaign_id = excluded.campaign_id,
+                lead_id = excluded.lead_id,
+                event_at = excluded.event_at,
+                event_type = excluded.event_type,
+                from_address = excluded.from_address,
+                subject = excluded.subject,
+                raw_message_id = excluded.raw_message_id,
+                related_smtp_message_id = excluded.related_smtp_message_id,
+                reason = excluded.reason,
+                matched = excluded.matched,
+                metadata_json = excluded.metadata_json,
+                updated_at = now()
+            """,
+            (
+                str(event.get("campaign_id") or "").strip() or None,
+                str(event.get("lead_id") or "").strip(),
+                str(event.get("folder_name") or "").strip(),
+                str(event.get("mailbox_uid") or "").strip(),
+                _mail_event_timestamp(event.get("event_at") or datetime.now().astimezone()),
+                str(event.get("event_type") or "").strip(),
+                str(event.get("from_address") or "").strip(),
+                str(event.get("subject") or "").strip(),
+                str(event.get("raw_message_id") or "").strip(),
+                str(event.get("related_smtp_message_id") or "").strip(),
+                str(event.get("reason") or "").strip(),
+                bool(event.get("matched")),
+                Jsonb(event.get("metadata") if isinstance(event.get("metadata"), dict) else {}),
+            ),
+        )
+        if event.get("matched") and event.get("related_smtp_message_id"):
+            _apply_outbound_status_update(
+                cur,
+                smtp_message_id=str(event.get("related_smtp_message_id") or "").strip(),
+                event_type=str(event.get("event_type") or "").strip(),
+                event_at=event.get("event_at") or datetime.now().astimezone(),
+                reason=str(event.get("reason") or "").strip(),
+            )
+
+
+def postgres_mark_outbound_unknown(since_at: Any, *, campaign_id: str = "", synced_at: Any | None = None) -> int:
+    ensure_postgres_ready()
+    where_clauses = [
+        "sent_at >= %s",
+        "status in ('sent', 'unknown')",
+    ]
+    params: list[Any] = [
+        _mail_event_timestamp(since_at),
+        _mail_event_timestamp(synced_at or datetime.now().astimezone()),
+    ]
+    if campaign_id:
+        where_clauses.append("campaign_id = %s")
+        params.append(campaign_id)
+    query = f"""
+        update outbound_emails
+        set status = 'unknown',
+            last_sync_at = %s,
+            updated_at = now()
+        where {' and '.join(where_clauses)}
+    """
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(query, tuple([params[1], params[0], *params[2:]]))
+        return cur.rowcount or 0
+
+
+def postgres_load_mail_summary(campaign_id: str, *, lookback_hours: int = 24) -> dict[str, Any]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select count(*) as total,
+                   count(*) filter (where status = 'failed') as failed,
+                   count(*) filter (where status = 'replied') as replied,
+                   count(*) filter (where status = 'delivered') as delivered,
+                   count(*) filter (where status = 'unknown') as unknown,
+                   count(*) filter (where status = 'sent') as sent
+            from outbound_emails
+            where campaign_id = %s
+              and sent_at >= now() - (%s * interval '1 hour')
+            """,
+            (campaign_id, max(1, int(lookback_hours or 24))),
+        )
+        row = cur.fetchone() or {}
+    return {
+        "total": int(row.get("total") or 0),
+        "failed": int(row.get("failed") or 0),
+        "replied": int(row.get("replied") or 0),
+        "delivered": int(row.get("delivered") or 0),
+        "unknown": int(row.get("unknown") or 0),
+        "sent": int(row.get("sent") or 0),
+        "last_sync_at": str(postgres_get_app_meta_value("mailbox_last_sync_at", "") or ""),
+    }
+
+
+def postgres_load_recent_mail_rows(
+    campaign_id: str,
+    *,
+    lookback_hours: int = 24,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select outbound.smtp_message_id,
+                   outbound.lead_id,
+                   coalesce(leads.payload ->> 'Unternehmen', '') as company,
+                   outbound.recipient_email,
+                   outbound.subject,
+                   outbound.sent_at,
+                   outbound.status,
+                   outbound.status_reason,
+                   outbound.last_event_type,
+                   outbound.last_event_at,
+                   outbound.last_sync_at,
+                   latest.from_address as latest_from_address,
+                   latest.subject as latest_event_subject,
+                   latest.reason as latest_event_reason
+            from outbound_emails outbound
+            left join leads
+              on leads.campaign_id = outbound.campaign_id
+             and leads.lead_id = outbound.lead_id
+            left join lateral (
+                select from_address, subject, reason
+                from mailbox_events
+                where related_smtp_message_id = outbound.smtp_message_id
+                order by event_at desc, id desc
+                limit 1
+            ) latest on true
+            where outbound.campaign_id = %s
+              and outbound.sent_at >= now() - (%s * interval '1 hour')
+            order by outbound.sent_at desc, outbound.smtp_message_id desc
+            limit %s
+            """,
+            (campaign_id, max(1, int(lookback_hours or 24)), max(1, int(limit or 200))),
+        )
+        rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+def postgres_load_mail_events_for_message(campaign_id: str, smtp_message_id: str) -> list[dict[str, Any]]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select campaign_id, lead_id, folder_name, mailbox_uid, event_at, event_type,
+                   from_address, subject, raw_message_id, related_smtp_message_id,
+                   reason, matched, metadata_json
+            from mailbox_events
+            where related_smtp_message_id = %s
+              and (%s = '' or campaign_id = %s)
+            order by event_at desc, id desc
+            """,
+            (smtp_message_id.strip(), campaign_id, campaign_id),
+        )
+        rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+def postgres_load_unmatched_mailbox_events(*, lookback_hours: int = 24, limit: int = 50) -> list[dict[str, Any]]:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select folder_name, mailbox_uid, event_at, event_type, from_address,
+                   subject, raw_message_id, reason, metadata_json
+            from mailbox_events
+            where matched = false
+              and event_at >= now() - (%s * interval '1 hour')
+            order by event_at desc, id desc
+            limit %s
+            """,
+            (max(1, int(lookback_hours or 24)), max(1, int(limit or 50))),
+        )
+        rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+def postgres_get_lead_mail_status(campaign_id: str, lead_id: str) -> dict[str, Any] | None:
+    ensure_postgres_ready()
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select smtp_message_id, recipient_email, subject, sent_at, status,
+                   status_reason, last_event_type, last_event_at, last_sync_at
+            from outbound_emails
+            where campaign_id = %s
+              and lead_id = %s
+            order by sent_at desc, id desc
+            limit 1
+            """,
+            (campaign_id, lead_id),
+        )
+        row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def postgres_archive_stale_contacted_leads(campaign_id: str, cutoff_date_iso: str) -> int:

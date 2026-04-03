@@ -4,6 +4,8 @@ crm_fields.py - Shared CRM lead schema constants.
 
 from __future__ import annotations
 
+import re
+
 # Original columns (must stay in this order)
 ORIGINAL_COLUMNS = [
     "Unternehmen",
@@ -84,4 +86,14 @@ VALID_STATUSES = {
     "blacklist",
 }
 
+PRE_CONTACT_STATUSES = {"new", "draft_ready", "approved"}
 TERMINAL_STATUSES = {"won", "lost", "done", "blacklist"}
+
+
+def normalize_company_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def is_pre_contact_status(status: str) -> bool:
+    normalized = (status or "").strip() or "new"
+    return normalized in PRE_CONTACT_STATUSES

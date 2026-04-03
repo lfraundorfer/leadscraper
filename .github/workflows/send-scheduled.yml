@@ -28,6 +28,12 @@ jobs:
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      IMAP_HOST: ${{ secrets.IMAP_HOST }}
+      IMAP_PORT: ${{ secrets.IMAP_PORT }}
+      IMAP_USER: ${{ secrets.IMAP_USER }}
+      IMAP_PASS: ${{ secrets.IMAP_PASS }}
+      IMAP_INBOX_FOLDER: ${{ secrets.IMAP_INBOX_FOLDER }}
+      IMAP_SENT_FOLDER: ${{ secrets.IMAP_SENT_FOLDER }}
       TZ: ${{ secrets.TZ }}
     steps:
       - name: Check out repository
@@ -42,6 +48,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Sync mailbox status
+        run: |
+          if [ -z "$TZ" ]; then
+            export TZ="Europe/Vienna"
+          fi
+          python crm.py sync-mailbox --lookback-hours 24
 
       - name: Run scheduled sender
         run: |

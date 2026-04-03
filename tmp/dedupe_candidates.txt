@@ -1,0 +1,486 @@
+Campaign: installateur_wien
+Duplicate company groups: 121
+
+Company: 1a Installateur - Paco Installationen GmbH | key=1ainstallateurpacoinstallationengmbh
+Proposed keep: INSTWIEN-0026 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0138 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: 1a Installateur - Schweifer-Sanitärinstallationen GmbH & Co KG | key=1ainstallateurschweifersanitrinstallationengmbhcokg
+Proposed keep: INSTWIEN-0066 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0808 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: 1a Installateur - Thomas Wiesmayr GmbH | key=1ainstallateurthomaswiesmayrgmbh
+Proposed keep: INSTWIEN-0069 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0811 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ALI A-Z Malerei KG | key=aliazmalereikg
+Proposed keep: INSTWIEN-0012 | status=blacklist | contact_count=0 | next=none | notes=no
+Proposed drop: INSTWIEN-0124 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: AP-Süd Installationen e.U. | key=apsdinstallationeneu
+Proposed keep: INSTWIEN-0931 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0855 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Aqua-All-Tech GmbH | key=aquaalltechgmbh
+Proposed keep: INSTWIEN-0086 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0828 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ARAX Thermentausch - DI Albert Raxendorfer | key=araxthermentauschdialbertraxendorfer
+Proposed keep: INSTWIEN-0819 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0077 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ARD-GAS Installationen e.U. | key=ardgasinstallationeneu
+Proposed keep: INSTWIEN-0041 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0175 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: AS Klima- und Kältetechnik GmbH | key=asklimaundkltetechnikgmbh
+Proposed keep: INSTWIEN-0027 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0139 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ASP Engineering & Installation GmbH | key=aspengineeringinstallationgmbh
+Proposed keep: INSTWIEN-0047 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0181 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: ATAS Installationen Gas und Sanitärtechnik | key=atasinstallationengasundsanitrtechnik
+Proposed keep: INSTWIEN-0034 | status=contacted | contact_count=1 | next=whatsapp | notes=no
+Proposed drop: INSTWIEN-0168 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: Baldauf Gebäudetechnik GmbH | key=baldaufgebudetechnikgmbh
+Proposed keep: INSTWIEN-0061 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0195 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Baltrio GmbH | key=baltriogmbh
+Proposed keep: INSTWIEN-0940 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0864 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Berger Christiane | key=bergerchristiane
+Proposed keep: INSTWIEN-0076 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0818 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: Berisha Installationen e.U. | key=berishainstallationeneu
+Proposed keep: INSTWIEN-0111 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0853 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: BHT Heiztech OG | key=bhtheiztechog
+Proposed keep: INSTWIEN-0094 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0836 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Bingo Haustechnik e.U. | key=bingohaustechnikeu
+Proposed keep: INSTWIEN-0004 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0116 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: BP-Installationen & Gasgerätetechnik e.U. | key=bpinstallationengasgertetechnikeu
+Proposed keep: INSTWIEN-0085 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0827 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: CLEVER installiert e.U. | key=cleverinstallierteu
+Proposed keep: INSTWIEN-0009 | status=approved | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0121 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: DEL-MISSIER Gas- und Sanitärtechnik - Inh. Oliver Jankovic e.U. | key=delmissiergasundsanitrtechnikinholiverjankoviceu
+Proposed keep: INSTWIEN-0860 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0936 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Der Kühlschränker Kälte - Klima GmbH | key=derkhlschrnkerklteklimagmbh
+Proposed keep: INSTWIEN-0036 | status=contacted | contact_count=1 | next=whatsapp | notes=no
+Proposed drop: INSTWIEN-0170 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: DI (FH) Trilsam Christian | key=difhtrilsamchristian
+Proposed keep: INSTWIEN-0006 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0118 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Dilek Installationstechnik GmbH | key=dilekinstallationstechnikgmbh
+Proposed keep: INSTWIEN-0084 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0826 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Dipl-Ing. BA Erler Thomas | key=diplingbaerlerthomas
+Proposed keep: INSTWIEN-0021 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0133 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: DODA Installationen e.U. | key=dodainstallationeneu
+Proposed keep: INSTWIEN-0042 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0176 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Dominik Schrenk | key=dominikschrenk
+Proposed keep: INSTWIEN-0932 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0856 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Duo Tech OG | key=duotechog
+Proposed keep: INSTWIEN-0100 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0842 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: EDEA Two GmbH | key=edeatwogmbh
+Proposed keep: INSTWIEN-0092 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0834 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: EISENBOCK & FREUNDLINGER Installationen GmbH | key=eisenbockfreundlingerinstallationengmbh
+Proposed keep: INSTWIEN-0043 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0177 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Erge Installationen GesmbH | key=ergeinstallationengesmbh
+Proposed keep: INSTWIEN-0939 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0863 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ESW Gebäudetechnik GmbH | key=eswgebudetechnikgmbh
+Proposed keep: INSTWIEN-0023 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0135 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: F. Schiefer GmbH | key=fschiefergmbh
+Proposed keep: INSTWIEN-0055 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0189 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Fa. Handel HS Installationen OG | key=fahandelhsinstallationenog
+Proposed keep: INSTWIEN-0038 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0172 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Franye Klimatechnik GmbH | key=franyeklimatechnikgmbh
+Proposed keep: INSTWIEN-0096 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0838 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: G.S.H.T Installateur Notdienst | key=gshtinstallateurnotdienst
+Proposed keep: INSTWIEN-0032 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0144 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: G.S.Lenz GmbH | key=gslenzgmbh
+Proposed keep: INSTWIEN-0052 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0186 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: GasTech - Pro e.U. | key=gastechproeu
+Proposed keep: INSTWIEN-0110 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0852 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: GasTherm e.U. | key=gasthermeu
+Proposed keep: INSTWIEN-0059 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0193 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Gebrüder Medek e.U. | key=gebrdermedekeu
+Proposed keep: INSTWIEN-0070 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0812 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Gelbmann Josef | key=gelbmannjosef
+Proposed keep: INSTWIEN-0067 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0809 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Gergits Ing Josef e.U. | key=gergitsingjosefeu
+Proposed keep: INSTWIEN-0108 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0850 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Guculj Sava | key=guculjsava
+Proposed keep: INSTWIEN-0039 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0173 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: GWH-Martin Nikolla Installationen e.U. | key=gwhmartinnikollainstallationeneu
+Proposed keep: INSTWIEN-0037 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0171 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: GWS Installationstechnik GmbH | key=gwsinstallationstechnikgmbh
+Proposed keep: INSTWIEN-0103 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0845 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: H-I-T Hallwirth Installationstechnik GmbH | key=hithallwirthinstallationstechnikgmbh
+Proposed keep: INSTWIEN-0046 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0180 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: H.I.M.G. GmbH | key=himggmbh
+Proposed keep: INSTWIEN-0109 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0851 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: H2O Gebäudetechnik e.U. | key=h2ogebudetechnikeu
+Proposed keep: INSTWIEN-0071 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0813 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: HAKAJ Installationen - Astrit Hakaj | key=hakajinstallationenastrithakaj
+Proposed keep: INSTWIEN-0075 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0817 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: Hans Dietmar Kargl GesmbH | key=hansdietmarkarglgesmbh
+Proposed keep: INSTWIEN-0858 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0934 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: HeizungsFix e.U. | key=heizungsfixeu
+Proposed keep: INSTWIEN-0937 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0861 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Hiessberger Ing GesmbH | key=hiessbergeringgesmbh
+Proposed keep: INSTWIEN-0107 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0849 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Hochleithner GesmbH | key=hochleithnergesmbh
+Proposed keep: INSTWIEN-0080 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0822 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Hofbauer Andreas | key=hofbauerandreas
+Proposed keep: INSTWIEN-0044 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0178 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Horstmann Heizungs- u Sanitärinstallationen e.U. | key=horstmannheizungsusanitrinstallationeneu
+Proposed keep: INSTWIEN-0045 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0179 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Horvat Johann GesmbH | key=horvatjohanngesmbh
+Proposed keep: INSTWIEN-0060 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0194 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: Ing. Balnik Christian | key=ingbalnikchristian
+Proposed keep: INSTWIEN-0083 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0825 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Ing. Erich Mozorits Gesellschaft m.b.H. | key=ingerichmozoritsgesellschaftmbh
+Proposed keep: INSTWIEN-0105 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0847 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Ing. Freund Franz | key=ingfreundfranz
+Proposed keep: INSTWIEN-0065 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0807 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: INSTALLATEUR Spiess Andreas Ing. | key=installateurspiessandreasing
+Proposed keep: INSTWIEN-0106 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0848 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Installateur24 - P.K. Installationen GmbH | key=installateur24pkinstallationengmbh
+Proposed keep: INSTWIEN-0062 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0196 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Installation Hrubi e.U. | key=installationhrubieu
+Proposed keep: INSTWIEN-0024 | status=contacted | contact_count=1 | next=phone | notes=no
+Proposed drop: INSTWIEN-0136 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: Jovanovic Dejan | key=jovanovicdejan
+Proposed keep: INSTWIEN-0025 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0137 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: JT BAU GmbH | key=jtbaugmbh
+Proposed keep: INSTWIEN-0063 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0805 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Kandelsdorfer Haustechnik GmbH | key=kandelsdorferhaustechnikgmbh
+Proposed keep: INSTWIEN-0072 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0814 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Kanyücel Emre | key=kanycelemre
+Proposed keep: INSTWIEN-0017 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0129 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Karaer Installateur in Wien | key=karaerinstallateurinwien
+Proposed keep: INSTWIEN-0104 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0846 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Keramotherm Installations GmbH | key=keramotherminstallationsgmbh
+Proposed keep: INSTWIEN-0089 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0831 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Kliha Installationen GmbH | key=klihainstallationengmbh
+Proposed keep: INSTWIEN-0938 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0862 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Kreutzer Andreas Gas- und Sanitärtechnik GmbH | key=kreutzerandreasgasundsanitrtechnikgmbh
+Proposed keep: INSTWIEN-0054 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0188 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Köse Installationen GmbH | key=kseinstallationengmbh
+Proposed keep: INSTWIEN-0053 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0187 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Lugar Installateur GmbH | key=lugarinstallateurgmbh
+Proposed keep: INSTWIEN-0001 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0113 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: M&G bad+raum GmbH | key=mgbadraumgmbh
+Proposed keep: INSTWIEN-0090 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0832 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: M.B.E. Haustechnik GmbH | key=mbehaustechnikgmbh
+Proposed keep: INSTWIEN-0050 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0184 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: MaHe Installationen KG | key=maheinstallationenkg
+Proposed keep: INSTWIEN-0095 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0837 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Maxtherm | key=maxtherm
+Proposed keep: INSTWIEN-0007 | status=approved | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0119 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: MHP Gebäudetechnik GmbH | key=mhpgebudetechnikgmbh
+Proposed keep: INSTWIEN-0101 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0843 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Mischa - Installationen e.U. | key=mischainstallationeneu
+Proposed keep: INSTWIEN-0018 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0130 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: MMF Installation GmbH | key=mmfinstallationgmbh
+Proposed keep: INSTWIEN-0087 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0829 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Morris Haustechnik GmbH | key=morrishaustechnikgmbh
+Proposed keep: INSTWIEN-0078 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0820 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: MUYU e.U. | key=muyueu
+Proposed keep: INSTWIEN-0013 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0125 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: My WTA GmbH | key=mywtagmbh
+Proposed keep: INSTWIEN-0008 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0120 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: NG Installationen GmbH | key=nginstallationengmbh
+Proposed keep: INSTWIEN-0074 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0816 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Nimführ Haustechnik e.U. | key=nimfhrhaustechnikeu
+Proposed keep: INSTWIEN-0835 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0093 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: NOVAX Gas-Wasser-Heizung e.U. | key=novaxgaswasserheizungeu
+Proposed keep: INSTWIEN-0040 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0174 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: OKY Lüftungstechnik e.U. | key=okylftungstechnikeu
+Proposed keep: INSTWIEN-0035 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0169 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: On Time Installationen GmbH | key=ontimeinstallationengmbh
+Proposed keep: INSTWIEN-0049 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0183 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: P.U.R Sanitär- und Gebäudetechnik GmbH | key=pursanitrundgebudetechnikgmbh
+Proposed keep: INSTWIEN-0844 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0102 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Pappel Installationen GmbH | key=pappelinstallationengmbh
+Proposed keep: INSTWIEN-0019 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0131 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: PipeSan GmbH | key=pipesangmbh
+Proposed keep: INSTWIEN-0005 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0117 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Prinz Dominik | key=prinzdominik
+Proposed keep: INSTWIEN-0048 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0182 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: PS Klima InstallationsgesmbH | key=psklimainstallationsgesmbh
+Proposed keep: INSTWIEN-0028 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0140 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Quantox GmbH | key=quantoxgmbh
+Proposed keep: INSTWIEN-0099 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0841 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: R. Breitschopf, Gebäudetechnik - Sanitär - Heizung - Lüftung - Klima GmbH | key=rbreitschopfgebudetechniksanitrheizunglftungklimagmbh
+Proposed keep: INSTWIEN-0098 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0840 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: R.I. Installationstechnik GmbH | key=riinstallationstechnikgmbh
+Proposed keep: INSTWIEN-0029 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0141 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: RDI GmbH | key=rdigmbh
+Proposed keep: INSTWIEN-0806 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0064 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Rohrli GmbH | key=rohrligmbh
+Proposed keep: INSTWIEN-0022 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0134 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Rudolf GmbH | key=rudolfgmbh
+Proposed keep: INSTWIEN-0056 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0190 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Samek Richard | key=samekrichard
+Proposed keep: INSTWIEN-0068 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0810 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: SAN - SYSTEME Installationen GmbH | key=sansystemeinstallationengmbh
+Proposed keep: INSTWIEN-0081 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0823 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Schachl Installationen | key=schachlinstallationen
+Proposed keep: INSTWIEN-0079 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0821 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Sebastian Winter Sanitär & Heizungstechnik | key=sebastianwintersanitrheizungstechnik
+Proposed keep: INSTWIEN-0016 | status=contacted | contact_count=1 | next=phone | notes=no
+Proposed drop: INSTWIEN-0128 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: SHWG Installationen GmbH | key=shwginstallationengmbh
+Proposed keep: INSTWIEN-0057 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0191 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Sigma Mont GmbH | key=sigmamontgmbh
+Proposed keep: INSTWIEN-0097 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0839 | status=draft_ready | contact_count=0 | next=phone | notes=no
+
+Company: Sinta Haustechnik OG | key=sintahaustechnikog
+Proposed keep: INSTWIEN-0082 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0824 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Steiner E.K.S. Installationen GesmbH. | key=steinereksinstallationengesmbh
+Proposed keep: INSTWIEN-0015 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0127 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Stolex GmbH & Co KG | key=stolexgmbhcokg
+Proposed keep: INSTWIEN-0002 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0114 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: SUPRA-HT GmbH | key=suprahtgmbh
+Proposed keep: INSTWIEN-0030 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0142 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Sutech Installationen GmbH | key=sutechinstallationengmbh
+Proposed keep: INSTWIEN-0088 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0830 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Sverak Energie- und Gebäudetechnik GmbH | key=sverakenergieundgebudetechnikgmbh
+Proposed keep: INSTWIEN-0010 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0122 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Tanasic Miodrag | key=tanasicmiodrag
+Proposed keep: INSTWIEN-0020 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0132 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Topinstallateur gmbH | key=topinstallateurgmbh
+Proposed keep: INSTWIEN-0014 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0126 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Urban - Kirchenheizung | key=urbankirchenheizung
+Proposed keep: INSTWIEN-0058 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0192 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Vanduo Badkultur GmbH | key=vanduobadkulturgmbh
+Proposed keep: INSTWIEN-0031 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0143 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Wegscheider Christian | key=wegscheiderchristian
+Proposed keep: INSTWIEN-0073 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0815 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Weikl & Hauser GmbH | key=weiklhausergmbh
+Proposed keep: INSTWIEN-0011 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0123 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Wohntraum Installationen GmbH | key=wohntrauminstallationengmbh
+Proposed keep: INSTWIEN-0933 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0857 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Yilmaz Gamze | key=yilmazgamze
+Proposed keep: INSTWIEN-0033 | status=draft_ready | contact_count=0 | next= | notes=no
+Proposed drop: INSTWIEN-0167 | status=draft_ready | contact_count=0 | next= | notes=no
+
+Company: Z. Lali Installateur GmbH | key=zlaliinstallateurgmbh
+Proposed keep: INSTWIEN-0091 | status=draft_ready | contact_count=0 | next=phone | notes=no
+Proposed drop: INSTWIEN-0833 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ZAC-Haustechnik A. Rezac Installationen GmbH | key=zachaustechnikarezacinstallationengmbh
+Proposed keep: INSTWIEN-0003 | status=contacted | contact_count=1 | next=phone | notes=no
+Proposed drop: INSTWIEN-0115 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: Zeiner KG | key=zeinerkg
+Proposed keep: INSTWIEN-0859 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0935 | status=draft_ready | contact_count=0 | next=email | notes=no
+
+Company: ZIYA-Christian Zampa e.U. | key=ziyachristianzampaeu
+Proposed keep: INSTWIEN-0051 | status=draft_ready | contact_count=0 | next=email | notes=no
+Proposed drop: INSTWIEN-0185 | status=draft_ready | contact_count=0 | next=email | notes=no
