@@ -447,20 +447,17 @@ def cached_dashboard_snapshot(campaign_id: str) -> dict:
 
 @st.cache_data(ttl=300)
 def cached_review_queue(campaign_id: str, page: int, page_size: int) -> dict:
-    blacklisted_company_keys = _campaign_blacklisted_company_keys(campaign_id)
     if backend.is_postgres_backend():
         queue_loader = getattr(backend, "postgres_load_review_queue_summary", None)
         if callable(queue_loader):
             offset = max(0, (page - 1) * page_size)
             rows = queue_loader(campaign_id, limit=page_size + 1, offset=offset)
             return {
-                "items": [
-                    row for row in rows[:page_size]
-                    if normalize_company_key(row.get("Unternehmen", "")) not in blacklisted_company_keys
-                ],
+                "items": rows[:page_size],
                 "has_more": len(rows) > page_size,
             }
 
+    blacklisted_company_keys = _campaign_blacklisted_company_keys(campaign_id)
     queue = [
         {
             "ID": lead.get("ID", ""),
@@ -604,7 +601,6 @@ def cached_all_leads_summary(
     page_size: int,
 ) -> dict:
     show_blacklisted = _should_show_blacklisted_company(search, statuses)
-    blacklisted_company_keys = _campaign_blacklisted_company_keys(campaign_id)
     if backend.is_postgres_backend():
         summary_loader = getattr(backend, "postgres_load_all_leads_summary", None)
         if callable(summary_loader):
@@ -619,6 +615,7 @@ def cached_all_leads_summary(
                 page_size=page_size,
             )
 
+    blacklisted_company_keys = _campaign_blacklisted_company_keys(campaign_id)
     items = [_all_leads_summary_item(lead) for lead in cached_leads(campaign_id)]
     filtered = [
         item for item in items
