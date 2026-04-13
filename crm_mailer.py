@@ -10,6 +10,7 @@ import smtplib
 import urllib.parse
 import html
 from datetime import datetime
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid
@@ -83,6 +84,38 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+_IMG_RE = re.compile(r"\{\{img:([^|}]+)\|([^}]*)\}\}")
+
+
+def _extract_inline_images(
+    html_text: str, base_dir: str
+) -> tuple[str, list[tuple[str, str, bytes]]]:
+    """Replace {{img:path|alt}} in HTML-converted body with <img src="cid:..."> tags.
+    Returns (modified_html, [(cid, path, raw_bytes), ...]).
+    Missing files fall back to [alt text].
+    """
+    images: list[tuple[str, str, bytes]] = []
+
+    def _replace(m: re.Match) -> str:
+        path = m.group(1).strip()
+        alt = html.escape(m.group(2).strip())
+        try:
+            with open(os.path.join(base_dir, path), "rb") as f:
+                data = f.read()
+        except OSError:
+            return f"[{m.group(2).strip()}]"
+        cid = make_msgid()
+        images.append((cid, path, data))
+        return f'<img src="cid:{cid[1:-1]}" alt="{alt}" style="max-width:100%">'
+
+    return _IMG_RE.sub(_replace, html_text), images
+
+
+def _strip_img_placeholders(text: str) -> str:
+    """Replace {{img:path|alt}} with [alt] for the plain-text version."""
+    return _IMG_RE.sub(lambda m: f"[{m.group(2).strip()}]", text)
+
+
 def send_email_result(
     lead_id: str,
     dry_run: bool = False,
@@ -151,7 +184,9 @@ def send_email_result(
         linked = re.sub(r"https?://[^\s<]+", _linkify, bolded)
         return "<br>\n".join(linked.splitlines())
 
-    html_lines = _to_html(body)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    plain_body = _strip_img_placeholders(body)
+    html_lines, inline_images = _extract_inline_images(_to_html(body), base_dir)
 
     def _apply_headers(message) -> None:
         message["Subject"] = subject
@@ -162,13 +197,29 @@ def send_email_result(
         message["Message-ID"] = make_msgid(domain=sender_domain) if sender_domain else make_msgid()
 
     if include_html:
-        msg = MIMEMultipart("alternative")
-        _apply_headers(msg)
-        msg.attach(MIMEText(body, "plain", "utf-8"))
         html_body = f"<html><body><p>{html_lines}</p></body></html>"
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        if inline_images:
+            msg = MIMEMultipart("related")
+            _apply_headers(msg)
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+            alt.attach(MIMEText(html_body, "html", "utf-8"))
+            msg.attach(alt)
+            for cid, path, data in inline_images:
+                img_part = MIMEImage(data, _subtype="png")
+                img_part["Content-ID"] = cid
+                img_part.add_header(
+                    "Content-Disposition", "inline",
+                    filename=os.path.basename(path),
+                )
+                msg.attach(img_part)
+        else:
+            msg = MIMEMultipart("alternative")
+            _apply_headers(msg)
+            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
     else:
-        msg = MIMEText(body, "plain", "utf-8")
+        msg = MIMEText(plain_body, "plain", "utf-8")
         _apply_headers(msg)
 
     if dry_run:

@@ -83,6 +83,49 @@ def scrape_campaign(
         seen_keys.add(company_key)
         new_entries += 1
 
+    for extra_query in campaign.get("extra_queries") or []:
+        eq_kw = (extra_query.get("keyword") or "").strip() or campaign["keyword"]
+        eq_loc = (extra_query.get("location") or "").strip() or campaign["location"]
+        if not eq_kw or not eq_loc:
+            continue
+        extra_temp = ""
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8", delete=False, suffix=".csv") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, delimiter=";", extrasaction="ignore")
+                writer.writeheader()
+                for lead in merged:
+                    writer.writerow({column: lead.get(column, "") for column in ORIGINAL_COLUMNS})
+                extra_temp = handle.name
+
+            scrape_to_csv(
+                category=eq_kw,
+                location=eq_loc,
+                output=extra_temp,
+                pages=pages,
+                page_pause=page_pause,
+                search_pause=search_pause,
+                no_search=no_search,
+                visible=visible,
+                dump_html=dump_html,
+                verbose=verbose,
+            )
+
+            with open(extra_temp, newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle, delimiter=";")
+                for row in reader:
+                    company_key = normalize_company_key(row.get("Unternehmen", ""))
+                    if not company_key or company_key in seen_keys:
+                        continue
+                    lead = {column: "" for column in ALL_COLUMNS}
+                    for column in ORIGINAL_COLUMNS:
+                        lead[column] = row.get(column, "")
+                    merged.append(lead)
+                    seen_keys.add(company_key)
+                    new_entries += 1
+        finally:
+            if extra_temp and os.path.exists(extra_temp):
+                os.remove(extra_temp)
+
     assigned = ensure_lead_ids(merged, campaign=campaign)
     save_leads(merged, campaign=campaign)
 

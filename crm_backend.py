@@ -316,6 +316,7 @@ def _campaign_defaults(config: dict[str, Any]) -> dict[str, Any]:
         "last_researched_at": str(config.get("last_researched_at") or "").strip(),
         "last_analyzed_at": str(config.get("last_analyzed_at") or "").strip(),
         "csv_path": str(config.get("csv_path") or layout["csv_path"].relative_to(ROOT_DIR)),
+        "extra_queries": config.get("extra_queries") if isinstance(config.get("extra_queries"), list) else [],
         "hooks_library_json": config.get("hooks_library_json") if isinstance(config.get("hooks_library_json"), dict) else {},
         "template_overrides_json": config.get("template_overrides_json") if isinstance(config.get("template_overrides_json"), dict) else {},
         "hooks_library_path": str(config.get("hooks_library_path") or layout["hooks_library_path"].relative_to(ROOT_DIR)),
@@ -532,6 +533,12 @@ def ensure_postgres_schema() -> None:
                 )
                 current_version = 2
                 _upsert_app_meta_value(cur, "schema_version", current_version, Jsonb)
+            if current_version < 3:
+                cur.execute(
+                    "alter table campaigns add column if not exists extra_queries_json jsonb not null default '[]'::jsonb"
+                )
+                current_version = 3
+                _upsert_app_meta_value(cur, "schema_version", current_version, Jsonb)
             _POSTGRES_SCHEMA_READY = True
 
 
@@ -611,6 +618,7 @@ def _campaign_row_to_config(row: dict[str, Any]) -> dict[str, Any]:
     config = {key: row.get(key) for key in CAMPAIGN_COLUMNS}
     config.update(
         {
+            "extra_queries": row.get("extra_queries_json") or [],
             "hooks_library_json": row.get("hooks_library_json") or {},
             "template_overrides_json": row.get("template_overrides_json") or {},
             "hooks_library_path": f"postgres://campaigns/{row.get('id')}/hooks",
@@ -665,16 +673,18 @@ def postgres_save_campaign(config: dict[str, Any]) -> dict[str, Any]:
     with postgres_connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
-            insert into campaigns ({", ".join(CAMPAIGN_COLUMNS)}, hooks_library_json, template_overrides_json, updated_at)
-            values ({", ".join(["%s"] * len(CAMPAIGN_COLUMNS))}, %s, %s, now())
+            insert into campaigns ({", ".join(CAMPAIGN_COLUMNS)}, extra_queries_json, hooks_library_json, template_overrides_json, updated_at)
+            values ({", ".join(["%s"] * len(CAMPAIGN_COLUMNS))}, %s, %s, %s, now())
             on conflict (id) do update set
                 {", ".join(f"{column} = excluded.{column}" for column in CAMPAIGN_COLUMNS if column != "id")},
+                extra_queries_json = excluded.extra_queries_json,
                 hooks_library_json = excluded.hooks_library_json,
                 template_overrides_json = excluded.template_overrides_json,
                 updated_at = now()
             """,
             (
                 *values,
+                Jsonb(normalized.get("extra_queries") or []),
                 Jsonb(normalized.get("hooks_library_json") or {}),
                 Jsonb(normalized.get("template_overrides_json") or {}),
             ),

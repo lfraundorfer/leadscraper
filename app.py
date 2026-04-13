@@ -1835,6 +1835,7 @@ def _active_campaign_switch() -> dict:
         options=campaign_ids,
         index=campaign_ids.index(active["id"]) if active["id"] in campaign_ids else 0,
         format_func=lambda cid: labels.get(cid, cid),
+        key="active_campaign_selector",
     )
     if selected_id != active["id"]:
         set_active_campaign(selected_id)
@@ -2729,7 +2730,8 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
             location = st.text_input("Location", placeholder="Wien")
             create_btn = st.form_submit_button("Create and Activate", type="primary")
         if create_btn and keyword.strip() and location.strip():
-            create_campaign(keyword.strip(), location.strip(), activate=True)
+            new_campaign = create_campaign(keyword.strip(), location.strip(), activate=True)
+            st.session_state["active_campaign_selector"] = new_campaign["id"]
             reload(campaign_changed=True)
     with create_right:
         st.subheader("Active Campaign")
@@ -2834,6 +2836,29 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
         reload(campaign_id=campaign["id"], campaign_changed=True)
 
     _render_campaign_template_editor(campaign)
+
+    st.divider()
+    st.subheader("Extra Queries")
+    st.caption("Additional keyword/location pairs scraped into this campaign's lead pool (deduplicated by company name).")
+    extra_queries = campaign.get("extra_queries") or []
+    if extra_queries:
+        for i, q in enumerate(extra_queries):
+            col1, col2, col3 = st.columns([2, 2, 1])
+            col1.text(q.get("keyword", ""))
+            col2.text(q.get("location", ""))
+            if col3.button("Remove", key=f"remove_eq_{i}"):
+                updated = [x for j, x in enumerate(extra_queries) if j != i]
+                update_campaign(campaign["id"], {"extra_queries": updated})
+                reload(campaign_id=campaign["id"], campaign_changed=True)
+    with st.form("add_extra_query"):
+        col1, col2 = st.columns(2)
+        eq_kw = col1.text_input("Keyword", placeholder="Werbeagentur")
+        eq_loc = col2.text_input("Location", placeholder="Klagenfurt")
+        add_eq = st.form_submit_button("Add Query")
+    if add_eq and eq_kw.strip() and eq_loc.strip():
+        new_queries = list(extra_queries) + [{"keyword": eq_kw.strip(), "location": eq_loc.strip()}]
+        update_campaign(campaign["id"], {"extra_queries": new_queries})
+        reload(campaign_id=campaign["id"], campaign_changed=True)
 
 
 def _ensure_stale_contacts_archived(campaign: dict) -> None:
