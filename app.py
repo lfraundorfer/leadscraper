@@ -19,6 +19,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Install Playwright browser binaries if not already present (required on Streamlit Cloud)
+subprocess.run(["playwright", "install", "chromium"], check=False, capture_output=True)
+
 import crm_backend as backend
 from campaign_service import (
     create_campaign,
