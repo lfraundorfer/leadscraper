@@ -2835,8 +2835,6 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
         )
         reload(campaign_id=campaign["id"], campaign_changed=True)
 
-    _render_campaign_template_editor(campaign)
-
     st.divider()
     st.subheader("Extra Queries")
     st.caption("Additional keyword/location pairs scraped into this campaign's lead pool (deduplicated by company name).")
@@ -2859,6 +2857,8 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
         new_queries = list(extra_queries) + [{"keyword": eq_kw.strip(), "location": eq_loc.strip()}]
         update_campaign(campaign["id"], {"extra_queries": new_queries})
         reload(campaign_id=campaign["id"], campaign_changed=True)
+
+    _render_campaign_template_editor(campaign)
 
 
 def _ensure_stale_contacts_archived(campaign: dict) -> None:
