@@ -1239,6 +1239,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 "level": "error",
                 "message": f"Email send failed for {lid}: {str(result.get('error') or 'unknown error')}",
             }
+            reload(campaign_id=campaign["id"])
     elif mark_email_sent:
         if _record_outreach_action(
             campaign,
