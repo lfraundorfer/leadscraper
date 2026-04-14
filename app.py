@@ -1365,6 +1365,7 @@ def _init_outreach_state(campaign: dict) -> dict[str, str]:
     key_map = {
         "selection": _campaign_state_key(campaign, "outreach_bulk_selection"),
         "note": _campaign_state_key(campaign, "outreach_bulk_note"),
+        "clear_note": _campaign_state_key(campaign, "outreach_bulk_note_clear"),
         "notice": _campaign_state_key(campaign, "outreach_bulk_notice"),
         "search": _campaign_state_key(campaign, "outreach_search"),
         "page": _campaign_state_key(campaign, "outreach_page"),
@@ -1374,6 +1375,7 @@ def _init_outreach_state(campaign: dict) -> dict[str, str]:
     defaults = {
         "selection": [],
         "note": "",
+        "clear_note": False,
         "notice": None,
         "search": "",
         "page": 1,
@@ -2285,6 +2287,9 @@ def _render_outreach(campaign: dict) -> None:
     if merged_selection != st.session_state.get(state_keys["selection"], []):
         st.session_state[state_keys["selection"]] = merged_selection
 
+    if st.session_state.get(state_keys["clear_note"]):
+        st.session_state[state_keys["note"]] = ""
+        st.session_state[state_keys["clear_note"]] = False
     st.text_input(
         "Bulk action note",
         key=state_keys["note"],
@@ -2311,7 +2316,7 @@ def _render_outreach(campaign: dict) -> None:
         st.session_state[state_keys["notice"]] = {"sent_ids": sent_ids, "failed_ids": failed_ids}
         st.session_state[state_keys["selection"]] = failed_ids
         if not failed_ids:
-            st.session_state[state_keys["note"]] = ""
+            st.session_state[state_keys["clear_note"]] = True
         reload(campaign_id=campaign["id"])
 
     nav_prev, nav_info, nav_next = st.columns([1, 2, 1])
