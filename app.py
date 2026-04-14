@@ -42,7 +42,7 @@ from campaign_service import (
     update_campaign,
 )
 from crm_fields import is_pre_contact_status, normalize_company_key
-from crm_mailer import format_phone_e164, send_email
+from crm_mailer import format_phone_e164, send_email, send_email_result
 from crm_mail_sync import sync_mailbox
 from crm_store import (
     ALL_COLUMNS,
@@ -1225,11 +1225,19 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
                 schedule_choice="clear",
             )
         with st.spinner("Sending email..."):
-            ok = send_email(lid, notes=action_note, campaign=campaign, lead=row)
-        if ok:
+            result = send_email_result(lid, notes=action_note, campaign=campaign, lead=row)
+        if result.get("ok"):
+            st.session_state[state_keys["notice"]] = {
+                "level": "success",
+                "message": f"Email sent for {lid}. Contact log updated.",
+            }
             reload(campaign_id=campaign["id"])
         elif row is not None:
             _persist_outreach_row(campaign, row)
+            st.session_state[state_keys["notice"]] = {
+                "level": "error",
+                "message": f"Email send failed for {lid}: {str(result.get('error') or 'unknown error')}",
+            }
     elif mark_email_sent:
         if _record_outreach_action(
             campaign,
@@ -2189,17 +2197,21 @@ def _render_outreach(campaign: dict) -> None:
 
     notice = st.session_state.get(state_keys["notice"])
     if notice:
-        sent_ids = notice.get("sent_ids", [])
-        failed_ids = notice.get("failed_ids", [])
-        if sent_ids and not failed_ids:
-            st.success(f"Bulk send complete: sent {len(sent_ids)} email(s).")
-        elif sent_ids:
-            st.warning(
-                f"Bulk send partially completed: sent {len(sent_ids)} email(s), "
-                f"failed {len(failed_ids)} ({', '.join(failed_ids)})."
-            )
+        if isinstance(notice, dict) and notice.get("message"):
+            renderer = getattr(st, str(notice.get("level") or "info"), st.info)
+            renderer(str(notice.get("message")))
         else:
-            st.error(f"Bulk send failed for {len(failed_ids)} email(s): {', '.join(failed_ids)}")
+            sent_ids = notice.get("sent_ids", [])
+            failed_ids = notice.get("failed_ids", [])
+            if sent_ids and not failed_ids:
+                st.success(f"Bulk send complete: sent {len(sent_ids)} email(s).")
+            elif sent_ids:
+                st.warning(
+                    f"Bulk send partially completed: sent {len(sent_ids)} email(s), "
+                    f"failed {len(failed_ids)} ({', '.join(failed_ids)})."
+                )
+            else:
+                st.error(f"Bulk send failed for {len(failed_ids)} email(s): {', '.join(failed_ids)}")
         st.session_state[state_keys["notice"]] = None
 
     bulk_ready = [lead for lead in approved if _is_bulk_email_ready_summary(lead)]
