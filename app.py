@@ -1056,10 +1056,16 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
     lid = lead.get("ID", "?")
     channel_options = available_channels(lead)
     notice_key = _campaign_state_key(campaign, "outreach_bulk_notice")
+    workspace_notice_key = f"{key_prefix}_workspace_notice"
     if not channel_options:
         st.warning("No usable outreach channel on this lead.")
         return
     _render_latest_mail_status(campaign, lead)
+
+    workspace_notice = st.session_state.pop(workspace_notice_key, None)
+    if isinstance(workspace_notice, dict) and workspace_notice.get("message"):
+        renderer = getattr(st, str(workspace_notice.get("level") or "info"), st.info)
+        renderer(str(workspace_notice.get("message")))
 
     current_subject, current_body = parse_email_draft(lead.get("Email_Draft", ""))
     planned = planned_channel(lead)
@@ -1228,17 +1234,20 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
         with st.spinner("Sending email..."):
             result = send_email_result(lid, notes=action_note, campaign=campaign, lead=row)
         if result.get("ok"):
-            st.session_state[notice_key] = {
-                "level": "success",
-                "message": f"Email sent for {lid}. Contact log updated.",
-            }
+            msg = f"Email sent for {lid}. Contact log updated."
+            st.session_state[notice_key] = {"level": "success", "message": msg}
+            st.session_state[workspace_notice_key] = {"level": "success", "message": msg}
             reload(campaign_id=campaign["id"])
         elif row is not None:
             _persist_outreach_row(campaign, row)
-            st.session_state[notice_key] = {
-                "level": "error",
-                "message": f"Email send failed for {lid}: {str(result.get('error') or 'unknown error')}",
-            }
+            msg = f"Email send failed for {lid}: {str(result.get('error') or 'unknown error')}"
+            st.session_state[notice_key] = {"level": "error", "message": msg}
+            st.session_state[workspace_notice_key] = {"level": "error", "message": msg}
+            reload(campaign_id=campaign["id"])
+        else:
+            msg = f"Could not load lead {lid} from database. Please refresh the page."
+            st.session_state[notice_key] = {"level": "error", "message": msg}
+            st.session_state[workspace_notice_key] = {"level": "error", "message": msg}
             reload(campaign_id=campaign["id"])
     elif mark_email_sent:
         if _record_outreach_action(
