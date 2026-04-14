@@ -113,6 +113,7 @@ def _default_campaign_config(keyword: str, location: str, campaign_id: str | Non
         "example_intro": _default_example_intro(keyword),
         "service_singular": keyword.strip(),
         "service_plural": f"{keyword.strip()}-Betriebe",
+        "extra_queries": [],
         "config_version": 1,
         "draft_config_version": 1,
         "research_config_version": 1,
@@ -148,6 +149,7 @@ def _legacy_campaign_config() -> dict[str, Any]:
         "example_intro": "Wenn das relevant ist, schicke ich Ihnen gern 2-3 konkrete Ideen dazu:",
         "service_singular": "Installateur",
         "service_plural": "Installateurbetriebe",
+        "extra_queries": [],
         "config_version": 1,
         "draft_config_version": 1,
         "research_config_version": 1,
@@ -309,6 +311,7 @@ def get_campaign(campaign_id: str) -> dict[str, Any]:
     config = _read_json(config_path, {})
     if not config:
         raise FileNotFoundError(f"Campaign config missing: {config_path}")
+    config.setdefault("extra_queries", [])
     config.setdefault("config_version", 1)
     config.setdefault("draft_config_version", config.get("config_version", 1))
     config.setdefault("research_config_version", config.get("config_version", 1))
@@ -411,6 +414,64 @@ def update_campaign(campaign_id: str, updates: dict[str, Any], bump_version: boo
                 config["research_config_version"] = int(config.get("research_config_version") or 0) + 1
         save_campaign_config(config)
     return config
+
+
+def _normalize_campaign_query(keyword: str, location: str) -> dict[str, str]:
+    normalized_keyword = (keyword or "").strip()
+    normalized_location = (location or "").strip()
+    if not normalized_keyword or not normalized_location:
+        raise ValueError("Both keyword and location are required.")
+    return {"keyword": normalized_keyword, "location": normalized_location}
+
+
+def _campaign_query_key(keyword: str, location: str) -> tuple[str, str]:
+    return (slugify(keyword), slugify(location))
+
+
+def list_campaign_extra_queries(campaign_id: str = "") -> list[dict[str, str]]:
+    campaign = get_campaign(campaign_id) if campaign_id else get_active_campaign()
+    extra_queries = campaign.get("extra_queries")
+    if not isinstance(extra_queries, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for item in extra_queries:
+        if not isinstance(item, dict):
+            continue
+        keyword = str(item.get("keyword") or "").strip()
+        location = str(item.get("location") or "").strip()
+        if keyword and location:
+            normalized.append({"keyword": keyword, "location": location})
+    return normalized
+
+
+def add_campaign_extra_query(keyword: str, location: str, campaign_id: str = "") -> dict[str, Any]:
+    campaign = get_campaign(campaign_id) if campaign_id else get_active_campaign()
+    new_query = _normalize_campaign_query(keyword, location)
+    primary_key = _campaign_query_key(campaign.get("keyword", ""), campaign.get("location", ""))
+    new_key = _campaign_query_key(new_query["keyword"], new_query["location"])
+    if new_key == primary_key:
+        raise ValueError("That query already matches the campaign's primary keyword/location.")
+
+    extra_queries = list_campaign_extra_queries(campaign.get("id", ""))
+    if any(_campaign_query_key(item["keyword"], item["location"]) == new_key for item in extra_queries):
+        raise ValueError("That extra query already exists on this campaign.")
+
+    updated = extra_queries + [new_query]
+    return update_campaign(campaign["id"], {"extra_queries": updated}, bump_version=False)
+
+
+def remove_campaign_extra_query(keyword: str, location: str, campaign_id: str = "") -> dict[str, Any]:
+    campaign = get_campaign(campaign_id) if campaign_id else get_active_campaign()
+    target = _campaign_query_key(keyword, location)
+    extra_queries = list_campaign_extra_queries(campaign.get("id", ""))
+    updated = [
+        item
+        for item in extra_queries
+        if _campaign_query_key(item["keyword"], item["location"]) != target
+    ]
+    if len(updated) == len(extra_queries):
+        raise ValueError("That extra query was not found on this campaign.")
+    return update_campaign(campaign["id"], {"extra_queries": updated}, bump_version=False)
 
 
 def bump_campaign_version(campaign_id: str) -> dict[str, Any]:

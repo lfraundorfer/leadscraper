@@ -24,10 +24,13 @@ subprocess.run(["playwright", "install", "chromium"], check=False, capture_outpu
 
 import crm_backend as backend
 from campaign_service import (
+    add_campaign_extra_query,
     create_campaign,
     get_active_campaign,
     get_campaign,
     get_hooks_library_path,
+    list_campaign_extra_queries,
+    remove_campaign_extra_query,
     get_template_overrides_path,
     list_campaigns,
     mark_campaign_stage_run,
@@ -38,7 +41,6 @@ from campaign_service import (
 from crm_fields import is_pre_contact_status, normalize_company_key
 from crm_mailer import format_phone_e164, send_email
 from crm_mail_sync import sync_mailbox
-from crm_scrape import scrape_campaign
 from crm_store import (
     ALL_COLUMNS,
     TERMINAL_STATUSES,
@@ -1857,7 +1859,7 @@ def _render_dashboard(campaign: dict, dashboard_snapshot: dict, metrics: dict[st
 
     total_leads = int(metrics.get("total_leads", 0))
     if not total_leads:
-        st.warning("No leads found yet. Start on the Campaigns page and run Scrape.")
+        st.warning("No leads found yet. Run `python crm.py scrape` locally, then refresh this app.")
         return
 
     counts = dict(dashboard_snapshot.get("status_counts") or {})
@@ -2707,7 +2709,7 @@ def _render_all_leads(campaign: dict) -> None:
 
 def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
     st.title("Campaigns")
-    st.caption("Create, switch, edit, and run pipeline stages for saved niche campaigns.")
+    st.caption("Create, switch, and edit saved niche campaigns. Scraping runs locally via `python crm.py scrape`.")
 
     campaigns = cached_campaigns()
     summary_rows = [
@@ -2755,32 +2757,29 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
     c4.metric("Draft stale", metrics.get("draft_stale", 0))
     c5.metric("Research stale", metrics.get("research_stale", 0))
 
-    stage_cols = st.columns(5)
-    if stage_cols[0].button("Scrape", type="primary", width="stretch"):
-        with st.spinner("Scraping Herold..."):
-            scrape_campaign(campaign)
-            mark_campaign_stage_run(campaign["id"], "scraped")
-        reload(campaign_id=campaign["id"], campaign_changed=True)
-    if stage_cols[1].button("Migrate", width="stretch"):
+    st.info("Run `python crm.py scrape` on your machine to add leads to the active campaign. Then use the buttons below for the remaining steps.")
+
+    stage_cols = st.columns(4)
+    if stage_cols[0].button("Migrate", width="stretch"):
         from crm_store import migrate
 
         with st.spinner("Assigning lead IDs and CRM fields..."):
             if migrate():
                 mark_campaign_stage_run(campaign["id"], "migrated")
         reload(campaign_id=campaign["id"], campaign_changed=True)
-    if stage_cols[2].button("Enrich", width="stretch"):
+    if stage_cols[1].button("Enrich", width="stretch"):
         from crm_enrich import main as enrich_main
 
         with st.spinner("Enriching contacts..."):
             enrich_main()
         reload(campaign_id=campaign["id"], campaign_changed=True)
-    if stage_cols[3].button("Research", width="stretch"):
+    if stage_cols[2].button("Research", width="stretch"):
         from crm_research import main as research_main
 
         with st.spinner("Running research..."):
             research_main()
         reload(campaign_id=campaign["id"], campaign_changed=True)
-    if stage_cols[4].button("Analyze", width="stretch"):
+    if stage_cols[3].button("Analyze", width="stretch"):
         from crm_analyze import main as analyze_main
 
         with st.spinner("Generating drafts..."):
@@ -2841,15 +2840,14 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
     st.divider()
     st.subheader("Extra Queries")
     st.caption("Additional keyword/location pairs scraped into this campaign's lead pool (deduplicated by company name).")
-    extra_queries = campaign.get("extra_queries") or []
+    extra_queries = list_campaign_extra_queries(campaign["id"])
     if extra_queries:
         for i, q in enumerate(extra_queries):
             col1, col2, col3 = st.columns([2, 2, 1])
             col1.text(q.get("keyword", ""))
             col2.text(q.get("location", ""))
             if col3.button("Remove", key=f"remove_eq_{i}"):
-                updated = [x for j, x in enumerate(extra_queries) if j != i]
-                update_campaign(campaign["id"], {"extra_queries": updated})
+                remove_campaign_extra_query(q.get("keyword", ""), q.get("location", ""), campaign["id"])
                 reload(campaign_id=campaign["id"], campaign_changed=True)
     with st.form("add_extra_query"):
         col1, col2 = st.columns(2)
@@ -2857,9 +2855,12 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
         eq_loc = col2.text_input("Location", placeholder="Klagenfurt")
         add_eq = st.form_submit_button("Add Query")
     if add_eq and eq_kw.strip() and eq_loc.strip():
-        new_queries = list(extra_queries) + [{"keyword": eq_kw.strip(), "location": eq_loc.strip()}]
-        update_campaign(campaign["id"], {"extra_queries": new_queries})
-        reload(campaign_id=campaign["id"], campaign_changed=True)
+        try:
+            add_campaign_extra_query(eq_kw.strip(), eq_loc.strip(), campaign["id"])
+        except ValueError as exc:
+            st.warning(str(exc))
+        else:
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
     _render_campaign_template_editor(campaign)
 

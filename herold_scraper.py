@@ -28,7 +28,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set
 from urllib.parse import quote_plus
 
 from bs4 import BeautifulSoup
@@ -585,6 +585,7 @@ def scrape_to_csv(
     visible: bool = False,
     dump_html: str = "",
     verbose: bool = False,
+    on_page_checkpoint: Callable[..., None] | None = None,
 ) -> dict:
     # Logging: route everything through tqdm so it doesn't break the progress bar.
     # Only show warnings+ normally; verbose enables debug.
@@ -694,7 +695,17 @@ def scrape_to_csv(
                     processed_leads.append(lead)
                     pbar.update(1)
 
-                total_new += write_leads(processed_leads, output, seen)
+                written = write_leads(processed_leads, output, seen)
+                total_new += written
+                if on_page_checkpoint is not None:
+                    on_page_checkpoint(
+                        processed_leads,
+                        page_num=page_num,
+                        total_pages=total_pages,
+                        category=category,
+                        location=location,
+                        total_new=total_new,
+                    )
 
                 if page_num < page_end:
                     time.sleep(page_pause)

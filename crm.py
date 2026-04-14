@@ -129,6 +129,35 @@ def cmd_campaign_activate(args) -> None:
     print(f"Active campaign: {campaign['id']} -> {campaign.get('label', '')}")
 
 
+def cmd_campaign_queries(args) -> None:
+    from campaign_service import get_campaign, get_active_campaign, list_campaign_extra_queries
+
+    campaign = get_campaign(args.campaign_id) if args.campaign_id else get_active_campaign()
+    extra_queries = list_campaign_extra_queries(campaign["id"])
+    print(f"Campaign: {campaign['id']} -> {campaign.get('label', '')}")
+    print(f"Primary query: {campaign.get('keyword', '')} / {campaign.get('location', '')}")
+    if not extra_queries:
+        print("Extra queries: none")
+        return
+    print("Extra queries:")
+    for item in extra_queries:
+        print(f"- {item['keyword']} / {item['location']}")
+
+
+def cmd_campaign_query_add(args) -> None:
+    from campaign_service import add_campaign_extra_query
+
+    campaign = add_campaign_extra_query(args.keyword, args.location, campaign_id=args.campaign_id or "")
+    print(f"Added extra query to {campaign['id']}: {args.keyword.strip()} / {args.location.strip()}")
+
+
+def cmd_campaign_query_remove(args) -> None:
+    from campaign_service import remove_campaign_extra_query
+
+    campaign = remove_campaign_extra_query(args.keyword, args.location, campaign_id=args.campaign_id or "")
+    print(f"Removed extra query from {campaign['id']}: {args.keyword.strip()} / {args.location.strip()}")
+
+
 def cmd_scrape(args) -> None:
     from campaign_service import create_campaign, get_active_campaign, mark_campaign_stage_run
     from crm_scrape import scrape_campaign
@@ -193,6 +222,9 @@ Examples:
   python crm.py campaigns
   python crm.py campaign-create Schluesseldienst Wien
   python crm.py campaign-activate schluesseldienst_wien
+  python crm.py campaign-queries
+  python crm.py campaign-query-add Schluesseldienst Graz
+  python crm.py campaign-query-remove Schluesseldienst Graz
   python crm.py scrape
 """,
     )
@@ -214,6 +246,19 @@ Examples:
 
     p = subparsers.add_parser("campaign-activate", help="Switch the active campaign")
     p.add_argument("campaign_id", help="Campaign id, e.g. schluesseldienst_wien")
+
+    p = subparsers.add_parser("campaign-queries", help="List extra scrape queries for a campaign")
+    p.add_argument("--campaign-id", default="", help="Optional campaign id; defaults to the active campaign")
+
+    p = subparsers.add_parser("campaign-query-add", help="Add an extra keyword/location pair to a campaign")
+    p.add_argument("keyword", help="Business keyword, e.g. Werbeagentur")
+    p.add_argument("location", help="Location, e.g. Berlin")
+    p.add_argument("--campaign-id", default="", help="Optional campaign id; defaults to the active campaign")
+
+    p = subparsers.add_parser("campaign-query-remove", help="Remove an extra keyword/location pair from a campaign")
+    p.add_argument("keyword", help="Business keyword, e.g. Werbeagentur")
+    p.add_argument("location", help="Location, e.g. Berlin")
+    p.add_argument("--campaign-id", default="", help="Optional campaign id; defaults to the active campaign")
 
     p = subparsers.add_parser("scrape", help="Scrape Herold leads into the active campaign backend")
     p.add_argument("--keyword", default="", help="Optional keyword to create/activate before scraping")
@@ -293,6 +338,9 @@ Examples:
         "campaigns": cmd_campaigns,
         "campaign-create": cmd_campaign_create,
         "campaign-activate": cmd_campaign_activate,
+        "campaign-queries": cmd_campaign_queries,
+        "campaign-query-add": cmd_campaign_query_add,
+        "campaign-query-remove": cmd_campaign_query_remove,
         "scrape": cmd_scrape,
         "enrich": cmd_enrich,
         "research": cmd_research,

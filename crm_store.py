@@ -245,46 +245,78 @@ def _persistable_row(lead: dict, draft_version: str, research_version: str) -> d
     )
 
 
-def ensure_lead_ids(leads: list[dict], campaign: Optional[dict] = None) -> int:
-    """
-    Assign IDs only to leads that are still missing one.
-    Keeps existing IDs stable so repeated scrapes do not renumber the whole campaign.
-    Returns the number of IDs assigned.
-    """
-    active_campaign = campaign or get_active_campaign()
-    prefix = (active_campaign.get("id_prefix") or "LEAD").upper()
-    draft_version = _draft_version(active_campaign)
-    research_version = _research_version(active_campaign)
+def _lead_id_prefix(active_campaign: dict) -> str:
+    return (active_campaign.get("id_prefix") or "LEAD").upper()
 
-    next_number = 0
+
+def _apply_lead_defaults(lead: dict, draft_version: str, research_version: str) -> None:
+    if not lead.get("Status"):
+        lead["Status"] = "new"
+    if not lead.get("Contact_Count"):
+        lead["Contact_Count"] = "0"
+    if not lead.get("Drafts_Approved"):
+        lead["Drafts_Approved"] = "0"
+    lead["Preferred_Channel"] = preferred_channel(lead)
+    if not lead.get("Draft_Config_Version") and _data_exists(lead, ["Email_Draft", "WhatsApp_Draft"]):
+        lead["Draft_Config_Version"] = draft_version
+    if not lead.get("Research_Config_Version") and _data_exists(lead, ["Website_Category", "Google_Rank_Keyword", "Google_Rating"]):
+        lead["Research_Config_Version"] = research_version
+
+
+def current_max_lead_number(leads: list[dict], campaign: Optional[dict] = None) -> int:
+    active_campaign = campaign or get_active_campaign()
+    prefix = _lead_id_prefix(active_campaign)
+    max_number = 0
     for lead in leads:
         lead_id = str(lead.get("ID") or "").strip()
         if not lead_id.startswith(f"{prefix}-"):
             continue
         suffix = lead_id.rsplit("-", 1)[-1]
         try:
-            next_number = max(next_number, int(suffix))
+            max_number = max(max_number, int(suffix))
         except ValueError:
             continue
+    return max_number
+
+
+def assign_missing_lead_ids(
+    leads: list[dict],
+    campaign: Optional[dict] = None,
+    *,
+    next_number: int | None = None,
+) -> tuple[int, int]:
+    """
+    Assign missing IDs in-place and apply baseline CRM defaults.
+
+    Returns `(next_number, assigned_count)` so callers doing incremental saves can
+    keep numbering stable across batches.
+    """
+    active_campaign = campaign or get_active_campaign()
+    prefix = _lead_id_prefix(active_campaign)
+    draft_version = _draft_version(active_campaign)
+    research_version = _research_version(active_campaign)
+    current_number = current_max_lead_number(leads, active_campaign)
+    if next_number is not None:
+        current_number = max(current_number, int(next_number))
 
     assigned = 0
     for lead in leads:
         if not str(lead.get("ID") or "").strip():
-            next_number += 1
-            lead["ID"] = f"{prefix}-{next_number:04d}"
+            current_number += 1
+            lead["ID"] = f"{prefix}-{current_number:04d}"
             assigned += 1
-        if not lead.get("Status"):
-            lead["Status"] = "new"
-        if not lead.get("Contact_Count"):
-            lead["Contact_Count"] = "0"
-        if not lead.get("Drafts_Approved"):
-            lead["Drafts_Approved"] = "0"
-        lead["Preferred_Channel"] = preferred_channel(lead)
-        if not lead.get("Draft_Config_Version") and _data_exists(lead, ["Email_Draft", "WhatsApp_Draft"]):
-            lead["Draft_Config_Version"] = draft_version
-        if not lead.get("Research_Config_Version") and _data_exists(lead, ["Website_Category", "Google_Rank_Keyword", "Google_Rating"]):
-            lead["Research_Config_Version"] = research_version
+        _apply_lead_defaults(lead, draft_version, research_version)
 
+    return current_number, assigned
+
+
+def ensure_lead_ids(leads: list[dict], campaign: Optional[dict] = None) -> int:
+    """
+    Assign IDs only to leads that are still missing one.
+    Keeps existing IDs stable so repeated scrapes do not renumber the whole campaign.
+    Returns the number of IDs assigned.
+    """
+    _, assigned = assign_missing_lead_ids(leads, campaign=campaign)
     return assigned
 
 

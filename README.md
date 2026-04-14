@@ -89,8 +89,8 @@ python crm.py analyze
 What "run locally" means:
 
 - run CLI commands on your laptop inside this repo
-- or run `streamlit run app.py` on your laptop and click the pipeline buttons in the local `localhost` app
-- if you click those buttons in the hosted Streamlit app, the work runs on Streamlit Cloud instead, which is not the recommended place for heavy scrape/research/analyze jobs
+- run `streamlit run app.py` on your laptop for review/config work, not scraping
+- the app no longer runs scrape inside Streamlit; use `python crm.py scrape` locally instead
 
 Recommended split:
 
@@ -105,7 +105,9 @@ Pipeline commands run against the current active campaign.
 Create and activate a new campaign explicitly:
 
 ```bash
-python crm.py campaign-create Schluesseldienst Wien
+python crm.py campaign-create Werbeagentur Wien
+python crm.py campaign-query-add Werbeagentur Berlin
+python crm.py campaign-queries
 python crm.py scrape
 python crm.py enrich
 python crm.py research
@@ -125,6 +127,9 @@ Notes:
 
 - the campaign is created immediately when you run `campaign-create` or `scrape --keyword ... --location ...`
 - it gets a campaign id like `schluesseldienst_wien`
+- extra queries let one campaign scrape multiple keyword/location pairs into the same deduplicated lead pool
+- `python crm.py campaign-query-add Werbeagentur Berlin` adds another city to the active campaign
+- the next `python crm.py scrape` runs the primary query plus all extra queries on that campaign
 - once created, it is stored in Supabase right away in hosted mode and appears in Streamlit after a refresh
 - you can edit `Campaign Config` and `Template Editor` as soon as the campaign exists
 - `Template Editor` now manages shared campaign-level email/WhatsApp bodies plus separate email and WhatsApp hook libraries
@@ -136,6 +141,9 @@ Notes:
 python crm.py campaigns
 python crm.py campaign-create Schluesseldienst Wien
 python crm.py campaign-activate schluesseldienst_wien
+python crm.py campaign-queries
+python crm.py campaign-query-add Schluesseldienst Graz
+python crm.py campaign-query-remove Schluesseldienst Graz
 
 python crm.py scrape
 python crm.py migrate
@@ -157,7 +165,7 @@ python crm.py stats
 
 ## Streamlit Pages
 
-- `Campaigns`: create/activate campaigns, edit config, edit shared email/WhatsApp templates, edit email/WhatsApp hooks, run pipeline stages
+- `Campaigns`: create/activate campaigns, edit config, edit shared email/WhatsApp templates, edit email/WhatsApp hooks, and manage extra queries
 - `Dashboard`: KPIs and batch draft generation
 - `Review Queue`: review drafts, approve, queue for today/tomorrow
 - `Outreach`: manual email/WhatsApp/phone actions, queued send overview

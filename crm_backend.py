@@ -15,7 +15,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from dotenv import load_dotenv
+
 from crm_fields import ALL_COLUMNS
+
+load_dotenv()
 
 
 ROOT_DIR = Path(__file__).resolve().parent

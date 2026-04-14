@@ -165,37 +165,37 @@ This shows:
 - ID prefix
 - config version
 
-Use it as a quick check that you are working in the right campaign before pressing any stage buttons.
+Use it as a quick check that you are working in the right campaign before running any stage.
 
-#### Run pipeline buttons
+#### Campaign stage buttons
 
 These buttons always operate on the **currently active campaign**.
 
-##### Scrape
+Scraping is CLI-only now. Run it locally:
 
-Use this to pull raw leads from Herold for the active campaign keyword and location.
+```bash
+python crm.py scrape
+```
 
-What it does:
+Or create and scrape a campaign in one step:
 
-- writes to the active campaign CSV
-- creates the CSV if it does not exist yet
-- appends new raw rows
-- skips duplicates by normalized company name
+```bash
+python crm.py scrape --keyword Werbeagentur --location Wien
+```
 
-What it does not do:
+To grow one campaign with more cities later, add extra queries to the active campaign:
 
-- it does not wipe the file first
-- it does not assign CRM IDs
-- it does not create drafts
+```bash
+python crm.py campaign-query-add Werbeagentur Berlin
+python crm.py campaign-queries
+python crm.py scrape
+```
 
-Safe expectation:
-
-- new campaign: creates `campaigns/<id>/leads.csv`
-- existing campaign: adds new raw leads to the existing CSV
+That keeps one shared campaign config, one review queue, and one deduplicated lead pool.
 
 ##### Migrate
 
-Use this after scraping raw leads into a campaign CSV.
+Use this after a local scrape added raw leads into a campaign CSV.
 
 What it does:
 
@@ -211,7 +211,7 @@ Important current behavior:
 Practical rule:
 
 - treat `Migrate` carefully on older campaigns
-- on a fresh campaign, it is the normal next step after `Scrape`
+- on a fresh campaign, it is the normal next step after a local `scrape`
 
 ##### Enrich
 
@@ -530,7 +530,7 @@ If a lead has been contacted 3+ times and still has no reply, it can be auto-arc
 Use this order:
 
 1. Create and activate the campaign
-2. Scrape
+2. Run `python crm.py scrape` locally
 3. Migrate
 4. Enrich
 5. Research
@@ -544,7 +544,7 @@ Use this order:
 
 1. Switch to the campaign in the sidebar
 2. Check Dashboard counts
-3. If you need more leads: Scrape
+3. If you need more leads: run `python crm.py scrape` locally
 4. If new raw rows were appended: Migrate carefully
 5. If research is stale or missing: Research
 6. If drafts are stale or missing: Analyze or Generate All Pending
@@ -571,7 +571,7 @@ If you scrape new raw rows into an already migrated CSV, then run `Migrate`, IDs
 
 ### 2. `Create and Activate` does not create leads immediately
 
-A new campaign starts with config and asset folders only. The campaign CSV usually appears on first `Scrape`.
+A new campaign starts with config and asset folders only. The campaign CSV usually appears on the first local `python crm.py scrape`.
 
 ### 3. Search in `All Leads` is limited
 
@@ -599,7 +599,7 @@ This keeps the visible sender and the actual outbound sender aligned more reliab
 If you just want the shortest safe way to operate the app:
 
 1. Pick the right active campaign in the sidebar.
-2. On `Campaigns`, run `Scrape -> Migrate -> Enrich -> Research -> Analyze` for a new campaign.
+2. Run `python crm.py scrape` locally for a new campaign, then on `Campaigns` run `Migrate -> Enrich -> Research -> Analyze`.
 3. On `Review Queue`, approve only the drafts you actually want to use first.
 4. On `Outreach`, send or log the chosen first channel.
 5. On `All Leads`, edit notes/prices and regenerate drafts when needed.
