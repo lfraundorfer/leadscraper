@@ -8,6 +8,7 @@ Commands:
   enrich [--id X]      Fill owner names from FirmenABC
   research [--id X]    Website + Google Reviews + rank + competitors
   analyze [--id X] [--no-review]  Generate AI messages with OpenAI
+  stamp-email          Apply one identical approved email draft to leads
   refresh-drafts       Re-render saved drafts from current templates only
   daily [--limit N]    Show today's action list
   log <ID> <outcome>   Log a contact attempt
@@ -65,6 +66,21 @@ def cmd_refresh_drafts(args) -> None:
         save_leads(leads, campaign=campaign)
     scope = f" in {campaign['id']}" if campaign.get("id") else ""
     print(f"Refreshed {count} draft(s){scope}.")
+
+
+def cmd_stamp_email(args) -> None:
+    from crm_stamp import main
+
+    main(
+        draft=args.draft or "",
+        draft_file=args.draft_file or "",
+        campaign_template=bool(args.campaign_template),
+        subject=args.subject or "",
+        body=args.body or "",
+        body_file=args.body_file or "",
+        hook=args.hook or "",
+        single_id=args.id or "",
+    )
 
 
 def cmd_daily(args) -> None:
@@ -211,6 +227,9 @@ Examples:
   python crm.py research --id LEAD-001
   python crm.py analyze --id LEAD-001
   python crm.py analyze --no-review        # auto-approve all drafts
+  python crm.py stamp-email --campaign-template --hook "Ich habe eine Idee für Ihre Website"
+  python crm.py stamp-email --subject "Kurze Frage" --body-file shared_email.txt
+  python crm.py stamp-email --draft-file shared_email_draft.txt
   python crm.py refresh-drafts             # refresh pending drafts from templates only
   python crm.py daily
   python crm.py log LEAD-001 sent --channel email --notes "Sent intro email"
@@ -290,6 +309,17 @@ Examples:
     p.add_argument("--limit", type=int, default=0, help="Only analyze the first N leads (e.g. --limit 50)")
     p.add_argument("--gpt-hooks", action="store_true", help="Generate custom hook via GPT (default: use pre-written library)")
 
+    # stamp-email
+    p = subparsers.add_parser("stamp-email", help="Apply one identical approved email draft to leads")
+    p.add_argument("--campaign-template", action="store_true", help="Render the active campaign's shared email template from campaign config")
+    p.add_argument("--draft", default="", help="Full stored email draft including 'Betreff: ...'")
+    p.add_argument("--draft-file", default="", help="Path to a UTF-8 text file containing the full stored email draft")
+    p.add_argument("--subject", default="", help="Subject line when building the draft from subject + body")
+    p.add_argument("--body", default="", help="Email body when building the draft from subject + body")
+    p.add_argument("--body-file", default="", help="Path to a UTF-8 text file containing the email body")
+    p.add_argument("--hook", default="", help="Hook text used with --campaign-template for {{hook}}")
+    p.add_argument("--id", default="", help="Only stamp a single lead by ID")
+
     # refresh-drafts
     p = subparsers.add_parser("refresh-drafts", help="Re-render saved drafts from current templates without refetching websites")
     p.add_argument("--id", default="", help="Only refresh a single lead by ID")
@@ -345,6 +375,7 @@ Examples:
         "enrich": cmd_enrich,
         "research": cmd_research,
         "analyze": cmd_analyze,
+        "stamp-email": cmd_stamp_email,
         "refresh-drafts": cmd_refresh_drafts,
         "daily": cmd_daily,
         "log": cmd_log,

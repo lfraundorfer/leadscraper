@@ -1678,14 +1678,17 @@ def fill_template(template_str: str, slots: dict) -> str:
 
 def parse_email_draft(draft: str) -> tuple[str, str]:
     """Parse 'Betreff: ...' email draft into (subject, body)."""
-    text = (draft or "").strip()
-    if not text:
+    text = (draft or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
         return "", ""
 
     lines = text.splitlines()
     if lines and lines[0].lower().startswith("betreff:"):
         subject = lines[0][8:].strip()
-        body = "\n".join(lines[1:]).strip()
+        body_lines = lines[1:]
+        if body_lines and body_lines[0] == "":
+            body_lines = body_lines[1:]
+        body = "\n".join(body_lines)
         return subject, body
 
     return "", text
@@ -1694,9 +1697,11 @@ def parse_email_draft(draft: str) -> tuple[str, str]:
 def compose_email_draft(subject: str, body: str) -> str:
     """Compose the stored email draft format."""
     subject_clean = (subject or "").strip()
-    body_clean = (body or "").strip()
+    body_clean = (body or "").replace("\r\n", "\n").replace("\r", "\n")
     if subject_clean:
-        return f"Betreff: {subject_clean}\n\n{body_clean}".strip()
+        if body_clean:
+            return f"Betreff: {subject_clean}\n\n{body_clean}"
+        return f"Betreff: {subject_clean}"
     return body_clean
 
 

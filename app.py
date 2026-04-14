@@ -25,11 +25,14 @@ subprocess.run(["playwright", "install", "chromium"], check=False, capture_outpu
 import crm_backend as backend
 from campaign_service import (
     add_campaign_extra_query,
+    build_campaign_asset_path,
     create_campaign,
     get_active_campaign,
     get_campaign,
+    get_flyer_path,
     get_hooks_library_path,
     list_campaign_extra_queries,
+    save_campaign_flyer,
     remove_campaign_extra_query,
     get_template_overrides_path,
     list_campaigns,
@@ -126,6 +129,7 @@ ALL_LEADS_PRIORITY_OPTIONS = ["1", "2", "3", "4", "5"]
 REVIEW_QUEUE_PAGE_SIZE = 100
 OUTREACH_PAGE_SIZE = 100
 TEMPLATE_EDITOR_NOTICE_KEY = "template_editor_notice"
+CAMPAIGN_ASSET_NOTICE_KEY = "campaign_asset_notice"
 TEMPLATE_PLACEHOLDER_HELP = [
     ("hook", "The selected hook sentence(s) for this lead."),
     ("wa_hook", "The selected WhatsApp hook sentence(s) for this lead."),
@@ -221,6 +225,22 @@ def _set_template_editor_notice(level: str, message: str) -> None:
 
 def _render_template_editor_notice() -> None:
     notice = st.session_state.pop(TEMPLATE_EDITOR_NOTICE_KEY, None)
+    if not isinstance(notice, dict):
+        return
+    level = str(notice.get("level") or "info").strip()
+    message = str(notice.get("message") or "").strip()
+    if not message:
+        return
+    renderer = getattr(st, level, st.info)
+    renderer(message)
+
+
+def _set_campaign_asset_notice(level: str, message: str) -> None:
+    st.session_state[CAMPAIGN_ASSET_NOTICE_KEY] = {"level": level, "message": message}
+
+
+def _render_campaign_asset_notice() -> None:
+    notice = st.session_state.pop(CAMPAIGN_ASSET_NOTICE_KEY, None)
     if not isinstance(notice, dict):
         return
     level = str(notice.get("level") or "info").strip()
@@ -2836,6 +2856,47 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
             },
         )
         reload(campaign_id=campaign["id"], campaign_changed=True)
+
+    st.divider()
+    st.subheader("Campaign Assets")
+    _render_campaign_asset_notice()
+    current_flyer_path = get_flyer_path(campaign)
+    if current_flyer_path:
+        st.caption("Current flyer placeholder for the shared email template:")
+        st.code(
+            f"{{{{img:{current_flyer_path}|Megaphonia Flyer fuer {campaign.get('service_plural') or campaign.get('keyword') or 'den Betrieb'}}}}}"
+        )
+    else:
+        default_flyer_path = build_campaign_asset_path(campaign, "assets", "flyer.png")
+        st.caption(
+            "No flyer uploaded yet. Upload one here, then paste the shown `{{img:...|...}}` line into the shared email template."
+        )
+        st.code(f"{{{{img:{default_flyer_path}|Alt text fuer Ihren Flyer}}}}")
+
+    with st.form(f"campaign_flyer_{campaign['id']}"):
+        flyer_upload = st.file_uploader(
+            "Flyer image",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=False,
+            help="Stored with the campaign so hosted Postgres sending can embed it inline.",
+        )
+        save_flyer = st.form_submit_button("Save Flyer", type="primary")
+
+    if save_flyer:
+        if flyer_upload is None:
+            st.warning("Choose a flyer image first.")
+        else:
+            flyer_path = save_campaign_flyer(
+                campaign,
+                flyer_upload.name,
+                flyer_upload.getvalue(),
+                content_type=str(flyer_upload.type or "").strip(),
+            )
+            _set_campaign_asset_notice(
+                "success",
+                f"Saved flyer to `{flyer_path}`. Pending drafts are now stale until you refresh them.",
+            )
+            reload(campaign_id=campaign["id"], campaign_changed=True)
 
     st.divider()
     st.subheader("Extra Queries")

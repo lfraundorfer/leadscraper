@@ -150,6 +150,8 @@ python crm.py migrate
 python crm.py enrich --id SCHLWIEN-0001
 python crm.py research --id SCHLWIEN-0001
 python crm.py analyze --limit 50
+python crm.py stamp-email --campaign-template --hook "Ich habe eine Idee fuer Ihre Website"
+python crm.py stamp-email --subject "Kurze Frage" --body-file shared_email.txt
 python crm.py refresh-drafts
 
 python crm.py bootstrap-postgres

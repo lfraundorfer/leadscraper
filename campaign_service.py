@@ -84,6 +84,8 @@ def _campaign_layout(campaign_id: str) -> dict[str, Path]:
         "csv_path": campaign_dir / "leads.csv",
         "hooks_library_path": campaign_dir / "hooks_library.json",
         "template_overrides_path": campaign_dir / "template_overrides.json",
+        "assets_dir": campaign_dir / "assets",
+        "portfolio_dir": campaign_dir / "portfolio",
         "archive_dir": campaign_dir / "archive",
     }
 
@@ -507,12 +509,88 @@ def format_rank_keyword(campaign: dict[str, Any], plz: str = "") -> str:
     return re.sub(r"\s+", " ", rank_keyword).strip()
 
 
+def build_campaign_asset_path(campaign: dict[str, Any], folder: str, filename: str) -> str:
+    asset_name = Path(filename or "").name.strip()
+    if not asset_name:
+        raise ValueError("Asset filename is required.")
+    cleaned_folder = re.sub(r"/+", "/", str(folder or "").replace("\\", "/").strip("/"))
+    if not cleaned_folder:
+        raise ValueError("Asset folder is required.")
+    return f"campaigns/{campaign['id']}/{cleaned_folder}/{asset_name}"
+
+
+def save_campaign_asset(
+    campaign: dict[str, Any],
+    relative_path: str,
+    data: bytes,
+    *,
+    content_type: str = "",
+    bump_version: bool = True,
+) -> str:
+    normalized_path = backend.normalize_asset_path(relative_path)
+    if backend.is_postgres_backend():
+        backend.postgres_upsert_campaign_asset(
+            campaign["id"],
+            normalized_path,
+            data,
+            content_type=content_type,
+        )
+    else:
+        absolute_path = resolve_path(normalized_path)
+        absolute_path.parent.mkdir(parents=True, exist_ok=True)
+        absolute_path.write_bytes(bytes(data))
+    if bump_version:
+        bump_campaign_version(campaign["id"])
+    return normalized_path
+
+
+def save_campaign_flyer(
+    campaign: dict[str, Any],
+    filename: str,
+    data: bytes,
+    *,
+    content_type: str = "",
+) -> str:
+    relative_path = build_campaign_asset_path(campaign, "assets", filename)
+    return save_campaign_asset(
+        campaign,
+        relative_path,
+        data,
+        content_type=content_type,
+        bump_version=True,
+    )
+
+
+def list_campaign_assets(campaign: dict[str, Any], folder: str) -> list[str]:
+    cleaned_folder = str(folder or "").strip("/").replace("\\", "/")
+    prefix = f"campaigns/{campaign['id']}/{cleaned_folder}/"
+    if backend.is_postgres_backend():
+        loader = getattr(backend, "postgres_list_campaign_assets", None)
+        if not callable(loader):
+            return []
+        return [str(item.get("asset_path") or "") for item in loader(campaign["id"], prefix=prefix)]
+
+    layout = _campaign_layout_for_config(campaign)
+    if cleaned_folder == "assets":
+        asset_dir = layout["assets_dir"]
+    elif cleaned_folder == "portfolio":
+        asset_dir = layout["portfolio_dir"]
+    else:
+        asset_dir = resolve_path(prefix)
+    if not asset_dir.exists():
+        return []
+    asset_paths = [path for path in asset_dir.rglob("*") if path.is_file()]
+    asset_paths.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    return [str(path.relative_to(ROOT_DIR)).replace("\\", "/") for path in asset_paths]
+
+
 def get_portfolio_dir(campaign: dict[str, Any]) -> str:
-    return ""
+    return f"campaigns/{campaign.get('id', '')}/portfolio"
 
 
 def get_flyer_path(campaign: dict[str, Any]) -> str:
-    return ""
+    flyers = list_campaign_assets(campaign, "assets")
+    return flyers[0] if flyers else ""
 
 
 def get_hooks_library_path(campaign: dict[str, Any]) -> str:

@@ -4,6 +4,7 @@ crm_mailer.py – Send generated email drafts via SMTP + WhatsApp link helper.
 
 from __future__ import annotations
 
+import mimetypes
 import os
 import re
 import smtplib
@@ -60,21 +61,19 @@ def _parse_draft(draft: str) -> tuple[str, str]:
 
         <body text>
     """
-    lines = draft.strip().splitlines()
-    subject = ""
-    body_lines = []
-    body_started = False
+    text = (draft or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return "", ""
 
-    for line in lines:
-        if not body_started and line.lower().startswith("betreff:"):
-            subject = line[8:].strip()
-        elif not body_started and line.strip() == "" and subject:
-            body_started = True
-        elif body_started:
-            body_lines.append(line)
+    lines = text.splitlines()
+    if lines and lines[0].lower().startswith("betreff:"):
+        subject = lines[0][8:].strip()
+        body_lines = lines[1:]
+        if body_lines and body_lines[0] == "":
+            body_lines = body_lines[1:]
+        return subject, "\n".join(body_lines)
 
-    body = "\n".join(body_lines).strip()
-    return subject, body
+    return "", text
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -85,27 +84,59 @@ def _env_enabled(name: str, default: bool = False) -> bool:
 
 
 _IMG_RE = re.compile(r"\{\{img:([^|}]+)\|([^}]*)\}\}")
+_URL_RE = re.compile(r"https?://[^\s<]+")
+
+
+def _normalize_inline_image_path(path_value: str, base_dir: str) -> str:
+    raw_path = (path_value or "").strip()
+    if not raw_path:
+        return ""
+    if os.path.isabs(raw_path):
+        try:
+            raw_path = os.path.relpath(raw_path, base_dir)
+        except ValueError:
+            pass
+    return backend.normalize_asset_path(raw_path)
+
+
+def _load_inline_image(path: str, base_dir: str, campaign: dict | None = None) -> tuple[bytes, str] | None:
+    normalized_path = _normalize_inline_image_path(path, base_dir)
+    if not normalized_path:
+        return None
+    local_path = path if os.path.isabs(path) else os.path.join(base_dir, normalized_path)
+    try:
+        with open(local_path, "rb") as handle:
+            data = handle.read()
+        return data, str(mimetypes.guess_type(local_path)[0] or "")
+    except OSError:
+        pass
+
+    if backend.is_postgres_backend():
+        active_campaign = campaign or get_active_campaign()
+        asset = backend.postgres_get_campaign_asset(active_campaign["id"], normalized_path)
+        if asset and asset.get("data_bytes"):
+            return bytes(asset["data_bytes"]), str(asset.get("content_type") or "")
+    return None
 
 
 def _extract_inline_images(
-    html_text: str, base_dir: str
-) -> tuple[str, list[tuple[str, str, bytes]]]:
+    html_text: str, base_dir: str, campaign: dict | None = None
+) -> tuple[str, list[tuple[str, str, bytes, str]]]:
     """Replace {{img:path|alt}} in HTML-converted body with <img src="cid:..."> tags.
-    Returns (modified_html, [(cid, path, raw_bytes), ...]).
+    Returns (modified_html, [(cid, path, raw_bytes, content_type), ...]).
     Missing files fall back to [alt text].
     """
-    images: list[tuple[str, str, bytes]] = []
+    images: list[tuple[str, str, bytes, str]] = []
 
     def _replace(m: re.Match) -> str:
         path = m.group(1).strip()
         alt = html.escape(m.group(2).strip())
-        try:
-            with open(os.path.join(base_dir, path), "rb") as f:
-                data = f.read()
-        except OSError:
+        resolved = _load_inline_image(path, base_dir, campaign=campaign)
+        if resolved is None:
             return f"[{m.group(2).strip()}]"
+        data, content_type = resolved
         cid = make_msgid()
-        images.append((cid, path, data))
+        images.append((cid, path, data, content_type))
         return f'<img src="cid:{cid[1:-1]}" alt="{alt}" style="max-width:100%">'
 
     return _IMG_RE.sub(_replace, html_text), images
@@ -114,6 +145,21 @@ def _extract_inline_images(
 def _strip_img_placeholders(text: str) -> str:
     """Replace {{img:path|alt}} with [alt] for the plain-text version."""
     return _IMG_RE.sub(lambda m: f"[{m.group(2).strip()}]", text)
+
+
+def _render_html_body(text: str) -> str:
+    """Convert plain-text draft content into HTML without collapsing layout."""
+    escaped = html.escape(text)
+    bolded = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+
+    def _linkify(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        url = raw_url.rstrip(".,);:]")
+        suffix = raw_url[len(url):]
+        return f"<a href=\"{url}\">{url}</a>{suffix}"
+
+    linked = _URL_RE.sub(_linkify, bolded)
+    return f'<div style="white-space: pre-wrap;">{linked}</div>'
 
 
 def send_email_result(
@@ -170,23 +216,9 @@ def send_email_result(
     sender_domain = sender_email.split("@", 1)[1] if "@" in sender_email else ""
     include_html = _env_enabled("EMAIL_INCLUDE_HTML", default=True)
 
-    # Build HTML: escape, bold **text**, preserve line breaks
-    def _to_html(text: str) -> str:
-        escaped = html.escape(text)
-        bolded = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-
-        def _linkify(match: re.Match[str]) -> str:
-            raw_url = match.group(0)
-            url = raw_url.rstrip(".,);:]")
-            suffix = raw_url[len(url):]
-            return f"<a href=\"{url}\">{url}</a>{suffix}"
-
-        linked = re.sub(r"https?://[^\s<]+", _linkify, bolded)
-        return "<br>\n".join(linked.splitlines())
-
     base_dir = os.path.dirname(os.path.abspath(__file__))
     plain_body = _strip_img_placeholders(body)
-    html_lines, inline_images = _extract_inline_images(_to_html(body), base_dir)
+    html_fragment, inline_images = _extract_inline_images(_render_html_body(body), base_dir, campaign=active_campaign)
 
     def _apply_headers(message) -> None:
         message["Subject"] = subject
@@ -197,7 +229,7 @@ def send_email_result(
         message["Message-ID"] = make_msgid(domain=sender_domain) if sender_domain else make_msgid()
 
     if include_html:
-        html_body = f"<html><body><p>{html_lines}</p></body></html>"
+        html_body = f"<html><body>{html_fragment}</body></html>"
         if inline_images:
             msg = MIMEMultipart("related")
             _apply_headers(msg)
@@ -205,8 +237,15 @@ def send_email_result(
             alt.attach(MIMEText(plain_body, "plain", "utf-8"))
             alt.attach(MIMEText(html_body, "html", "utf-8"))
             msg.attach(alt)
-            for cid, path, data in inline_images:
-                img_part = MIMEImage(data, _subtype="png")
+            for cid, path, data, content_type in inline_images:
+                subtype = "png"
+                if str(content_type or "").startswith("image/"):
+                    subtype = str(content_type).split("/", 1)[1] or "png"
+                else:
+                    guessed_type = mimetypes.guess_type(path)[0] or ""
+                    if guessed_type.startswith("image/"):
+                        subtype = guessed_type.split("/", 1)[1] or "png"
+                img_part = MIMEImage(data, _subtype=subtype)
                 img_part["Content-ID"] = cid
                 img_part.add_header(
                     "Content-Disposition", "inline",

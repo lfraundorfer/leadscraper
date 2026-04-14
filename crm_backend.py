@@ -9,6 +9,7 @@ import json
 import os
 import re
 import atexit
+import mimetypes
 import threading
 from contextlib import contextmanager
 from datetime import datetime
@@ -33,7 +34,7 @@ _POSTGRES_POOL_COND = threading.Condition(_POSTGRES_STATE_LOCK)
 _POSTGRES_POOL: list[Any] = []
 _POSTGRES_POOL_SIZE = 0
 _POSTGRES_POOL_URL = ""
-POSTGRES_SCHEMA_VERSION = 2
+POSTGRES_SCHEMA_VERSION = 4
 
 CAMPAIGN_COLUMNS = [
     "id",
@@ -286,7 +287,25 @@ def _campaign_layout(campaign_id: str) -> dict[str, Path]:
         "csv_path": campaign_dir / "leads.csv",
         "hooks_library_path": campaign_dir / "hooks_library.json",
         "template_overrides_path": campaign_dir / "template_overrides.json",
+        "assets_dir": campaign_dir / "assets",
+        "portfolio_dir": campaign_dir / "portfolio",
     }
+
+
+def normalize_asset_path(path_value: str | Path) -> str:
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        raise ValueError("Asset path is required.")
+    path = Path(raw_path)
+    if path.is_absolute():
+        try:
+            path = path.relative_to(ROOT_DIR)
+        except ValueError:
+            path = Path(os.path.relpath(path, ROOT_DIR))
+    normalized = str(path).replace("\\", "/")
+    normalized = re.sub(r"^\./+", "", normalized)
+    normalized = re.sub(r"/+", "/", normalized)
+    return normalized.strip("/")
 
 
 def _campaign_defaults(config: dict[str, Any]) -> dict[str, Any]:
@@ -543,6 +562,25 @@ def ensure_postgres_schema() -> None:
                 )
                 current_version = 3
                 _upsert_app_meta_value(cur, "schema_version", current_version, Jsonb)
+            if current_version < 4:
+                cur.execute(
+                    """
+                    create table if not exists campaign_assets (
+                        campaign_id text not null references campaigns(id) on delete cascade,
+                        asset_path text not null,
+                        content_type text not null default '',
+                        data_bytes bytea not null,
+                        created_at timestamptz not null default now(),
+                        updated_at timestamptz not null default now(),
+                        primary key (campaign_id, asset_path)
+                    )
+                    """
+                )
+                cur.execute(
+                    "create index if not exists idx_campaign_assets_campaign_path on campaign_assets (campaign_id, asset_path)"
+                )
+                current_version = 4
+                _upsert_app_meta_value(cur, "schema_version", current_version, Jsonb)
             _POSTGRES_SCHEMA_READY = True
 
 
@@ -694,6 +732,75 @@ def postgres_save_campaign(config: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     return normalized
+
+
+def postgres_upsert_campaign_asset(
+    campaign_id: str,
+    asset_path: str | Path,
+    data: bytes,
+    *,
+    content_type: str = "",
+) -> str:
+    ensure_postgres_ready()
+    normalized_path = normalize_asset_path(asset_path)
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise ValueError("Asset data is required.")
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into campaign_assets (campaign_id, asset_path, content_type, data_bytes, updated_at)
+            values (%s, %s, %s, %s, now())
+            on conflict (campaign_id, asset_path) do update set
+                content_type = excluded.content_type,
+                data_bytes = excluded.data_bytes,
+                updated_at = now()
+            """,
+            (campaign_id, normalized_path, str(content_type or "").strip(), bytes(data)),
+        )
+    return normalized_path
+
+
+def postgres_get_campaign_asset(campaign_id: str, asset_path: str | Path) -> dict[str, Any] | None:
+    ensure_postgres_ready()
+    normalized_path = normalize_asset_path(asset_path)
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select campaign_id, asset_path, content_type, data_bytes, updated_at
+            from campaign_assets
+            where campaign_id = %s and asset_path = %s
+            limit 1
+            """,
+            (campaign_id, normalized_path),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    payload = dict(row)
+    payload["data_bytes"] = bytes(payload.get("data_bytes") or b"")
+    return payload
+
+
+def postgres_list_campaign_assets(campaign_id: str, *, prefix: str = "") -> list[dict[str, Any]]:
+    ensure_postgres_ready()
+    normalized_prefix = normalize_asset_path(prefix) if prefix else ""
+    params: list[Any] = [campaign_id]
+    where_sql = "where campaign_id = %s"
+    if normalized_prefix:
+        where_sql += " and asset_path like %s"
+        params.append(f"{normalized_prefix.rstrip('/')}/%")
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select asset_path, content_type, octet_length(data_bytes) as size_bytes, updated_at
+            from campaign_assets
+            {where_sql}
+            order by updated_at desc, asset_path asc
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall()
+    return [dict(row) for row in rows]
 
 
 def _parse_schedule_timestamp(value: str) -> datetime | None:
@@ -2072,6 +2179,19 @@ def bootstrap_postgres_from_files(force: bool = False) -> dict[str, int]:
         raw_config.pop("template_overrides_path", None)
         config = postgres_save_campaign(raw_config)
         imported_campaigns += 1
+
+        for asset_dir in (layout["assets_dir"], layout["portfolio_dir"]):
+            if not asset_dir.exists():
+                continue
+            for asset_path in sorted(path for path in asset_dir.rglob("*") if path.is_file()):
+                relative_path = normalize_asset_path(asset_path)
+                guessed_type = mimetypes.guess_type(asset_path.name)[0] or ""
+                postgres_upsert_campaign_asset(
+                    config["id"],
+                    relative_path,
+                    asset_path.read_bytes(),
+                    content_type=guessed_type,
+                )
 
         csv_path = ROOT_DIR / str(config.get("csv_path") or layout["csv_path"].relative_to(ROOT_DIR))
         leads: list[dict[str, Any]] = []
