@@ -1055,6 +1055,7 @@ def _record_outreach_action(
 def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: str) -> None:
     lid = lead.get("ID", "?")
     channel_options = available_channels(lead)
+    notice_key = _campaign_state_key(campaign, "outreach_bulk_notice")
     if not channel_options:
         st.warning("No usable outreach channel on this lead.")
         return
@@ -1227,14 +1228,14 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
         with st.spinner("Sending email..."):
             result = send_email_result(lid, notes=action_note, campaign=campaign, lead=row)
         if result.get("ok"):
-            st.session_state[state_keys["notice"]] = {
+            st.session_state[notice_key] = {
                 "level": "success",
                 "message": f"Email sent for {lid}. Contact log updated.",
             }
             reload(campaign_id=campaign["id"])
         elif row is not None:
             _persist_outreach_row(campaign, row)
-            st.session_state[state_keys["notice"]] = {
+            st.session_state[notice_key] = {
                 "level": "error",
                 "message": f"Email send failed for {lid}: {str(result.get('error') or 'unknown error')}",
             }
