@@ -159,7 +159,11 @@ def _render_html_body(text: str) -> str:
         return f"<a href=\"{url}\">{url}</a>{suffix}"
 
     linked = _URL_RE.sub(_linkify, bolded)
-    return f'<div style="white-space: pre-wrap;">{linked}</div>'
+    # Split on blank lines for paragraphs; convert remaining single newlines to <br>.
+    # white-space: pre-wrap is not supported by Gmail/Outlook so we use explicit tags.
+    paragraphs = re.split(r"\n{2,}", linked)
+    parts = [p.replace("\n", "<br>\n") for p in paragraphs]
+    return "".join(f"<p>{p}</p>" for p in parts if p.strip())
 
 
 def send_email_result(
