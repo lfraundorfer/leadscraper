@@ -2217,3 +2217,48 @@ def bootstrap_postgres_from_files(force: bool = False) -> dict[str, int]:
     global _POSTGRES_BOOTSTRAP_CHECKED
     _POSTGRES_BOOTSTRAP_CHECKED = True
     return {"campaigns": imported_campaigns, "leads": imported_leads}
+
+
+def postgres_restale_template_lead(campaign_id: str) -> bool:
+    """Reset the -0000 template lead to a clean stale state for testing.
+
+    Sets status=new, clears contact history, and pins Draft_Config_Version to '0'
+    so the lead is always draft-stale regardless of campaign version.
+    Returns True if the lead was found and updated, False if it didn't exist.
+    """
+    ensure_postgres_ready()
+    campaign = postgres_get_campaign(campaign_id)
+    id_prefix = str(campaign.get("id_prefix") or "LEAD").strip()
+    lead_id = f"{id_prefix}-0000"
+    reset_patch = {
+        "Status": "new",
+        "Draft_Stale": "1",
+        "Research_Stale": "1",
+        "Draft_Config_Version": "0",
+        "Last_Contact_Date": "",
+        "Next_Action_Date": "",
+        "Next_Action_Type": "none",
+        "Channel_Used": "",
+        "Contact_Log": "",
+        "Contact_Count": "0",
+        "Sent_At": "",
+        "SMTP_Message_ID": "",
+        "Drafts_Approved": "0",
+    }
+    import json as _json
+
+    with postgres_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE leads
+               SET status = 'new',
+                   next_action_date = NULL,
+                   payload = payload || %s::jsonb,
+                   updated_at = now()
+             WHERE lead_id = %s AND campaign_id = %s
+            """,
+            (_json.dumps(reset_patch), lead_id, campaign_id),
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+    return updated

@@ -2843,6 +2843,18 @@ def _render_campaigns_page(campaign: dict, metrics: dict[str, int]) -> None:
         f"analyze={campaign.get('last_analyzed_at') or '-'}"
     )
 
+    if backend.is_postgres_backend():
+        id_prefix = campaign.get("id_prefix") or "LEAD"
+        template_lead_id = f"{id_prefix}-0000"
+        _, btn_col, _ = st.columns([3, 1, 3])
+        if btn_col.button(f"Re-stale {template_lead_id}", width="stretch"):
+            found = backend.postgres_restale_template_lead(campaign["id"])
+            if found:
+                st.toast(f"{template_lead_id} reset to stale", icon="✅")
+            else:
+                st.toast(f"{template_lead_id} not found", icon="⚠️")
+            reload(campaign_id=campaign["id"], campaign_changed=True)
+
     st.divider()
     st.subheader("Campaign Config")
     with st.form("campaign_config"):
