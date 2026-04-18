@@ -67,10 +67,8 @@ USER_AGENT = (
 
 
 def _slugify(s: str) -> str:
-    s = s.lower()
-    for a, b in [("ä","ae"),("ö","oe"),("ü","ue"),("ß","ss")]:
-        s = s.replace(a, b)
-    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    s = s.lower().replace("ß", "ss")
+    return re.sub(r"[^a-z0-9äöü]+", "-", s).strip("-")
 
 
 def build_page_url(category: str, location: str, page: int) -> str:
@@ -176,6 +174,15 @@ class HeroldFetcher:
             self._page.goto(url, wait_until="networkidle", timeout=45_000)
         except PWTimeout:
             logging.warning("networkidle timed out for %s – using what we have", url)
+
+        # Dismiss cookie consent if present (consentmanager.net)
+        try:
+            btn = self._page.locator("button.cmptxt_btn_yes").first
+            if btn.is_visible(timeout=3000):
+                btn.click()
+                self._page.wait_for_timeout(1500)
+        except Exception:
+            pass
 
         # Scroll to trigger lazy-loaded listings
         self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")

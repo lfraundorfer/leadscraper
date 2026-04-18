@@ -2252,7 +2252,7 @@ def _render_outreach(campaign: dict) -> None:
     max_to_send = st.number_input(
         "Max companies to send",
         min_value=1,
-        value=100,
+        value=25,
         step=1,
         key=_campaign_state_key(campaign, "outreach_max_to_send"),
     )
