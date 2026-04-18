@@ -163,7 +163,7 @@ def _render_html_body(text: str) -> str:
     # white-space: pre-wrap is not supported by Gmail/Outlook so we use explicit tags.
     paragraphs = re.split(r"\n{2,}", linked)
     parts = [p.replace("\n", "<br>\n") for p in paragraphs]
-    return "".join(f"<p>{p}</p>" for p in parts if p.strip())
+    return "".join(f'<p style="white-space: pre-wrap">{p}</p>' for p in parts if p.strip())
 
 
 def send_email_result(
