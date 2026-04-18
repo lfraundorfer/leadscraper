@@ -2268,12 +2268,15 @@ def _render_outreach(campaign: dict) -> None:
         note = (st.session_state.get(state_keys["note"]) or "").strip()
         sent_ids: list[str] = []
         failed_ids: list[str] = []
-        with st.spinner(f"Sending {len(selected_ids)} email(s)..."):
-            for lead_id in selected_ids:
-                if send_email(lead_id, notes=note, campaign=campaign):
-                    sent_ids.append(lead_id)
-                else:
-                    failed_ids.append(lead_id)
+        total = len(selected_ids)
+        progress_placeholder = st.empty()
+        for i, lead_id in enumerate(selected_ids, 1):
+            progress_placeholder.info(f"Sending {i}/{total}...")
+            if send_email(lead_id, notes=note, campaign=campaign):
+                sent_ids.append(lead_id)
+            else:
+                failed_ids.append(lead_id)
+        progress_placeholder.empty()
         st.session_state[state_keys["notice"]] = {"sent_ids": sent_ids, "failed_ids": failed_ids}
         st.session_state[state_keys["selection"]] = failed_ids
         if not failed_ids:
