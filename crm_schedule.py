@@ -37,9 +37,8 @@ def scheduled_send_datetime(choice: str, now: datetime | None = None) -> datetim
     today = current.date()
 
     if choice == "today":
-        if is_business_day(today) and current.timetz().replace(tzinfo=None) < BUSINESS_DAY_END:
-            return combine_vienna(today, BUSINESS_DAY_END)
-        return combine_vienna(next_business_day(today), BUSINESS_DAY_START)
+        # Send immediately — no weekend or business-hours check.
+        return current
 
     if choice == "tomorrow":
         if is_business_day(today):

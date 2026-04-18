@@ -211,11 +211,13 @@ def invalidate_campaign_cache(campaign_id: str = "") -> None:
     invalidate_lead_cache("")
 
 
-def reload(*, campaign_id: str = "", campaign_changed: bool = False) -> None:
+def reload(*, campaign_id: str = "", campaign_changed: bool = False, scroll_to_top: bool = False) -> None:
     if campaign_changed:
         invalidate_campaign_cache(campaign_id)
     elif campaign_id:
         invalidate_lead_cache(campaign_id)
+    if scroll_to_top:
+        st.components.v1.html("<script>window.parent.scrollTo(0, 0);</script>", height=0)
     st.rerun()
 
 
@@ -861,14 +863,6 @@ def _extract_urls(*texts: str) -> list[str]:
     return urls
 
 
-def _render_draft_links(*texts: str) -> None:
-    urls = _extract_urls(*texts)
-    if not urls:
-        return
-    st.caption("Links")
-    for url in urls:
-        st.markdown(f"- [{url}]({url})")
-
 
 def _write_json_payload(path_value: str, payload: dict) -> None:
     path = Path(path_value)
@@ -1092,7 +1086,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
         )
         email_body = st.text_area("Email body", value=current_body, height=240, key=email_body_key)
         wa_draft = st.text_area("WhatsApp draft", value=lead.get("WhatsApp_Draft", ""), height=120, key=whatsapp_key)
-        _render_draft_links(email_body, wa_draft)
         action_note = st.text_input(
             "Action note",
             value="",
@@ -1108,22 +1101,7 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             type="primary",
             width="stretch",
         )
-        log_col.caption("Saving here marks the draft approved/fresh without queueing an automatic send.")
-
-        queue_today = False
-        queue_tomorrow = False
-        if "email" in channel_options:
-            queue_col1, queue_col2 = st.columns(2)
-            queue_today = queue_col1.form_submit_button(
-                "Queue Send Today",
-                key=f"{key_prefix}_queue_today",
-                width="stretch",
-            )
-            queue_tomorrow = queue_col2.form_submit_button(
-                "Queue Send Tomorrow",
-                key=f"{key_prefix}_queue_tomorrow",
-                width="stretch",
-            )
+        log_col.caption("Saving here marks the draft approved/fresh without sending.")
 
         send_email_now = False
         mark_email_sent = False
@@ -1197,28 +1175,6 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             schedule_choice="clear",
         )
         reload(campaign_id=campaign["id"])
-    elif queue_today:
-        _save_draft_edits(
-            campaign,
-            lid,
-            subject=selected_subject,
-            body=email_body,
-            whatsapp=wa_draft,
-            selected_channel=selected_channel,
-            schedule_choice="today",
-        )
-        reload(campaign_id=campaign["id"])
-    elif queue_tomorrow:
-        _save_draft_edits(
-            campaign,
-            lid,
-            subject=selected_subject,
-            body=email_body,
-            whatsapp=wa_draft,
-            selected_channel=selected_channel,
-            schedule_choice="tomorrow",
-        )
-        reload(campaign_id=campaign["id"])
     elif send_email_now:
         row = get_lead_by_id(lid, campaign=campaign)
         if row is not None:
@@ -1237,18 +1193,18 @@ def _render_editable_draft_workspace(campaign: dict, lead: dict, *, key_prefix: 
             msg = f"Email sent for {lid}. Contact log updated."
             st.session_state[notice_key] = {"level": "success", "message": msg}
             st.session_state[workspace_notice_key] = {"level": "success", "message": msg}
-            reload(campaign_id=campaign["id"])
+            reload(campaign_id=campaign["id"], scroll_to_top=True)
         elif row is not None:
             _persist_outreach_row(campaign, row)
             msg = f"Email send failed for {lid}: {str(result.get('error') or 'unknown error')}"
             st.session_state[notice_key] = {"level": "error", "message": msg}
             st.session_state[workspace_notice_key] = {"level": "error", "message": msg}
-            reload(campaign_id=campaign["id"])
+            reload(campaign_id=campaign["id"], scroll_to_top=True)
         else:
             msg = f"Could not load lead {lid} from database. Please refresh the page."
             st.session_state[notice_key] = {"level": "error", "message": msg}
             st.session_state[workspace_notice_key] = {"level": "error", "message": msg}
-            reload(campaign_id=campaign["id"])
+            reload(campaign_id=campaign["id"], scroll_to_top=True)
     elif mark_email_sent:
         if _record_outreach_action(
             campaign,
@@ -2027,7 +1983,8 @@ def _render_review_queue(campaign: dict) -> None:
     website = selected.get("Website", "")
     plz, bezirk = get_bezirk(selected.get("Adresse", ""))
 
-    st.markdown(f"### {lid} - {company}")
+    company_search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(company)}"
+    st.markdown(f"### {lid} - [{company}]({company_search_url})")
     meta1, meta2, meta3 = st.columns(3)
     meta1.markdown(f"**Location:** {plz or '-'} {bezirk}")
     meta2.markdown(f"**Website:** {selected.get('Website_Category') or '-'}")
@@ -2085,16 +2042,14 @@ def _render_review_queue(campaign: dict) -> None:
             )
             email_body = st.text_area("Email body", value=current_body, height=260, key=f"{review_key_prefix}_email_body")
             wa_draft = st.text_area("WhatsApp draft", value=selected.get("WhatsApp_Draft", ""), height=120, key=f"{review_key_prefix}_wa")
-            _render_draft_links(email_body, wa_draft)
             st.caption(f"Queue status: {scheduled_send_label(selected)}")
-            c1, c2, c3, c4, c5 = st.columns(5)
+            c1, c2, c3, c4 = st.columns(4)
             approve = c1.form_submit_button("Approve", type="primary", width="stretch")
-            queue_today = c2.form_submit_button("Send Today", width="stretch")
-            queue_tomorrow = c3.form_submit_button("Send Tomorrow", width="stretch")
-            skip = c4.form_submit_button("Skip", width="stretch")
-            blacklist = c5.form_submit_button("Blacklist", width="stretch")
+            queue_today = c2.form_submit_button("Send Now", width="stretch")
+            skip = c3.form_submit_button("Skip", width="stretch")
+            blacklist = c4.form_submit_button("Blacklist", width="stretch")
 
-        if approve or queue_today or queue_tomorrow:
+        if approve or queue_today:
             lead = get_lead_by_id(lid, campaign=campaign)
             if lead is not None:
                 lead["Email_Draft"] = compose_email_draft(selected_subject, email_body)
@@ -2107,8 +2062,6 @@ def _render_review_queue(campaign: dict) -> None:
                 set_stored_draft_stale(lead, False)
                 if queue_today and "email" in available_channels(lead):
                     queue_scheduled_email(lead, "today")
-                elif queue_tomorrow and "email" in available_channels(lead):
-                    queue_scheduled_email(lead, "tomorrow")
                 else:
                     clear_scheduled_send(lead)
                 save_lead(lead, campaign=campaign)
@@ -2296,6 +2249,14 @@ def _render_outreach(campaign: dict) -> None:
         placeholder="Optional note added to every contact log entry",
     )
 
+    max_to_send = st.number_input(
+        "Max companies to send",
+        min_value=1,
+        value=100,
+        step=1,
+        key=_campaign_state_key(campaign, "outreach_max_to_send"),
+    )
+
     send_selected = st.button(
         f"Send Selected ({len(st.session_state.get(state_keys['selection'], []))})",
         type="primary",
@@ -2303,7 +2264,7 @@ def _render_outreach(campaign: dict) -> None:
         key=_campaign_state_key(campaign, "outreach_send_selected"),
     )
     if send_selected:
-        selected_ids = list(st.session_state.get(state_keys["selection"], []))
+        selected_ids = list(st.session_state.get(state_keys["selection"], []))[:int(max_to_send)]
         note = (st.session_state.get(state_keys["note"]) or "").strip()
         sent_ids: list[str] = []
         failed_ids: list[str] = []
